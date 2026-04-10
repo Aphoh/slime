@@ -437,19 +437,23 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1"):
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
+    # Dynamo frontend doesn't expose /workers — skip worker-level abort.
+    if getattr(args, "rollout_backend", None) == "dynamo":
+        logger.info("Dynamo backend: skipping per-worker abort (no /workers endpoint)")
     else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
+        if parse(sglang_router.__version__) <= parse("0.2.1"):
+            response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+            urls = response["urls"]
+        else:
+            response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+            urls = [worker["url"] for worker in response["workers"]]
 
-    logger.info(f"Abort request for {urls}")
-    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
-    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
-    for url, result in zip(urls, abort_results, strict=False):
-        if isinstance(result, Exception):
-            logger.warning(f"Failed to abort worker at {url}: {result}")
+        logger.info(f"Abort request for {urls}")
+        abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+        abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+        for url, result in zip(urls, abort_results, strict=False):
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to abort worker at {url}: {result}")
 
     # make sure all the pending tasks are finished
     count = 0
