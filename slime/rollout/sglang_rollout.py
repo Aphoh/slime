@@ -258,7 +258,7 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
     # Send as text string — the Dynamo router tokenizes internally.
     model_name = getattr(args, "hf_checkpoint", None) or "default"
     token_ids = sample.tokens if sample.response else prompt_ids
-    assert token_ids, f"Empty prompt token IDs for sample {sample.uid}"
+    assert token_ids, "Empty prompt token IDs"
     prompt_text = state.tokenizer.decode(token_ids)
     payload = {
         "model": model_name,
