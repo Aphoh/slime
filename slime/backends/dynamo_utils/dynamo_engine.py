@@ -149,13 +149,20 @@ class DynamoEngine(RayActor):
             if self._disaggregation_bootstrap_port:
                 cmd.extend(["--disaggregation-bootstrap-port", str(self._disaggregation_bootstrap_port)])
 
-        # Per-group sglang overrides
+        # Per-group sglang overrides (skip keys already handled above)
+        _skip_override_keys = {"model_path", "tp", "port", "host", "enable_rl"}
         for key, value in self.sglang_overrides.items():
+            if key in _skip_override_keys:
+                continue
             flag = f"--{key.replace('_', '-')}"
             cmd.extend([flag, str(value)])
 
         env = os.environ.copy()
         env.setdefault("DYN_DISCOVERY_BACKEND", "file")
+        # The Dynamo runtime's system status server exposes /health and
+        # /engine/* routes (including call_tokenizer_manager).  It only
+        # starts when DYN_SYSTEM_PORT >= 0.
+        env["DYN_SYSTEM_PORT"] = str(self.server_port)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(self._base_gpu_id + i) for i in range(gpus_per_engine)
         )
