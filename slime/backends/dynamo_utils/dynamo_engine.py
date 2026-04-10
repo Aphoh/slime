@@ -356,12 +356,14 @@ class DynamoEngine(RayActor):
         )
 
     def release_memory_occupation(self):
+        # Dynamo's release_memory_occupation engine route unregisters from
+        # discovery and pauses generation, which breaks the frontend's model
+        # routing.  For now, just flush the cache without unregistering.
         self.flush_cache()
-        return self._call_engine_route("release_memory_occupation")
 
     def resume_memory_occupation(self, tags: list[str] | None = None):
-        body = {"tags": tags} if tags else {}
-        return self._call_engine_route("resume_memory_occupation", body)
+        # Matching no-op for release_memory_occupation above.
+        pass
 
     # ------------------------------------------------------------------
     # Profiling & misc
