@@ -72,4 +72,12 @@ def convert_glm4_to_hf(args, name, param):
         elif rest == "post_mlp_layernorm.weight":
             return [(f"model.layers.{layer_idx}.post_mlp_layernorm.weight", param)]
 
+        # layer_norm biases (RMSNorm has no bias — skip these)
+        elif rest in ("self_attention.linear_qkv.layer_norm_bias", "mlp.linear_fc1.layer_norm_bias"):
+            return []
+
+    # final_layernorm.bias (RMSNorm — skip)
+    if name == "module.module.decoder.final_layernorm.bias":
+        return []
+
     raise ValueError(f"Unknown parameter name: {name}")
