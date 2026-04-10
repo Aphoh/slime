@@ -289,6 +289,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # rollout
         def add_rollout_arguments(parser):
             parser.add_argument(
+                "--rollout-backend",
+                type=str,
+                default="sglang",
+                choices=["sglang", "dynamo"],
+                help="Rollout inference backend. 'dynamo' uses Dynamo's KV-aware router and RLMixin engine routes.",
+            )
+            parser.add_argument(
                 "--hf-checkpoint",
                 type=str,
                 default=None,

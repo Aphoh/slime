@@ -148,7 +148,10 @@ class GenerateState(metaclass=SingletonMeta):
 
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
-    """Generate using traditional SGLang router with token-based workflow"""
+    """Generate using SGLang router (default) or Dynamo frontend."""
+    if getattr(args, "rollout_backend", "sglang") == "dynamo":
+        return await _generate_dynamo(args, sample, sampling_params)
+
     if args.ci_test:
         assert isinstance(sample.prompt, str)
 
@@ -230,6 +233,83 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         )
 
     sample.update_from_meta_info(args, output["meta_info"])
+
+    return sample
+
+
+async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
+    """Generate using Dynamo frontend with OpenAI-compatible completions API."""
+    state = GenerateState(args)
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/completions"
+
+    assert sample.status in (Sample.Status.PENDING, Sample.Status.ABORTED), f"Sample status is {sample.status}"
+
+    prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
+
+    assert sampling_params["max_new_tokens"] >= 0
+    if sampling_params["max_new_tokens"] == 0:
+        sample.status = Sample.Status.TRUNCATED
+        return sample
+
+    if not sample.tokens:
+        sample.tokens = prompt_ids
+
+    # Dynamo frontend expects OpenAI-compatible completions payload.
+    # Models register by their full path, so use hf_checkpoint for matching.
+    model_name = getattr(args, "hf_checkpoint", None) or "default"
+    payload = {
+        "model": model_name,
+        "prompt": sample.tokens if sample.response else prompt_ids,
+        "max_tokens": sampling_params["max_new_tokens"],
+        "temperature": sampling_params.get("temperature", 1.0),
+        "top_p": sampling_params.get("top_p", 1.0),
+        "logprobs": 1,
+        "stream": False,
+    }
+    top_k = sampling_params.get("top_k", -1)
+    if top_k > 0:
+        payload["top_k"] = top_k
+    stop = sampling_params.get("stop")
+    if stop:
+        payload["stop"] = stop
+
+    output = await post(url, payload)
+
+    choice = output["choices"][0]
+    response_text = choice["text"]
+
+    # Extract logprobs and token IDs from response
+    new_response_log_probs = []
+    if choice.get("logprobs") and choice["logprobs"].get("token_logprobs"):
+        new_response_log_probs = choice["logprobs"]["token_logprobs"]
+
+    # Re-tokenize to get token IDs (OpenAI format returns token strings, not IDs)
+    new_response_tokens = state.tokenizer.encode(response_text, add_special_tokens=False)
+
+    # Align logprobs length with token count
+    if len(new_response_log_probs) != len(new_response_tokens):
+        if len(new_response_log_probs) > len(new_response_tokens):
+            new_response_log_probs = new_response_log_probs[: len(new_response_tokens)]
+        else:
+            new_response_log_probs.extend([0.0] * (len(new_response_tokens) - len(new_response_log_probs)))
+
+    sample.tokens = sample.tokens + new_response_tokens
+    sample.response_length += len(new_response_tokens)
+    sample.response += response_text
+
+    if sample.loss_mask is not None:
+        assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
+        sample.loss_mask += [1] * len(new_response_tokens)
+
+    if sample.rollout_log_probs is None:
+        sample.rollout_log_probs = []
+    sample.rollout_log_probs += new_response_log_probs
+
+    finish_reason = choice.get("finish_reason", "length")
+    if finish_reason == "stop":
+        sample.status = Sample.Status.COMPLETED
+    elif finish_reason == "length":
+        sample.status = Sample.Status.TRUNCATED
 
     return sample
 

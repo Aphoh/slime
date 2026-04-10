@@ -17,6 +17,13 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from slime.backends.sglang_utils.external import start_external_rollout_servers
 from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+
+def _get_engine_cls(args):
+    """Return the engine class based on --rollout-backend."""
+    if getattr(args, "rollout_backend", "sglang") == "dynamo":
+        from slime.backends.dynamo_utils.dynamo_engine import DynamoEngine
+        return DynamoEngine
+    return SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.dp_schedule import build_dp_schedule
@@ -123,7 +130,7 @@ class ServerGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
-        RolloutRayActor = ray.remote(SGLangEngine)
+        RolloutRayActor = ray.remote(_get_engine_cls(self.args))
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -1058,7 +1065,13 @@ def start_rollout_servers(args, pg) -> dict[str, Any]:
         model_cfg.resolve(args)
 
         has_pd = model_cfg.has_pd_disaggregation
-        router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+        if getattr(args, "rollout_backend", "sglang") == "dynamo":
+            from slime.backends.dynamo_utils.dynamo_frontend import start_dynamo_frontend
+            router_ip, router_port = start_dynamo_frontend(
+                args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0)
+            )
+        else:
+            router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
 
         # Write back for backward compat (first model only).
         if model_idx == 0:
