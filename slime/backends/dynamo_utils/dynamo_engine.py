@@ -204,8 +204,21 @@ class DynamoEngine(RayActor):
             self.shutdown()
 
     # ------------------------------------------------------------------
-    # call_tokenizer_manager passthrough (via RLMixin /engine/ route)
+    # Engine route helpers
     # ------------------------------------------------------------------
+
+    def _call_engine_route(self, route, body=None):
+        """Call a dedicated /engine/{route} endpoint on the system status server."""
+        if self.node_rank != 0:
+            return
+        url = f"http://{self.server_host}:{self.server_port}/engine/{route}"
+        response = requests.post(url, json=body or {})
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            e.add_note(f"{response.text=}")
+            raise
+        return response.json()
 
     def _call_tm(self, method, args=None, kwargs=None):
         """Call a tokenizer_manager method via the RLMixin endpoint."""
@@ -216,14 +229,7 @@ class DynamoEngine(RayActor):
             body["args"] = args
         if kwargs is not None:
             body["kwargs"] = kwargs
-        url = f"http://{self.server_host}:{self.server_port}/engine/call_tokenizer_manager"
-        response = requests.post(url, json=body)
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            e.add_note(f"{response.text=}")
-            raise
-        return response.json()
+        return self._call_engine_route("call_tokenizer_manager", body)
 
     # ------------------------------------------------------------------
     # Health
@@ -245,7 +251,7 @@ class DynamoEngine(RayActor):
         return f"http://{self.server_host}:{self.server_port}"
 
     # ------------------------------------------------------------------
-    # Weight management
+    # Weight management (via dedicated /engine/* routes)
     # ------------------------------------------------------------------
 
     def update_weights_from_tensor(
@@ -255,14 +261,14 @@ class DynamoEngine(RayActor):
         flush_cache: bool = False,
         weight_version: str | None = None,
     ):
-        payload = {
+        body = {
             "serialized_named_tensors": serialized_named_tensors,
             "load_format": load_format,
             "flush_cache": flush_cache,
         }
         if weight_version is not None:
-            payload["weight_version"] = weight_version
-        return self._call_tm("update_weights_from_tensor", args=[payload])
+            body["weight_version"] = weight_version
+        return self._call_engine_route("update_weights_from_tensor", body)
 
     def update_weights_from_distributed(
         self,
@@ -273,24 +279,22 @@ class DynamoEngine(RayActor):
         flush_cache=False,
         weight_version: str | None = None,
     ):
-        payload = {
-            "io_struct.UpdateWeightsFromDistributedReqInput": {
-                "names": names,
-                "dtypes": [str(d).replace("torch.", "") for d in dtypes],
-                "shapes": shapes,
-                "group_name": group_name,
-                "flush_cache": flush_cache,
-            }
+        body = {
+            "names": names,
+            "dtypes": [str(d).replace("torch.", "") for d in dtypes],
+            "shapes": shapes,
+            "group_name": group_name,
+            "flush_cache": flush_cache,
         }
         if weight_version is not None:
-            payload["io_struct.UpdateWeightsFromDistributedReqInput"]["weight_version"] = weight_version
-        return self._call_tm("update_weights_from_distributed", args=[payload])
+            body["weight_version"] = weight_version
+        return self._call_engine_route("update_weights_from_distributed", body)
 
     def update_weights_from_disk(self, model_path, load_format=None):
-        payload = {"model_path": model_path}
+        body = {"model_path": model_path}
         if load_format:
-            payload["load_format"] = load_format
-        return self._call_tm("update_weights_from_disk", args=[payload])
+            body["load_format"] = load_format
+        return self._call_engine_route("update_weights_from_disk", body)
 
     def init_weights_update_group(
         self, master_address, master_port, rank_offset, world_size, group_name, backend
@@ -323,12 +327,8 @@ class DynamoEngine(RayActor):
             pass
 
     def get_weight_version(self):
-        if self.node_rank != 0:
-            return
-        result = self._call_tm("get_weight_version")
-        if isinstance(result, dict):
-            return result.get("weight_version") or result.get("result")
-        return result
+        # No get_weight_version on tokenizer_manager or engine routes.
+        return None
 
     # ------------------------------------------------------------------
     # Cache & generation control
@@ -357,10 +357,11 @@ class DynamoEngine(RayActor):
 
     def release_memory_occupation(self):
         self.flush_cache()
-        return self._call_tm("release_memory_occupation")
+        return self._call_engine_route("release_memory_occupation")
 
     def resume_memory_occupation(self, tags: list[str] | None = None):
-        return self._call_tm("resume_memory_occupation", args=[tags] if tags else None)
+        body = {"tags": tags} if tags else {}
+        return self._call_engine_route("resume_memory_occupation", body)
 
     # ------------------------------------------------------------------
     # Profiling & misc
@@ -382,7 +383,10 @@ class DynamoEngine(RayActor):
         )
 
     def check_weights(self, action: str):
-        return self._call_tm("check_weights", args=[action])
+        return self._call_tm(
+            "check_weights",
+            args=[{"io_struct.CheckWeightsReqInput": {"action": action}}],
+        )
 
     def start_profile(
         self,
@@ -394,20 +398,15 @@ class DynamoEngine(RayActor):
         with_stack: bool | None = None,
         record_shapes: bool | None = None,
     ):
-        return self._call_tm(
-            "start_profile",
-            args=[{
-                "io_struct.StartProfileReqInput": {
-                    "output_dir": output_dir,
-                    "start_step": start_step,
-                    "num_steps": num_steps,
-                    "activities": activities,
-                    "profile_by_stage": profile_by_stage,
-                    "with_stack": with_stack,
-                    "record_shapes": record_shapes,
-                },
-            }],
-        )
+        return self._call_engine_route("start_profile", {
+            "output_dir": output_dir,
+            "start_step": start_step,
+            "num_steps": num_steps,
+            "activities": activities,
+            "profile_by_stage": profile_by_stage,
+            "with_stack": with_stack,
+            "record_shapes": record_shapes,
+        })
 
     def stop_profile(self):
-        return self._call_tm("stop_profile")
+        return self._call_engine_route("stop_profile")
