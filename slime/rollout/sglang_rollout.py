@@ -423,14 +423,18 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1"):
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
+    # Dynamo frontend doesn't expose /workers — skip worker-level abort.
+    if getattr(args, "rollout_backend", None) == "dynamo":
+        logger.info("Dynamo backend: skipping per-worker abort (no /workers endpoint)")
     else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
+        if parse(sglang_router.__version__) <= parse("0.2.1"):
+            response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+            urls = response["urls"]
+        else:
+            response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+            urls = [worker["url"] for worker in response["workers"]]
 
-    await abort_servers_until_idle(urls)
+        await abort_servers_until_idle(urls)
 
     # make sure all the pending tasks are finished
     count = 0
