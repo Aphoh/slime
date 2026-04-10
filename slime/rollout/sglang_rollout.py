@@ -255,11 +255,14 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
         sample.tokens = prompt_ids
 
     # Dynamo frontend expects OpenAI-compatible completions payload.
-    # Models register by their full path, so use hf_checkpoint for matching.
+    # Send as text string — the Dynamo router tokenizes internally.
     model_name = getattr(args, "hf_checkpoint", None) or "default"
+    token_ids = sample.tokens if sample.response else prompt_ids
+    assert token_ids, f"Empty prompt token IDs for sample {sample.uid}"
+    prompt_text = state.tokenizer.decode(token_ids)
     payload = {
         "model": model_name,
-        "prompt": sample.tokens if sample.response else prompt_ids,
+        "prompt": prompt_text,
         "max_tokens": sampling_params["max_new_tokens"],
         "temperature": sampling_params.get("temperature", 1.0),
         "top_p": sampling_params.get("top_p", 1.0),
