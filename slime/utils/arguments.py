@@ -296,6 +296,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Rollout inference backend. 'dynamo' uses Dynamo's KV-aware router and RLMixin engine routes.",
             )
             parser.add_argument(
+                "--dynamo-router-mode",
+                type=str,
+                default=None,
+                choices=["round-robin", "kv"],
+                help="Dynamo frontend router mode. Defaults to round-robin (or kv if PD disaggregation is enabled).",
+            )
+            parser.add_argument(
                 "--hf-checkpoint",
                 type=str,
                 default=None,

@@ -254,19 +254,19 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
     if not sample.tokens:
         sample.tokens = prompt_ids
 
-    # Dynamo frontend expects OpenAI-compatible completions payload.
-    # Send as text string — the Dynamo router tokenizes internally.
+    # Send token IDs directly — Dynamo frontend accepts prompt as token ID array.
+    # Use return_tokens_as_token_ids to get token IDs back in logprobs without re-tokenization.
     model_name = getattr(args, "hf_checkpoint", None) or "default"
     token_ids = sample.tokens if sample.response else prompt_ids
     assert token_ids, "Empty prompt token IDs"
-    prompt_text = state.tokenizer.decode(token_ids)
     payload = {
         "model": model_name,
-        "prompt": prompt_text,
+        "prompt": token_ids,
         "max_tokens": sampling_params["max_new_tokens"],
         "temperature": sampling_params.get("temperature", 1.0),
         "top_p": sampling_params.get("top_p", 1.0),
         "logprobs": 1,
+        "return_tokens_as_token_ids": True,
         "stream": False,
     }
     top_k = sampling_params.get("top_k", -1)
@@ -281,13 +281,24 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
     choice = output["choices"][0]
     response_text = choice["text"]
 
-    # Extract logprobs and token IDs from response
+    # Extract token IDs and logprobs directly from response.
+    # With return_tokens_as_token_ids, tokens are "token_id:<id>" strings.
+    new_response_tokens = []
     new_response_log_probs = []
     if choice.get("logprobs") and choice["logprobs"].get("token_logprobs"):
         new_response_log_probs = choice["logprobs"]["token_logprobs"]
+        tokens = choice["logprobs"].get("tokens", [])
+        for tok in tokens:
+            if isinstance(tok, str) and tok.startswith("token_id:"):
+                new_response_tokens.append(int(tok[len("token_id:"):]))
+            else:
+                # Fallback: re-tokenize this token
+                ids = state.tokenizer.encode(tok, add_special_tokens=False)
+                new_response_tokens.append(ids[0] if ids else 0)
 
-    # Re-tokenize to get token IDs (OpenAI format returns token strings, not IDs)
-    new_response_tokens = state.tokenizer.encode(response_text, add_special_tokens=False)
+    # If no logprobs returned, fall back to re-tokenization
+    if not new_response_tokens and response_text:
+        new_response_tokens = state.tokenizer.encode(response_text, add_special_tokens=False)
 
     # Align logprobs length with token count
     if len(new_response_log_probs) != len(new_response_tokens):
