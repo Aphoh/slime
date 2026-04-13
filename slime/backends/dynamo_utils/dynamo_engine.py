@@ -87,6 +87,10 @@ class DynamoEngine(RayActor):
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_ipv6(ip_part)}:{port_part}"
 
+        # KV router requires etcd discovery; propagate from CLI args.
+        router_mode = getattr(self.args, "dynamo_router_mode", None) or "round-robin"
+        self._discovery_backend = "etcd" if router_mode == "kv" else "file"
+
         self.server_host = host
         self.server_port = port
 
@@ -158,7 +162,9 @@ class DynamoEngine(RayActor):
             cmd.extend([flag, str(value)])
 
         env = os.environ.copy()
-        env.setdefault("DYN_DISCOVERY_BACKEND", "file")
+        # KV router requires etcd discovery; propagate from frontend config.
+        discovery = getattr(self, "_discovery_backend", None) or "file"
+        env["DYN_DISCOVERY_BACKEND"] = discovery
         # The Dynamo runtime's system status server exposes /health and
         # /engine/* routes (including call_tokenizer_manager).  It only
         # starts when DYN_SYSTEM_PORT >= 0.
