@@ -31,7 +31,7 @@ def start_dynamo_frontend(args, *, has_pd_disaggregation: bool = False, force_ne
     else:
         frontend_port = getattr(args, "sglang_router_port", None) or find_available_port(3000)
 
-    router_mode = "kv" if has_pd_disaggregation else "round-robin"
+    router_mode = getattr(args, "dynamo_router_mode", None) or ("kv" if has_pd_disaggregation else "round-robin")
     discovery_backend = getattr(args, "dynamo_discovery_backend", "file")
 
     cmd = [
