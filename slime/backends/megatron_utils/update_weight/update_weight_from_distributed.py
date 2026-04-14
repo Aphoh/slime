@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import socket
 import time
 from argparse import Namespace
@@ -19,6 +20,8 @@ from slime.utils.http_utils import _wrap_ipv6
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import DeltaSpec
 from .common import all_gather_param, named_params_and_buffers
+
+logger = logging.getLogger(__name__)
 
 
 class UpdateWeightFromDistributed:
