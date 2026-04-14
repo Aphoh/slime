@@ -280,6 +280,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 "temperature": sampling_params.get("temperature", 1.0),
                 "top_p": sampling_params.get("top_p", 1.0),
                 "logprobs": 1,
+                "return_tokens_as_token_ids": True,
                 "stream": False,
             }
             top_k = sampling_params.get("top_k", -1)
@@ -322,10 +323,20 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if use_dynamo:
             choice = output["choices"][0]
             cur_response = choice["text"]
-            cur_response_token_ids = state.tokenizer.encode(cur_response, add_special_tokens=False) if cur_response else []
+            # Extract token IDs directly from logprobs — no re-tokenization.
+            cur_response_token_ids = []
             cur_log_probs = []
             if choice.get("logprobs") and choice["logprobs"].get("token_logprobs"):
                 cur_log_probs = choice["logprobs"]["token_logprobs"]
+                for tok in choice["logprobs"].get("tokens", []):
+                    if isinstance(tok, str) and tok.startswith("token_id:"):
+                        cur_response_token_ids.append(int(tok[len("token_id:"):]))
+                    else:
+                        ids = state.tokenizer.encode(tok, add_special_tokens=False)
+                        cur_response_token_ids.append(ids[0] if ids else 0)
+            if not cur_response_token_ids and cur_response:
+                cur_response_token_ids = state.tokenizer.encode(cur_response, add_special_tokens=False)
+            # Align lengths
             if len(cur_log_probs) > len(cur_response_token_ids):
                 cur_log_probs = cur_log_probs[: len(cur_response_token_ids)]
             elif len(cur_log_probs) < len(cur_response_token_ids):
