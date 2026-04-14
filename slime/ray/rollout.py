@@ -523,14 +523,30 @@ class RolloutManager:
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
+
+        gen_t0 = time.time()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        gen_elapsed = time.time() - gen_t0
+
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
-        _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        rollout_time = time.time() - start_time
+        _log_rollout_data(rollout_id, self.args, data, metrics, rollout_time)
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
             return
+
+        convert_t0 = time.time()
         data = self._convert_samples_to_train_data(data)
-        return self._split_train_data_by_dp(data)
+        result = self._split_train_data_by_dp(data)
+        convert_elapsed = time.time() - convert_t0
+
+        logger.info(
+            f"[ROLLOUT BREAKDOWN] step={rollout_id} | "
+            f"generation={gen_elapsed:.2f}s | "
+            f"convert+split={convert_elapsed:.2f}s | "
+            f"total={time.time() - start_time:.2f}s"
+        )
+        return result
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:

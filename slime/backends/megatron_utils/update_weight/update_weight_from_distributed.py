@@ -103,11 +103,24 @@ class UpdateWeightFromDistributed:
         """
         Pause → flush → _send_weights → continue. Progress on PP source.
         """
+        import time as _time
+
         self.weight_version += 1
 
         if dist.get_rank() == 0:
+            _t0 = _time.time()
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+            _pause_elapsed = _time.time() - _t0
+
+            _t0 = _time.time()
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            _flush_elapsed = _time.time() - _t0
+
+            logger.info(
+                f"[WEIGHT UPDATE] pause_generation={_pause_elapsed:.3f}s | "
+                f"flush_cache={_flush_elapsed:.3f}s | "
+                f"num_engines={len(self.rollout_engines)}"
+            )
 
             # int4/fp4 pre_process
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
@@ -118,9 +131,11 @@ class UpdateWeightFromDistributed:
                 )
         dist.barrier(group=get_gloo_group())
 
+        _sync_t0 = _time.time()
         pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
         self._send_weights(pbar)
 
+        _sync_elapsed = _time.time() - _sync_t0
         if dist.get_rank() == 0:
             # int4/fp4 post_process
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
@@ -129,7 +144,15 @@ class UpdateWeightFromDistributed:
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
+            _t0 = _time.time()
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            _continue_elapsed = _time.time() - _t0
+
+            logger.info(
+                f"[WEIGHT UPDATE] sync={_sync_elapsed:.3f}s | "
+                f"continue_generation={_continue_elapsed:.3f}s | "
+                f"total={_sync_elapsed + _continue_elapsed:.3f}s"
+            )
         dist.barrier(group=get_gloo_group())
 
     def _send_weights(self, pbar: tqdm | None) -> None:

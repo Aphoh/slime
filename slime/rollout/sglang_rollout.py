@@ -2,6 +2,7 @@ import asyncio
 import copy
 import inspect
 import logging
+import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -239,6 +240,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
 async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
     """Generate using Dynamo frontend with OpenAI-compatible completions API."""
+    import time as _time
+
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/completions"
 
@@ -276,7 +279,10 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
     if stop:
         payload["stop"] = stop
 
-    output = await post(url, payload)
+    _req_t0 = _time.time()
+    with trace_span(sample, "dynamo_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"], "prompt_len": len(token_ids)}) as span:
+        output = await post(url, payload)
+    _req_elapsed = _time.time() - _req_t0
 
     choice = output["choices"][0]
     response_text = choice["text"]
@@ -284,24 +290,39 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
     # Extract token IDs and logprobs directly — no re-tokenization needed.
     new_response_tokens = []
     new_response_log_probs = []
+    _had_fallback_tokenize = False
     if choice.get("logprobs") and choice["logprobs"].get("token_logprobs"):
         new_response_log_probs = choice["logprobs"]["token_logprobs"]
         for tok in choice["logprobs"].get("tokens", []):
             if isinstance(tok, str) and tok.startswith("token_id:"):
                 new_response_tokens.append(int(tok[len("token_id:"):]))
             else:
+                _had_fallback_tokenize = True
                 ids = state.tokenizer.encode(tok, add_special_tokens=False)
                 new_response_tokens.append(ids[0] if ids else 0)
 
     if not new_response_tokens and response_text:
+        _had_fallback_tokenize = True
         new_response_tokens = state.tokenizer.encode(response_text, add_special_tokens=False)
 
     # Align logprobs length with token count
-    if len(new_response_log_probs) != len(new_response_tokens):
+    _logprob_mismatch = len(new_response_log_probs) != len(new_response_tokens)
+    if _logprob_mismatch:
         if len(new_response_log_probs) > len(new_response_tokens):
             new_response_log_probs = new_response_log_probs[: len(new_response_tokens)]
         else:
             new_response_log_probs.extend([0.0] * (len(new_response_tokens) - len(new_response_log_probs)))
+
+    _tok_per_sec = len(new_response_tokens) / _req_elapsed if _req_elapsed > 0 else 0
+    logger.debug(
+        f"[DYNAMO REQUEST] prompt_tokens={len(token_ids)} | "
+        f"output_tokens={len(new_response_tokens)} | "
+        f"latency={_req_elapsed:.3f}s | "
+        f"tok/s={_tok_per_sec:.1f} | "
+        f"finish={choice.get('finish_reason', 'unknown')} | "
+        f"fallback_tokenize={_had_fallback_tokenize} | "
+        f"logprob_mismatch={_logprob_mismatch}"
+    )
 
     sample.tokens = sample.tokens + new_response_tokens
     sample.response_length += len(new_response_tokens)
@@ -345,6 +366,7 @@ async def generate_and_rm(
     state = GenerateState(args)
 
     # generate
+    _gen_t0 = time.time()
     async with state.semaphore:
         if state.aborted:
             sample.status = Sample.Status.ABORTED
@@ -363,11 +385,13 @@ async def generate_and_rm(
                     sample = await custom_generate_func(args, sample, sampling_params)
             else:
                 sample = await generate(args, sample, sampling_params)
+    _gen_elapsed = time.time() - _gen_t0
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
         return sample
 
+    _rm_t0 = time.time()
     if isinstance(sample, list):
         samples = sample
         if any(sample.status == Sample.Status.ABORTED for sample in samples):
@@ -378,6 +402,10 @@ async def generate_and_rm(
             rewards = await batched_async_rm(args, samples_need_reward)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
+        _rm_elapsed = time.time() - _rm_t0
+        # Track non-generation time on all samples
+        for s in samples:
+            s.non_generation_time += _rm_elapsed
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
@@ -386,6 +414,8 @@ async def generate_and_rm(
         if sample.reward is None:
             with trace_span(sample, "reward_model"):
                 sample.reward = await async_rm(args, sample)
+        _rm_elapsed = time.time() - _rm_t0
+        sample.non_generation_time += _rm_elapsed
 
     return sample
 
@@ -517,6 +547,9 @@ async def generate_rollout_async(
     data = []
     all_data = []
     do_print = True
+    _gen_start = time.time()
+    _group_latencies = []
+    _group_token_counts = []
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
@@ -526,6 +559,7 @@ async def generate_rollout_async(
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+        _batch_done_t = time.time()
         for task in done:
             group: list[Sample] = task.result()
 
@@ -538,6 +572,15 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
+
+            # Track per-group completion stats
+            _group_total_tokens = sum(
+                (s.response_length if not isinstance(s, list) else sum(ss.response_length for ss in s))
+                for s in group
+            )
+            _group_latencies.append(_batch_done_t - _gen_start)
+            _group_token_counts.append(_group_total_tokens)
+
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
@@ -550,7 +593,25 @@ async def generate_rollout_async(
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
 
+    _gen_elapsed = time.time() - _gen_start
     pbar.close()
+
+    # Log generation phase summary
+    if _group_latencies:
+        _first_group_t = min(_group_latencies)
+        _last_group_t = max(_group_latencies)
+        _total_tokens = sum(_group_token_counts)
+        _median_lat = sorted(_group_latencies)[len(_group_latencies) // 2]
+        logger.info(
+            f"[ROLLOUT GEN] total={_gen_elapsed:.2f}s | "
+            f"groups_completed={len(_group_latencies)} | "
+            f"total_output_tokens={_total_tokens} | "
+            f"first_group_done={_first_group_t:.2f}s | "
+            f"median_group_done={_median_lat:.2f}s | "
+            f"last_group_done={_last_group_t:.2f}s | "
+            f"overall_tok/s={_total_tokens / _gen_elapsed:.1f}"
+        )
+
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
         f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",

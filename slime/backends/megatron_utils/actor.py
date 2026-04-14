@@ -604,17 +604,22 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @timer
     def update_weights(self) -> None:
+        import time as _time
+
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        _t0 = _time.time()
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.recover_updatable_engines.remote())
             dist.barrier(group=get_gloo_group())
 
+        _get_engines_t0 = _time.time()
         rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
             self.rollout_manager.get_updatable_engines_and_lock.remote()
         )
+        _get_engines_elapsed = _time.time() - _get_engines_t0
 
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
 
@@ -623,7 +628,9 @@ class MegatronTrainRayActor(TrainRayActor):
         elif self.args.offload_train:
             reload_process_groups()
 
+        _connect_elapsed = 0.0
         if num_new_engines > 0 or reconnect_rollout_engines:
+            _connect_t0 = _time.time()
             self.weight_updater.connect_rollout_engines(
                 rollout_engines,
                 rollout_engine_lock,
@@ -631,12 +638,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 engine_gpu_offsets=engine_gpu_offsets,
             )
             dist.barrier(group=get_gloo_group())
+            _connect_elapsed = _time.time() - _connect_t0
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
+            _sync_t0 = _time.time()
             self.weight_updater.update_weights()
+            _sync_elapsed = _time.time() - _sync_t0
             print_memory("after update_weights")
 
             if self.args.ci_test and len(rollout_engines) > 0 and self.weight_updater.weight_version > 0:
@@ -657,6 +667,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
+
+        _total_elapsed = _time.time() - _t0
+        if dist.get_rank() == 0:
+            logger.info(
+                f"[WEIGHT UPDATE OUTER] get_engines={_get_engines_elapsed:.3f}s | "
+                f"connect={_connect_elapsed:.3f}s | "
+                f"sync={_sync_elapsed:.3f}s | "
+                f"total={_total_elapsed:.3f}s | "
+                f"num_engines={len(rollout_engines)} | "
+                f"num_new={num_new_engines}"
+            )
 
         if reconnect_rollout_engines:
             self.sleep()
