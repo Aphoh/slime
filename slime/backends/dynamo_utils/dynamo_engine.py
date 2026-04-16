@@ -190,6 +190,13 @@ class DynamoEngine(RayActor):
         # /engine/* routes (including call_tokenizer_manager).  It only
         # starts when DYN_SYSTEM_PORT >= 0.
         env["DYN_SYSTEM_PORT"] = str(self.server_port)
+        # Block hashes in KV events must be deterministic across workers so
+        # the router can match predicted inserts with engine-published
+        # events.  Without a fixed hash seed Python's randomized hash leaks
+        # into SGLang's block-hash derivation and the router logs
+        # "block_hash mismatch: sequence hashes should be uniform across
+        # workers", preventing any prefix cache hits.
+        env.setdefault("PYTHONHASHSEED", "0")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(self._base_gpu_id + i) for i in range(gpus_per_engine)
         )
