@@ -303,6 +303,52 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Dynamo frontend router mode. Defaults to round-robin (or kv if PD disaggregation is enabled).",
             )
             parser.add_argument(
+                "--dynamo-router-kv-events",
+                action="store_true",
+                default=True,
+                help=(
+                    "When using --dynamo-router-mode kv, consume real KV events from workers "
+                    "via the NATS event plane (default). Workers publish via ZMQ -> NATS. "
+                    "Pass --no-dynamo-router-kv-events to fall back to approximate mode where "
+                    "the router tracks its own routing decisions locally."
+                ),
+            )
+            parser.add_argument(
+                "--no-dynamo-router-kv-events",
+                dest="dynamo_router_kv_events",
+                action="store_false",
+                help="Disable KV event consumption; use approximate mode.",
+            )
+            parser.add_argument(
+                "--dynamo-router-predict-on-route",
+                action="store_true",
+                default=True,
+                help=(
+                    "When using --dynamo-router-mode kv, speculatively insert a request's "
+                    "blocks into the router's indexer at routing time so sibling requests "
+                    "arriving in the same burst (n-samples-per-prompt, best-of-N) see the "
+                    "shared prefix and pin to the same worker. Works together with "
+                    "--dynamo-router-kv-events: real engine events promote the speculative "
+                    "entry via TTL-upgrade. Default on."
+                ),
+            )
+            parser.add_argument(
+                "--no-dynamo-router-predict-on-route",
+                dest="dynamo_router_predict_on_route",
+                action="store_false",
+                help="Disable predict-on-route speculative inserts.",
+            )
+            parser.add_argument(
+                "--dynamo-router-predicted-ttl-secs",
+                type=float,
+                default=5.0,
+                help=(
+                    "TTL in seconds applied to --dynamo-router-predict-on-route speculative "
+                    "inserts. Short values (2-5s) let predictions expire quickly if the "
+                    "engine never confirms them (e.g. cancelled request). Default 5s."
+                ),
+            )
+            parser.add_argument(
                 "--hf-checkpoint",
                 type=str,
                 default=None,

@@ -153,6 +153,27 @@ class DynamoEngine(RayActor):
             if self._disaggregation_bootstrap_port:
                 cmd.extend(["--disaggregation-bootstrap-port", str(self._disaggregation_bootstrap_port)])
 
+        # Publish KV cache events when the router is configured to consume
+        # them. Each worker binds a unique ZMQ port; the router subscribes
+        # via NATS. When --no-dynamo-router-kv-events is set, skip the
+        # publisher — the router uses approximate / predict-on-route mode.
+        publish_kv_events = (
+            self._discovery_backend == "etcd"
+            and getattr(args, "dynamo_router_kv_events", True)
+        )
+        if publish_kv_events:
+            import json as _json
+            kv_events_cfg = getattr(args, "sglang_kv_events_config", None)
+            if not kv_events_cfg:
+                zmq_port = self.server_port + 10000  # unique per engine
+                kv_events_cfg = _json.dumps({
+                    "publisher": "zmq",
+                    "topic": "kv-events",
+                    "endpoint": f"tcp://*:{zmq_port}",
+                    "enable_kv_cache_events": True,
+                })
+            cmd.extend(["--kv-events-config", kv_events_cfg])
+
         # Per-group sglang overrides (skip keys already handled above)
         _skip_override_keys = {"model_path", "tp", "port", "host", "enable_rl"}
         for key, value in self.sglang_overrides.items():
