@@ -349,6 +349,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-sibling-stagger-ms",
+                type=float,
+                default=0,
+                help=(
+                    "Delay in milliseconds between submitting sibling requests within a "
+                    "group (n-samples-per-prompt). Staggering lets the first sibling's "
+                    "prefill populate the worker's radix cache before later siblings "
+                    "arrive, so they can reuse the prefix. 0 disables staggering."
+                ),
+            )
+            parser.add_argument(
                 "--hf-checkpoint",
                 type=str,
                 default=None,
