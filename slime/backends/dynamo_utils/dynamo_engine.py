@@ -135,6 +135,10 @@ class DynamoEngine(RayActor):
         if getattr(args, "sglang_mem_fraction_static", None) is not None:
             cmd.extend(["--mem-fraction-static", str(args.sglang_mem_fraction_static)])
 
+        stream_interval = getattr(args, "rollout_stream_interval", 1)
+        if stream_interval != 1:
+            cmd.extend(["--stream-interval", str(stream_interval)])
+
         if getattr(args, "sglang_dp_size", 1) > 1:
             cmd.extend(["--dp-size", str(args.sglang_dp_size)])
 
