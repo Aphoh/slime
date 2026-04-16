@@ -588,6 +588,9 @@ def _compute_server_args(
         # Always enable Prometheus metrics so the router /engine_metrics endpoint
         # is available for external scraping.
         "enable_metrics": True,
+        # Batch scheduler->detokenizer output pushes so stream_output=True
+        # (forced by dynamo.sglang) does not cost a round-trip per token.
+        "stream_interval": getattr(args, "rollout_stream_interval", 1),
     }
 
     if worker_type == "prefill":

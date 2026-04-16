@@ -349,6 +349,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-stream-interval",
+                type=int,
+                default=1,
+                help=(
+                    "Forwarded to the SGLang worker (both native sglang and dynamo.sglang) as "
+                    "--stream-interval. Dynamo forces stream_output=True, which costs per-token "
+                    "scheduler->detokenizer round-trips; bumping stream_interval batches those "
+                    "round-trips. Values around 50 roughly close the decode-throughput gap with "
+                    "the native SGLang router on large-batch RL rollouts."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-sibling-stagger-ms",
                 type=float,
                 default=0,
