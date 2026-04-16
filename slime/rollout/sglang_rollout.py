@@ -199,9 +199,24 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         if getattr(args, "router_policy", None) == "consistent_hashing":
             headers = {"X-SMG-Routing-Key": sample.session_id}
 
+    import time as _time
+    _req_t0 = _time.time()
     with trace_span(sample, "sglang_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
         output = await post(url, payload, headers=headers)
         span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
+    _req_elapsed = _time.time() - _req_t0
+    _prompt_len = len(payload.get("input_ids") or prompt_ids)
+    _output_len = output["meta_info"].get("completion_tokens", 0)
+    _cached_tokens = output["meta_info"].get("cached_tokens", 0)
+    _tok_per_sec = _output_len / _req_elapsed if _req_elapsed > 0 else 0
+    logger.info(
+        f"[SGLANG REQUEST] prompt_tokens={_prompt_len} | "
+        f"output_tokens={_output_len} | "
+        f"cached_tokens={_cached_tokens} | "
+        f"latency={_req_elapsed:.3f}s | "
+        f"tok/s={_tok_per_sec:.1f} | "
+        f"finish={output['meta_info'].get('finish_reason', {}).get('type', 'unknown')}"
+    )
 
     if "output_token_logprobs" in output["meta_info"]:
         new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -314,7 +329,7 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
             new_response_log_probs.extend([0.0] * (len(new_response_tokens) - len(new_response_log_probs)))
 
     _tok_per_sec = len(new_response_tokens) / _req_elapsed if _req_elapsed > 0 else 0
-    logger.debug(
+    logger.info(
         f"[DYNAMO REQUEST] prompt_tokens={len(token_ids)} | "
         f"output_tokens={len(new_response_tokens)} | "
         f"latency={_req_elapsed:.3f}s | "
