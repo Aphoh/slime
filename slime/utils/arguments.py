@@ -349,6 +349,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-numa-node",
+                type=int,
+                default=None,
+                help=(
+                    "Pin the dynamo.sglang rollout worker subprocess to this "
+                    "NUMA node via numactl --cpunodebind/--membind. Use the "
+                    "NUMA node the GPUs are attached to (inspect "
+                    "/sys/bus/pci/devices/<bus>/numa_node). Avoids cross-NUMA "
+                    "PCIe traffic on every CUDA call."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-stream-interval",
                 type=int,
                 default=1,

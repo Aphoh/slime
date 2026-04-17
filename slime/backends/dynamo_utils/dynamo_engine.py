@@ -132,6 +132,20 @@ class DynamoEngine(RayActor):
             "--enable-rl",
         ]
 
+        # Pin the worker + all its scheduler/detokenizer/tokenizer_manager
+        # subprocesses to the NUMA node the GPUs sit on. Without this, the
+        # scheduler thread ping-pongs across NUMA nodes and every CUDA call
+        # pays cross-socket PCIe latency — measured ~10% GPU-forward slowdown
+        # on B200 vs native sglang_router (which happens to land on NUMA 1
+        # through different launch dynamics).
+        numa_node = getattr(args, "rollout_numa_node", None)
+        if numa_node is not None and os.path.exists("/usr/bin/numactl"):
+            cmd = [
+                "/usr/bin/numactl",
+                f"--cpunodebind={numa_node}",
+                f"--membind={numa_node}",
+            ] + cmd
+
         if getattr(args, "sglang_mem_fraction_static", None) is not None:
             cmd.extend(["--mem-fraction-static", str(args.sglang_mem_fraction_static)])
 
