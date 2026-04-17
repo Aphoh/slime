@@ -283,7 +283,7 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
         "max_tokens": sampling_params["max_new_tokens"],
         "temperature": sampling_params.get("temperature", 1.0),
         "top_p": sampling_params.get("top_p", 1.0),
-        "logprobs": 1,
+        "logprobs": 0,
         "return_tokens_as_token_ids": True,
         "stream": False,
     }
