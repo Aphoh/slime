@@ -201,6 +201,12 @@ class DynamoEngine(RayActor):
         # "block_hash mismatch: sequence hashes should be uniform across
         # workers", preventing any prefix cache hits.
         env.setdefault("PYTHONHASHSEED", "0")
+        # Force dynamo.sglang's decode_handler to call SGLang's engine with
+        # stream=False. Slime always aggregates full responses, so we get no
+        # benefit from the per-chunk scheduler->detokenizer push path — and
+        # pay a ~4-5k tok/s aggregate decode-throughput penalty for it. See
+        # dynamo commit 724b1a994e1 for the backend-side toggle.
+        env.setdefault("DYN_SGL_FORCE_NONSTREAM", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(self._base_gpu_id + i) for i in range(gpus_per_engine)
         )
