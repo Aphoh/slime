@@ -82,7 +82,25 @@ class DynamoEngine(RayActor):
         disaggregation_bootstrap_port=None,
         router_ip=None,
         router_port=None,
+        external_host=None,
+        external_port=None,
+        external_tp_size=None,
     ):
+        # External mode: bind to a worker the DGD already launched.
+        if external_host is not None:
+            self.server_host = _format_ipv6(external_host)
+            self.server_port = int(external_port)
+            self.node_rank = 0
+            self.tp_size = int(external_tp_size or 1)
+            self._base_gpu_id = 0
+            self._external = True
+            logger.info(
+                "DynamoEngine (rank=%d) bound to external worker at %s:%s",
+                self.rank, self.server_host, self.server_port,
+            )
+            return
+
+        self._external = False
         host = _format_ipv6(host or get_host_info()[1])
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_ipv6(ip_part)}:{port_part}"
@@ -257,6 +275,9 @@ class DynamoEngine(RayActor):
         kill_process_tree(self.process.pid)
 
     def simulate_crash(self):
+        if getattr(self, "_external", False):
+            logger.info("simulate_crash is a no-op for external Dynamo engines")
+            return
         if self.process:
             logger.info("Simulating crash on Dynamo engine %s:%s", self.server_host, self.server_port)
             self.shutdown()
