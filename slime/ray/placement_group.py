@@ -98,11 +98,15 @@ def _create_placement_group(num_gpus):
 
 def _get_placement_group_layout(args) -> tuple[int, int]:
     actor_num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+    dynamo_external = bool(getattr(args, "dynamo_frontend_url", None))
+
+    if dynamo_external and args.colocate:
+        raise ValueError("--colocate is incompatible with --dynamo-frontend-url")
 
     if args.debug_train_only:
         return actor_num_gpus, 0
 
-    if args.rollout_external:
+    if args.rollout_external or dynamo_external:
         if args.debug_rollout_only:
             return 0, 0
         return actor_num_gpus, actor_num_gpus

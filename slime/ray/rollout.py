@@ -211,6 +211,50 @@ class ServerGroup:
         ]
         return init_handles, port_cursors
 
+    def bind_external_engines(self, workers: list) -> list:
+        """Create Ray actors that wrap externally-managed Dynamo workers.
+
+        Each actor has ``num_gpus=0``, no placement group, and calls
+        ``init(external_host=..., external_port=...)`` to skip subprocess
+        launch.  Returns a list of init ObjectRefs that the caller should
+        ``ray.get()`` on.
+        """
+        from slime.backends.dynamo_utils.dynamo_engine import DynamoEngine
+
+        RolloutRayActor = ray.remote(DynamoEngine)
+        num_engines = len(workers)
+        if self.all_engines and len(self.all_engines) != num_engines:
+            logger.warning(
+                "ServerGroup pre-sized to %d engines but %d external workers given; resizing.",
+                len(self.all_engines), num_engines,
+            )
+        self.all_engines = [None] * num_engines
+
+        init_handles = []
+        for i, w in enumerate(workers):
+            actor = RolloutRayActor.options(num_cpus=1, num_gpus=0).remote(
+                self.args,
+                rank=self.rank_offset + i,
+                worker_type=self.worker_type,
+                num_gpus_per_engine=w.tp_size,
+            )
+            self.all_engines[i] = actor
+            init_handles.append(
+                actor.init.remote(
+                    dist_init_addr=None,
+                    port=None,
+                    nccl_port=None,
+                    router_ip=self.router_ip,
+                    router_port=self.router_port,
+                    external_host=w.host,
+                    external_port=w.system_port,
+                    external_tp_size=w.tp_size,
+                )
+            )
+        self.num_new_engines = num_engines
+        self.num_gpus_per_engine = workers[0].tp_size if workers else self.num_gpus_per_engine
+        return init_handles
+
     def offload(self):
         """Fire release_memory_occupation on all engines (non-blocking).
 
@@ -1051,7 +1095,90 @@ def _compute_megatron_num_gpus(args) -> int:
     return num
 
 
-def start_rollout_servers(args, pg) -> dict[str, Any]:
+def _start_rollout_servers_external(args) -> dict[str, RolloutServer]:
+    """Bind to an externally-managed Dynamo frontend + worker pool.
+
+    Skips all frontend/worker/placement-group launching. Polls the frontend
+    /health until enough workers are registered, discovers each one's
+    topology via /engine/call_tokenizer_manager, then wraps each worker in
+    a GPU-less Ray actor so the rest of slime's weight-update and generation
+    paths are unchanged.
+    """
+    from urllib.parse import urlparse
+
+    from slime.backends.dynamo_utils.external_discovery import topology_fingerprint, wait_for_workers
+
+    if args.offload_rollout:
+        raise ValueError(
+            "--offload-rollout is incompatible with --dynamo-frontend-url "
+            "(the DGD owns memory lifecycle)."
+        )
+
+    gpus_per_engine = args.rollout_num_gpus_per_engine
+    expected_count = args.rollout_num_gpus // gpus_per_engine
+
+    workers = wait_for_workers(
+        frontend_url=args.dynamo_frontend_url,
+        expected_count=expected_count,
+        dyn_system_port=args.dynamo_worker_system_port,
+        timeout=args.dynamo_frontend_wait_timeout,
+    )
+
+    parsed = urlparse(args.dynamo_frontend_url)
+    router_ip = parsed.hostname
+    router_port = parsed.port
+    args.sglang_router_ip = router_ip
+    args.sglang_router_port = router_port
+
+    # Group workers by worker_type (regular / prefill / decode).
+    by_type: dict[str, list] = {}
+    for w in workers:
+        by_type.setdefault(w.worker_type, []).append(w)
+
+    server_groups: list[ServerGroup] = []
+    engine_offset = 0
+    gpu_offset = 0
+    for worker_type, group_workers in by_type.items():
+        per_engine_gpus = group_workers[0].tp_size
+        group = ServerGroup(
+            args=args,
+            pg=None,
+            all_engines=[None] * len(group_workers),
+            num_gpus_per_engine=per_engine_gpus,
+            num_new_engines=0,
+            worker_type=worker_type,
+            rank_offset=engine_offset,
+            gpu_offset=gpu_offset,
+            sglang_overrides={},
+            needs_offload=False,
+            model_path=args.hf_checkpoint,
+            router_ip=router_ip,
+            router_port=router_port,
+        )
+        handles = group.bind_external_engines(group_workers)
+        ray.get(handles)
+        engine_offset += len(group_workers)
+        gpu_offset += per_engine_gpus * len(group_workers)
+        server_groups.append(group)
+
+    model_name = workers[0].served_model_name or "default"
+    servers = {
+        model_name: RolloutServer(
+            server_groups=server_groups,
+            router_ip=router_ip,
+            router_port=router_port,
+            model_name=model_name,
+            update_weights=True,
+        )
+    }
+    args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
+
+    args._dynamo_topology_fingerprint = topology_fingerprint(workers)
+
+    return servers
+
+
+def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     """Start rollout servers: one per model, each with its own router.
 
     Each model defined in the sglang config gets its own router and set
@@ -1064,8 +1191,16 @@ def start_rollout_servers(args, pg) -> dict[str, Any]:
     Note: ``init_http_client`` should be called separately before this,
     as the HTTP client is shared across all servers.
     """
+    if args.rollout_external and getattr(args, "dynamo_frontend_url", None):
+        raise ValueError(
+            "--rollout-external-engine-addrs and --dynamo-frontend-url are mutually exclusive"
+        )
+
     if args.rollout_external:
         return start_external_rollout_servers(args, start_router=_start_router)
+
+    if getattr(args, "dynamo_frontend_url", None):
+        return _start_rollout_servers_external(args)
 
     config = _resolve_sglang_config(args)
 

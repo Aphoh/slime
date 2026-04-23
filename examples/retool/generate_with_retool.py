@@ -277,7 +277,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 "max_tokens": per_turn_sampling_params["max_new_tokens"],
                 "temperature": sampling_params.get("temperature", 1.0),
                 "top_p": sampling_params.get("top_p", 1.0),
-                "logprobs": 1,
+                "logprobs": 0,
                 "return_tokens_as_token_ids": True,
                 "stream": False,
             }

@@ -361,6 +361,38 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--dynamo-frontend-url",
+                type=str,
+                default=None,
+                help=(
+                    "URL of an externally-managed Dynamo frontend (e.g. a DGD). "
+                    "When set, slime does not launch its own frontend or workers. "
+                    "It polls this URL's /health for workers, discovers topology "
+                    "via /engine/call_tokenizer_manager on each worker's system port, "
+                    "and attaches to the external inference pool as a client."
+                ),
+            )
+            parser.add_argument(
+                "--dynamo-worker-system-port",
+                type=int,
+                default=30001,
+                help=(
+                    "The DYN_SYSTEM_PORT every worker in the DGD exposes /engine/* on. "
+                    "Combined with the host parsed from /health's transport.tcp to "
+                    "build per-worker HTTP URLs. Only used with --dynamo-frontend-url."
+                ),
+            )
+            parser.add_argument(
+                "--dynamo-frontend-wait-timeout",
+                type=int,
+                default=600,
+                help=(
+                    "Seconds to wait for the external Dynamo frontend to report the "
+                    "expected number of workers in /health before giving up. "
+                    "Only used with --dynamo-frontend-url."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-stream-interval",
                 type=int,
                 default=1,
