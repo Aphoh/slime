@@ -20,8 +20,8 @@ import psutil
 
 # Configuration for tool execution
 TOOL_CONFIGS = {
-    "max_turns": 16,
-    "max_tool_calls": 16,
+    "max_turns": 6,
+    "max_tool_calls": 5,
     "tool_concurrency": 32,  # Aggressive: 32 concurrent processes
     # Python interpreter settings
     "python_timeout": 120,  # 2 minutes for complex calculations
