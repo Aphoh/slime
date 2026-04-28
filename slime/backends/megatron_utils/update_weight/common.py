@@ -135,7 +135,15 @@ def named_params_and_buffers(
 def _maybe_get_cpu_backup(x: torch.Tensor):
     from torch_memory_saver import torch_memory_saver
 
-    if (cpu_tensor := torch_memory_saver.get_cpu_backup(x, zero_copy=True)) is not None:
+    get_cpu_backup = getattr(torch_memory_saver, "get_cpu_backup", None)
+    if get_cpu_backup is None:
+        return x
+
+    try:
+        cpu_tensor = get_cpu_backup(x, zero_copy=True)
+    except TypeError:
+        cpu_tensor = get_cpu_backup(x)
+    if cpu_tensor is not None:
         return cpu_tensor
 
     return x

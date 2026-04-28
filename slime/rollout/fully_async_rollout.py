@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import os
 import queue
 import threading
 import time
@@ -48,6 +49,21 @@ logger = logging.getLogger("slime.rollout.fully_async")
 # Global worker, shared across rollout calls so the queue stays warm.
 _global_worker: AsyncRolloutWorker | None = None
 _worker_lock = threading.Lock()
+
+
+def _get_positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r; using %d", name, value, default)
+        return default
+    if parsed <= 0:
+        logger.warning("ignoring non-positive %s=%r; using %d", name, value, default)
+        return default
+    return parsed
 
 
 def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
@@ -80,11 +96,15 @@ class AsyncRolloutWorker:
     def __init__(self, args, data_buffer, concurrency: int = 10):
         self.args = args
         self.data_buffer = data_buffer
-        self.concurrency = concurrency
+        self.concurrency = _get_positive_int_env("SWEPRO_ASYNC_MAX_INFLIGHT", concurrency)
         self.running = True
         self.output_queue: queue.Queue[tuple[int, list[Sample]]] = queue.Queue(maxsize=1000)
         self.worker_thread: threading.Thread | None = None
         self.state = GenerateState(args)
+        self.active_count = 0
+        self.started_count = 0
+        self.completed_count = 0
+        self.failed_count = 0
 
     # -- public --------------------------------------------------------------
 
@@ -131,6 +151,7 @@ class AsyncRolloutWorker:
                         except Exception as e:  # noqa: BLE001
                             logger.warning("fully-async task crashed: %r", e)
                     active_tasks -= done
+                    self.active_count = len(active_tasks)
 
                 # Top up.
                 while len(active_tasks) < max_concurrent and self.running:
@@ -140,6 +161,7 @@ class AsyncRolloutWorker:
                     for group in groups:
                         gid = gid_counter
                         gid_counter += 1
+                        self.started_count += 1
                         task = asyncio.create_task(
                             generate_and_rm_group(
                                 self.args,
@@ -150,6 +172,7 @@ class AsyncRolloutWorker:
                         )
                         task.add_done_callback(self._make_done_cb(gid))
                         active_tasks.add(task)
+                        self.active_count = len(active_tasks)
 
                 await asyncio.sleep(1)
             except Exception as e:  # noqa: BLE001
@@ -171,8 +194,10 @@ class AsyncRolloutWorker:
             try:
                 result = done_task.result()
             except Exception:  # noqa: BLE001
+                self.failed_count += 1
                 logger.exception("fully-async: process task raised")
                 return
+            self.completed_count += 1
             if not isinstance(result, list):
                 logger.warning(
                     "fully-async: generate_and_rm_group returned %r, expected list[Sample]; dropping",
@@ -221,11 +246,16 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         now = time.time()
         if now - last_log > LOG_EVERY:
             logger.info(
-                "fully-async rollout %d: collected %d/%d, queue=%d, elapsed=%.1fs",
+                "fully-async rollout %d: collected %d/%d, queue=%d, active=%d, "
+                "started=%d, completed=%d, failed=%d, elapsed=%.1fs",
                 rollout_id,
                 len(collected),
                 target,
                 worker.queue_size(),
+                worker.active_count,
+                worker.started_count,
+                worker.completed_count,
+                worker.failed_count,
                 now - started,
             )
             last_log = now

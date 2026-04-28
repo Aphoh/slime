@@ -313,6 +313,16 @@ def connect_rollout_engines_from_distributed(
     have heterogeneous TP sizes (e.g. prefill TP=2, decode TP=4), each engine
     occupies a different number of ranks in the NCCL group.
     """
+    # A stopped or crashed training job can leave an engine-side update group
+    # alive. SGLang/Dynamo rejects reusing the same group name, and the training
+    # rank can then block waiting for ranks that never join. Clean up first;
+    # destroying a missing group is best-effort and intentionally non-fatal.
+    stale_group_refs = [engine.destroy_weights_update_group.remote(group_name) for engine in rollout_engines]
+    try:
+        ray.get(stale_group_refs, timeout=30)
+    except Exception as exc:
+        logger.warning("Best-effort cleanup of stale rollout weight group %s failed: %s", group_name, exc)
+
     if engine_gpu_counts is None:
         engine_gpu_counts = [args.rollout_num_gpus_per_engine] * len(rollout_engines)
 
