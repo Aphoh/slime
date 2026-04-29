@@ -21,6 +21,12 @@ from typing import Any
 
 from nats.aio.client import Client as NATS
 
+SLIME_ROOT = Path(__file__).resolve().parents[2]
+if str(SLIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(SLIME_ROOT))
+
+from slime.utils.speedscope_trace import trace_span
+
 CONTROL_PLANE_METHODS = {"close", "health"}
 
 
@@ -148,6 +154,106 @@ def _tool_names(tools: list[dict[str, Any]]) -> set[str]:
     return names
 
 
+def _read_int_file(path: str) -> int | None:
+    try:
+        return int(Path(path).read_text().strip())
+    except Exception:
+        return None
+
+
+def _run_docker_json_lines(args: list[str], *, timeout: float = 5.0) -> list[Any]:
+    try:
+        output = subprocess.check_output(args, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+    except Exception as exc:
+        return [{"error": repr(exc)}]
+    values = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            values.append(json.loads(line))
+        except Exception:
+            values.append({"raw": line})
+    return values
+
+
+def _docker_container_ids(session_id: str) -> list[str]:
+    try:
+        output = subprocess.check_output(
+            ["docker", "ps", "-aq", "--filter", f"label=swepro.session={session_id}"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _docker_state_by_container(container_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not container_ids:
+        return {}
+    lines = _run_docker_json_lines(["docker", "inspect", "--format", "{{json .State}}", *container_ids])
+    states: dict[str, dict[str, Any]] = {}
+    for container_id, value in zip(container_ids, lines, strict=False):
+        states[container_id] = value if isinstance(value, dict) else {"raw": value}
+    return states
+
+
+def _docker_stats_by_container(container_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not container_ids:
+        return {}
+    lines = _run_docker_json_lines(["docker", "stats", "--no-stream", "--format", "{{json .}}", *container_ids])
+    stats: dict[str, dict[str, Any]] = {}
+    for value in lines:
+        if not isinstance(value, dict):
+            continue
+        container = str(value.get("Container") or value.get("ID") or "")
+        if container:
+            stats[container] = value
+    return stats
+
+
+def _session_resource_snapshot(session_id: str) -> dict[str, Any]:
+    container_ids = _docker_container_ids(session_id)
+    states = _docker_state_by_container(container_ids)
+    stats = _docker_stats_by_container(container_ids)
+    containers = []
+    for container_id in container_ids:
+        short_id = container_id[:12]
+        containers.append(
+            {
+                "id": short_id,
+                "state": states.get(container_id) or states.get(short_id) or {},
+                "stats": stats.get(container_id) or stats.get(short_id) or {},
+            }
+        )
+    return {
+        "pod_memory_current": _read_int_file("/sys/fs/cgroup/memory.current"),
+        "pod_memory_peak": _read_int_file("/sys/fs/cgroup/memory.peak"),
+        "containers": containers,
+    }
+
+
+def _snapshot_has_oom(snapshot: dict[str, Any]) -> bool:
+    for container in snapshot.get("containers") or []:
+        state = container.get("state") or {}
+        if state.get("OOMKilled") is True:
+            return True
+        if state.get("ExitCode") == 137:
+            return True
+    return False
+
+
+def _observation_looks_like_oom(observation: str) -> bool:
+    return bool(re.search(r"\b(killed|oom|out of memory|cannot allocate memory)\b", observation, re.IGNORECASE))
+
+
+def _log_tool_resource_event(event: dict[str, Any]) -> None:
+    print("swepro-session-tool-resource " + json.dumps(event, default=_json_default), flush=True)
+
+
 @dataclass
 class Session:
     session_id: str
@@ -244,19 +350,26 @@ class SessionManager:
         )
         env = None
         try:
-            env = SWEEnv.from_config(env_cfg)
-            tools = ToolHandler(self._tools_config)
-            env.start()
-            tools.install(env)
-            env.set_env_variables(
-                {
-                    "PAGER": "cat",
-                    "GIT_PAGER": "cat",
-                    "GH_PAGER": "cat",
-                    "LESS": "-F -X",
-                    "TERM": "dumb",
-                }
-            )
+            with trace_span(
+                f"session/{self.worker_id}/{session_id}",
+                "session.bootstrap",
+                worker_id=self.worker_id,
+                session_id=session_id,
+                instance_id=instance_id,
+            ):
+                env = SWEEnv.from_config(env_cfg)
+                tools = ToolHandler(self._tools_config)
+                env.start()
+                tools.install(env)
+                env.set_env_variables(
+                    {
+                        "PAGER": "cat",
+                        "GIT_PAGER": "cat",
+                        "GH_PAGER": "cat",
+                        "LESS": "-F -X",
+                        "TERM": "dumb",
+                    }
+                )
         except Exception:
             if env is not None:
                 try:
@@ -372,24 +485,85 @@ class SessionManager:
                 "error": None,
             }
         timeout = self._execution_timeout()
-        try:
-            observation = session.env.communicate(
-                input=run_action,
-                timeout=timeout,
-                check="ignore",
-            )
-        except self._imports["BashIncorrectSyntaxError"] as exc:
-            observation = _tool_error_observation(exc)
-        except self._imports["CommandTimeoutError"]:
+        started_at = time.time()
+        before_resources = _session_resource_snapshot(session.session_id)
+        tool_error = None
+        communication_error = None
+        session_dropped = False
+        with trace_span(
+            f"session/{self.worker_id}/{session.session_id}",
+            f"tool.run {name}",
+            worker_id=self.worker_id,
+            session_id=session.session_id,
+            instance_id=session.instance_id,
+            timeout_s=timeout,
+        ):
             try:
-                session.env.interrupt_session()
-            except Exception:
-                traceback.print_exc()
+                observation = session.env.communicate(
+                    input=run_action,
+                    timeout=timeout,
+                    check="ignore",
+                )
+            except self._imports["BashIncorrectSyntaxError"] as exc:
+                observation = _tool_error_observation(exc)
+                tool_error = type(exc).__name__
+            except self._imports["CommandTimeoutError"]:
+                try:
+                    session.env.interrupt_session()
+                except Exception:
+                    traceback.print_exc()
+                observation = (
+                    f"The command was cancelled because it took more than {timeout:g} seconds. "
+                    "Please inspect less broadly or run a narrower command."
+                )
+                tool_error = "timeout"
+            except Exception as exc:
+                observation = _tool_error_observation(exc)
+                tool_error = type(exc).__name__
+                communication_error = exc
+
+        after_resources = _session_resource_snapshot(session.session_id)
+        docker_oom = _snapshot_has_oom(after_resources)
+        possible_oom = docker_oom or _observation_looks_like_oom(observation)
+        if possible_oom:
+            tool_error = "container_oom" if docker_oom else "possible_oom"
             observation = (
-                f"The command was cancelled because it took more than {timeout:g} seconds. "
-                "Please inspect less broadly or run a narrower command."
+                f"{observation}\n\n"
+                "The previous command likely exceeded the container memory limit. "
+                "Try a narrower command, inspect fewer files, or run tests in smaller batches."
             )
-        state = session.tools.get_state(session.env)
+
+        state_error = None
+        try:
+            state = session.tools.get_state(session.env)
+        except Exception as exc:
+            state = {}
+            state_error = repr(exc)
+            if possible_oom or communication_error is not None:
+                tool_error = tool_error or type(exc).__name__
+                close_error = self._drop_session(session.session_id, reason=tool_error)
+                if close_error:
+                    state_error = f"{state_error}; close_error={close_error}"
+                session_dropped = True
+            else:
+                raise
+
+        elapsed = time.time() - started_at
+        _log_tool_resource_event(
+            {
+                "event": "step",
+                "worker_id": self.worker_id,
+                "session_id": session.session_id,
+                "instance_id": session.instance_id,
+                "tool": name,
+                "elapsed_s": elapsed,
+                "tool_error": tool_error,
+                "session_dropped": session_dropped,
+                "state_error": state_error,
+                "before": before_resources,
+                "after": after_resources,
+            }
+        )
         submission = _extract_submission(observation)
         submitted = submission is not None or session.tools.check_for_submission_cmd(observation)
         return {
@@ -404,6 +578,10 @@ class SessionManager:
             "submitted": submitted,
             "done": submitted,
             "submission": submission,
+            "tool_error": tool_error,
+            "session_dropped": session_dropped,
+            "state_error": state_error,
+            "resources": {"before": before_resources, "after": after_resources, "elapsed_s": elapsed},
             "error": None,
         }
 
@@ -411,12 +589,19 @@ class SessionManager:
         session = self._get(request["session_id"])
         output = {"message": "", "tool_calls": [{"id": "call_submit", "type": "function", "function": {"name": "submit", "arguments": "{}"}}]}
         _, action = session.tools.parse_actions(output)
-        observation = session.env.communicate(
-            input=session.tools.guard_multiline_input(action).strip(),
-            timeout=session.tools.config.execution_timeout,
-            check="ignore",
-        )
-        state = session.tools.get_state(session.env)
+        with trace_span(
+            f"session/{self.worker_id}/{session.session_id}",
+            "tool.submit",
+            worker_id=self.worker_id,
+            session_id=session.session_id,
+            instance_id=session.instance_id,
+        ):
+            observation = session.env.communicate(
+                input=session.tools.guard_multiline_input(action).strip(),
+                timeout=session.tools.config.execution_timeout,
+                check="ignore",
+            )
+            state = session.tools.get_state(session.env)
         return {
             "session_id": session.session_id,
             "worker_id": self.worker_id,
@@ -428,7 +613,8 @@ class SessionManager:
 
     def close(self, request: dict[str, Any]) -> dict[str, Any]:
         session_id = request["session_id"]
-        close_error = self._drop_session(session_id, reason="explicit close")
+        with trace_span(f"session/{self.worker_id}/{session_id}", "session.close", worker_id=self.worker_id, session_id=session_id):
+            close_error = self._drop_session(session_id, reason="explicit close")
         return {
             "session_id": session_id,
             "worker_id": self.worker_id,

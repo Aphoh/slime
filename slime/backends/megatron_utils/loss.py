@@ -571,6 +571,42 @@ def apply_opd_kl_to_advantages(
     rollout_data["opd_reverse_kl"] = reverse_kls
 
 
+def _get_local_response_loss_mask(
+    args: Namespace,
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    max_seq_lens: list[int] | None = None,
+) -> torch.Tensor:
+    if mpu.get_context_parallel_world_size() == 1:
+        return torch.cat(loss_masks, dim=0)
+
+    local_masks: list[torch.Tensor] = []
+    for i, (total_length, response_length, loss_mask) in enumerate(
+        zip(total_lengths, response_lengths, loss_masks, strict=False)
+    ):
+        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        prompt_length = total_length - response_length
+        _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(
+            total_length,
+            response_length,
+            args.qkv_format,
+            max_seq_len,
+        )
+        parts = []
+        for start, end in token_offsets:
+            response_start = max(0, start - prompt_length)
+            response_end = max(0, end - prompt_length)
+            if response_end > response_start:
+                parts.append(loss_mask[response_start:response_end])
+        if parts:
+            local_masks.append(torch.cat(parts, dim=0))
+        else:
+            local_masks.append(loss_mask.new_zeros((0,)))
+
+    return torch.cat(local_masks, dim=0)
+
+
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
@@ -895,7 +931,26 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+    policy_loss_mask = _get_local_response_loss_mask(
+        args,
+        total_lengths,
+        response_lengths,
+        batch["loss_masks"],
+        max_seq_lens,
+    )
+    ppo_kl_for_metrics = torch.where(
+        policy_loss_mask.to(dtype=torch.bool) & torch.isfinite(ppo_kl),
+        ppo_kl,
+        torch.zeros_like(ppo_kl),
+    )
+
+    pg_loss, pg_clipfrac = compute_policy_loss(
+        ppo_kl,
+        advantages,
+        args.eps_clip,
+        args.eps_clip_high,
+        loss_mask=policy_loss_mask,
+    )
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -960,7 +1015,7 @@ def policy_loss_function(
 
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
-    ppo_kl = sum_of_sample_mean(ppo_kl)
+    ppo_kl = sum_of_sample_mean(ppo_kl_for_metrics)
 
     # entropy loss
     entropy = log_probs_and_entropy["entropy"]

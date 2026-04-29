@@ -1,6 +1,6 @@
 import gc
 import os
-import shutil
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -52,7 +52,8 @@ def get_args():
     def ceildiv(a, b):
         return -(a // -b)
 
-    if args.pipeline_model_parallel_size == 1 and world_size > 1:
+    auto_pipeline = os.environ.get("SLIME_CONVERT_AUTO_PIPELINE", "1") not in {"0", "false", "False", "no", "No"}
+    if auto_pipeline and args.pipeline_model_parallel_size == 1 and world_size > 1:
         pp_size = world_size
         while True:
             args.pipeline_model_parallel_size = pp_size
@@ -77,6 +78,33 @@ def get_args():
     return args
 
 
+def _env_true(name: str) -> bool:
+    return os.environ.get(name, "0") in {"1", "true", "True", "yes", "Yes"}
+
+
+def _broadcast_file_from_rank0(path: Path, local_rank: int, global_rank: int) -> None:
+    if global_rank == 0:
+        payload = path.read_bytes() if path.exists() else None
+        size = torch.tensor([-1 if payload is None else len(payload)], dtype=torch.long)
+    else:
+        payload = None
+        size = torch.tensor([-1], dtype=torch.long)
+
+    dist.broadcast(size, src=0)
+    if size.item() < 0:
+        return
+
+    if global_rank == 0:
+        data = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+    else:
+        data = torch.empty(size.item(), dtype=torch.uint8)
+    dist.broadcast(data, src=0)
+
+    if local_rank == 0 and global_rank != 0:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data.numpy().tobytes())
+
+
 def main():
     if torch.version.hip:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
@@ -98,12 +126,15 @@ def main():
     os.environ.setdefault("LOCAL_RANK", str(local_rank))
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "12355")
-    dist.init_process_group(
-        backend="nccl",
-        world_size=world_size,
-        rank=global_rank,
-        device_id=torch.device(f"cuda:{local_rank}"),
-    )
+    process_group_backend = os.environ.get("SLIME_CONVERT_PROCESS_GROUP_BACKEND", "nccl")
+    init_kwargs = {
+        "backend": process_group_backend,
+        "world_size": world_size,
+        "rank": global_rank,
+    }
+    if process_group_backend == "nccl":
+        init_kwargs["device_id"] = torch.device(f"cuda:{local_rank}")
+    dist.init_process_group(**init_kwargs)
     args = get_args()
     init(args)
 
@@ -127,16 +158,16 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-    save_checkpoint(1, model, None, None, 0)
+    save_checkpoint(1, model, None, None, 0, release=True)
 
-    if dist.get_rank() == 0:
-        # change to release ckpt
-        tracker_filename = get_checkpoint_tracker_filename(args.save)
-        with open(tracker_filename, "w") as f:
-            f.write("release")
-        source_dir = get_checkpoint_name(args.save, 1, False, return_base_dir=True)
-        target_dir = get_checkpoint_name(args.save, -1, True, return_base_dir=True)
-        shutil.move(source_dir, target_dir)
+    if _env_true("SLIME_CONVERT_LOCAL_CHECKPOINT"):
+        checkpoint_dir = Path(get_checkpoint_name(args.save, -1, True, return_base_dir=True))
+        for filename in ("common.pt", ".metadata"):
+            _broadcast_file_from_rank0(checkpoint_dir / filename, local_rank, global_rank)
+        if local_rank == 0:
+            tracker_filename = get_checkpoint_tracker_filename(args.save)
+            with open(tracker_filename, "w") as f:
+                f.write("release")
     dist.barrier()
     dist.destroy_process_group()
 

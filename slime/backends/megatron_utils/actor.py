@@ -22,6 +22,7 @@ from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
+from slime.utils.speedscope_trace import trace_span
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
 
@@ -42,6 +43,12 @@ from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _trainer_trace_profile(role: str = "actor") -> str:
+    if dist.is_initialized():
+        return f"trainer/{role}/rank{dist.get_rank()}"
+    return f"trainer/{role}/pid{os.getpid()}"
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -391,15 +398,20 @@ class MegatronTrainRayActor(TrainRayActor):
         store_prefix: str = "",
     ) -> dict[str, list[torch.Tensor]]:
 
-        with timer(f"{store_prefix}log_probs"):
-            return forward_only(
-                get_log_probs_and_entropy,
-                self.args,
-                self.model,
-                data_iterator,
-                num_microbatches,
-                store_prefix=store_prefix,
-            )
+        with trace_span(
+            _trainer_trace_profile("actor"),
+            f"trainer.batch.{store_prefix}log_probs",
+            store_prefix=store_prefix,
+        ):
+            with timer(f"{store_prefix}log_probs"):
+                return forward_only(
+                    get_log_probs_and_entropy,
+                    self.args,
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                    store_prefix=store_prefix,
+                )
 
     def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
         if self.args.debug_rollout_only:
@@ -408,8 +420,9 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             self.wake_up()
 
-        with timer("data_preprocess"):
-            rollout_data = self._get_rollout_data(rollout_data_ref)
+        with trace_span(_trainer_trace_profile(self.role), "trainer.data_preprocess", rollout_id=rollout_id):
+            with timer("data_preprocess"):
+                rollout_data = self._get_rollout_data(rollout_data_ref)
 
         if self.role == "critic":
             result = self.train_critic(rollout_id, rollout_data)
@@ -425,7 +438,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch):
         """Train critic and return CPU values (used as old-values for the next actor train)."""
-        data_iterator = get_data_iterator(rollout_data)
+        with trace_span(_trainer_trace_profile("critic"), "trainer.batch.build_iterator", rollout_id=rollout_id):
+            data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
 
@@ -530,7 +544,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
-                compute_advantages_and_returns(self.args, rollout_data)
+                with trace_span(_trainer_trace_profile("actor"), "trainer.batch.advantages", rollout_id=rollout_id):
+                    compute_advantages_and_returns(self.args, rollout_data)
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
@@ -544,16 +559,17 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
-            with timer("actor_train"):
-                train(
-                    rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
-                    global_batch_sizes,
-                )
+            with trace_span(_trainer_trace_profile("actor"), "trainer.batch.train", rollout_id=rollout_id):
+                with timer("actor_train"):
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                        global_batch_sizes,
+                    )
 
             self.prof.step(rollout_id=rollout_id)
 

@@ -50,6 +50,73 @@ class _Message:
         self.responses.append(json.loads(payload.decode("utf-8")))
 
 
+def test_step_drops_session_when_deployment_disappears():
+    runner = _load_session_runner()
+
+    class DeploymentNotStartedError(Exception):
+        pass
+
+    class CommandTimeoutError(Exception):
+        pass
+
+    class BashIncorrectSyntaxError(Exception):
+        pass
+
+    class _Env:
+        closed = False
+
+        def communicate(self, **kwargs):
+            raise DeploymentNotStartedError("Deployment not started")
+
+        def close(self):
+            self.closed = True
+
+    class _Tools:
+        config = types.SimpleNamespace(execution_timeout=1)
+
+        def parse_actions(self, output):
+            return "thought", "echo hi"
+
+        def guard_multiline_input(self, action):
+            return action
+
+        def get_state(self, env):
+            raise DeploymentNotStartedError("Deployment not started")
+
+        def check_for_submission_cmd(self, observation):
+            return False
+
+    env = _Env()
+    manager = runner.SessionManager.__new__(runner.SessionManager)
+    manager.worker_id = "worker-0"
+    manager.sessions = {
+        "sid": runner.Session(
+            session_id="sid",
+            instance_id="instance-0",
+            env=env,
+            tools=_Tools(),
+            started_at=0,
+            last_used_at=0,
+        )
+    }
+    manager._lock = threading.RLock()
+    manager._valid_tools = {"bash"}
+    manager._tools_config = types.SimpleNamespace(execution_timeout=1)
+    manager._imports = {
+        "CommandTimeoutError": CommandTimeoutError,
+        "BashIncorrectSyntaxError": BashIncorrectSyntaxError,
+    }
+
+    result = manager.step({"session_id": "sid", "tool_call": {"function": {"name": "bash"}}})
+
+    assert result["error"] is None
+    assert result["session_dropped"] is True
+    assert result["tool_error"] == "DeploymentNotStartedError"
+    assert "Deployment not started" in result["state_error"]
+    assert "sid" not in manager.sessions
+    assert env.closed is True
+
+
 async def _health_completes_while_step_is_blocked(*, shared_semaphore: bool) -> bool:
     runner = _load_session_runner()
     manager = _BlockingManager()

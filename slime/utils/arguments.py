@@ -29,6 +29,8 @@ def reset_arg(parser, name, **kwargs):
         if name in action.option_strings:
             if "default" in kwargs:
                 action.default = kwargs["default"]
+            if "choices" in kwargs:
+                action.choices = kwargs["choices"]
             break
     else:
         parser.add_argument(name, **kwargs)
@@ -100,7 +102,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
 
-            reset_arg(parser, "--distributed-backend", type=str, default="nccl")
+            reset_arg(
+                parser,
+                "--distributed-backend",
+                type=str,
+                default="nccl",
+                choices=["nccl", "gloo", "cpu:gloo,cuda:nccl"],
+            )
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)
 
             return parser
