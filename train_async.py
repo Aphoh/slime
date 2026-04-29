@@ -7,6 +7,7 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.speedscope_trace import trace_span
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,8 @@ def train(args):
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
     # Always push actor weights to rollout once weights are loaded.
-    actor_model.update_weights()
+    with trace_span("driver", "weights.initial_update"):
+        actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
@@ -38,28 +40,35 @@ def train(args):
     if allow_stale_rollouts:
         logger.info("SLIME_ASYNC_ALLOW_STALE_ROLLOUTS=1: weight updates will not wait for prefetched rollout data.")
 
-    rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
+    with trace_span("driver", "rollout.submit", rollout_id=args.start_rollout_id):
+        rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # Sync the last generation
         if rollout_data_next_future is not None:
-            rollout_data_curr_ref = ray.get(rollout_data_next_future)
+            with trace_span("driver", "rollout.wait", rollout_id=rollout_id):
+                rollout_data_curr_ref = ray.get(rollout_data_next_future)
 
         # Start the next rollout early.
         if rollout_id + 1 < args.num_rollout:
-            rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+            with trace_span("driver", "rollout.submit", rollout_id=rollout_id + 1):
+                rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
         if release_train:
             actor_model.create()
 
         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
         if args.use_critic:
-            value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
+            with trace_span("driver", "trainer.critic.submit", rollout_id=rollout_id):
+                value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
             if actor_trains:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
+                with trace_span("driver", "trainer.actor.wait", rollout_id=rollout_id):
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
             else:
-                ray.get(value_refs)
+                with trace_span("driver", "trainer.critic.wait", rollout_id=rollout_id):
+                    ray.get(value_refs)
         else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+            with trace_span("driver", "trainer.actor.wait", rollout_id=rollout_id):
+                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 
         if release_train or should_run_periodic_action(
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
@@ -84,7 +93,8 @@ def train(args):
                 # during a rollout request.
                 rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
                 rollout_data_next_future = None
-            actor_model.update_weights()
+            with trace_span("driver", "weights.update", rollout_id=rollout_id):
+                actor_model.update_weights()
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))

@@ -128,7 +128,17 @@ def compute_policy_loss(
     eps_clip: float,
     eps_clip_high: float,
     eps_clip_c: float | None = None,
+    loss_mask: torch.Tensor | None = None,
 ):
+    if loss_mask is not None:
+        active = loss_mask.to(dtype=torch.bool)
+        ppo_kl = torch.where(active, ppo_kl, torch.zeros_like(ppo_kl))
+        advantages = torch.where(active, advantages, torch.zeros_like(advantages))
+
+    # A zero-advantage token has no policy-gradient contribution. Avoid forming
+    # exp(+/-inf) for those positions, since 0 * inf is NaN in floating point.
+    ppo_kl = torch.where(advantages == 0, torch.zeros_like(ppo_kl), ppo_kl)
+
     ratio = (-ppo_kl).exp()
     pg_losses1 = -ratio * advantages
     pg_losses2 = -ratio.clamp(1 - eps_clip, 1 + eps_clip_high) * advantages
