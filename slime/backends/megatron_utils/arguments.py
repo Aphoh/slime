@@ -74,14 +74,16 @@ def validate_args(args):
 
     _megatron_validate_args(args)
 
-    # always use varlen
-    args.variable_seq_lengths = True
+    # THD uses packed/variable-length sequence metadata. BSHD is the padded
+    # fixed-shape fallback used for dispatchers that cannot run with varlen.
+    args.variable_seq_lengths = args.qkv_format == "thd"
     if getattr(args, "moe_token_dispatcher_type", None) == "allgather":
-        logger.info(
-            "--moe-token-dispatcher-type allgather does not support variable sequence length, "
-            "please use alltoall dispatcher instead."
-        )
-        args.moe_token_dispatcher_type = "alltoall"
+        if args.variable_seq_lengths:
+            logger.info(
+                "--moe-token-dispatcher-type allgather does not support variable sequence length, "
+                "please use alltoall dispatcher instead."
+            )
+            args.moe_token_dispatcher_type = "alltoall"
 
     if args.pipeline_model_parallel_size == 1:
         assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, (

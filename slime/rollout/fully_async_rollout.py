@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import concurrent.futures
 import logging
 import os
 import queue
@@ -36,6 +37,7 @@ import time
 from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
 from slime.utils.async_utils import run
 from slime.utils.http_utils import get_rollout_num_engines
+from slime.utils.speedscope_trace import trace_span
 from slime.utils.types import Sample
 
 __all__ = [
@@ -97,6 +99,13 @@ class AsyncRolloutWorker:
         self.args = args
         self.data_buffer = data_buffer
         self.concurrency = _get_positive_int_env("SWEPRO_ASYNC_MAX_INFLIGHT", concurrency)
+        self.max_thread_workers = _get_positive_int_env(
+            "SWEPRO_ASYNC_THREADPOOL_WORKERS",
+            max(
+                self.concurrency * max(1, getattr(args, "n_samples_per_prompt", 1)),
+                concurrency,
+            ),
+        )
         self.running = True
         self.output_queue: queue.Queue[tuple[int, list[Sample]]] = queue.Queue(maxsize=1000)
         self.worker_thread: threading.Thread | None = None
@@ -133,7 +142,27 @@ class AsyncRolloutWorker:
     # -- internals -----------------------------------------------------------
 
     def _thread_main(self) -> None:
-        asyncio.run(self._loop())
+        loop = asyncio.new_event_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_thread_workers,
+            thread_name_prefix="swepro-rollout",
+        )
+        loop.set_default_executor(executor)
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._loop())
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            loop.close()
+
+    async def _generate_group_with_trace(self, gid: int, group: list[Sample]) -> list[Sample]:
+        with trace_span("async_rollout", "rollout.group.generate", group_id=gid):
+            return await generate_and_rm_group(
+                self.args,
+                group,
+                sampling_params=self.state.sampling_params.copy(),
+                evaluation=False,
+            )
 
     async def _loop(self) -> None:
         active_tasks: set[asyncio.Task] = set()
@@ -162,14 +191,7 @@ class AsyncRolloutWorker:
                         gid = gid_counter
                         gid_counter += 1
                         self.started_count += 1
-                        task = asyncio.create_task(
-                            generate_and_rm_group(
-                                self.args,
-                                group,
-                                sampling_params=self.state.sampling_params.copy(),
-                                evaluation=False,
-                            )
-                        )
+                        task = asyncio.create_task(self._generate_group_with_trace(gid, group))
                         task.add_done_callback(self._make_done_cb(gid))
                         active_tasks.add(task)
                         self.active_count = len(active_tasks)
@@ -233,32 +255,33 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
     last_log = started
     LOG_EVERY = 30.0
 
-    while len(collected) < target:
-        # Pull whatever's done.
-        drained = 0
-        for gid, group in worker.get_completed_groups():
-            collected[gid] = group
-            drained += 1
+    with trace_span("async_rollout", "rollout.batch.collect", rollout_id=rollout_id, target_groups=target):
+        while len(collected) < target:
+            # Pull whatever's done.
+            drained = 0
+            for gid, group in worker.get_completed_groups():
+                collected[gid] = group
+                drained += 1
 
-        if not drained:
-            await asyncio.sleep(0.05)
+            if not drained:
+                await asyncio.sleep(0.05)
 
-        now = time.time()
-        if now - last_log > LOG_EVERY:
-            logger.info(
-                "fully-async rollout %d: collected %d/%d, queue=%d, active=%d, "
-                "started=%d, completed=%d, failed=%d, elapsed=%.1fs",
-                rollout_id,
-                len(collected),
-                target,
-                worker.queue_size(),
-                worker.active_count,
-                worker.started_count,
-                worker.completed_count,
-                worker.failed_count,
-                now - started,
-            )
-            last_log = now
+            now = time.time()
+            if now - last_log > LOG_EVERY:
+                logger.info(
+                    "fully-async rollout %d: collected %d/%d, queue=%d, active=%d, "
+                    "started=%d, completed=%d, failed=%d, elapsed=%.1fs",
+                    rollout_id,
+                    len(collected),
+                    target,
+                    worker.queue_size(),
+                    worker.active_count,
+                    worker.started_count,
+                    worker.completed_count,
+                    worker.failed_count,
+                    now - started,
+                )
+                last_log = now
 
     # Order by sample.index for determinism (slime convention).
     def _key(group: list[Sample]) -> int:

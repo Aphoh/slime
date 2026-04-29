@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import itertools
 import json
 import logging
@@ -33,6 +34,7 @@ from sweagent_session import SweAgentSessionClient
 
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.mask_utils import MultiTurnLossMaskGenerator
+from slime.utils.speedscope_trace import record_span, trace_now, trace_span
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,36 @@ def _positive_int_env(name: str, default: int) -> int:
         return default
     try:
         parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %s", name, value, default)
+        return default
+    if parsed <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using %s", name, value, default)
+        return default
+    return parsed
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %s", name, value, default)
+        return default
+    if parsed < 0:
+        logger.warning("Ignoring negative %s=%r; using %s", name, value, default)
+        return default
+    return parsed
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(value)
     except ValueError:
         logger.warning("Ignoring invalid %s=%r; using %s", name, value, default)
         return default
@@ -81,8 +113,30 @@ def _episode_wall_timeout_s() -> float | None:
     return timeout
 
 
+def _model_call_timeout_s() -> float:
+    return _positive_float_env("SWEPRO_MODEL_CALL_TIMEOUT", 600.0)
+
+
+def _session_call_timeout_s(kind: str, default: float) -> float:
+    specific = f"SWEPRO_SESSION_{kind.upper()}_CALL_TIMEOUT"
+    if os.getenv(specific):
+        return _positive_float_env(specific, default)
+    return _positive_float_env("SWEPRO_SESSION_CALL_TIMEOUT", default)
+
+
+async def _await_with_timeout(awaitable, *, timeout: float, label: str):
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except TimeoutError as exc:
+        raise TimeoutError(f"{label} timed out after {timeout:g}s") from exc
+
+
 def _metadata(sample: Sample) -> dict[str, Any]:
     return sample.metadata if isinstance(sample.metadata, dict) else {}
+
+
+def _rollout_trace_profile(instance_id: Any, sample: Sample) -> str:
+    return f"rollout/{instance_id}/{getattr(sample, 'index', 'unknown')}/{uuid.uuid4().hex[:8]}"
 
 
 def _list(value: Any) -> list[str]:
@@ -462,6 +516,8 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
     instance_id = metadata.get("instance_id") or sample.label
     if not instance_id:
         raise ValueError("SWE-bench Pro sample is missing instance_id")
+    trace_profile = _rollout_trace_profile(instance_id, sample)
+    rollout_span_start = trace_now()
     base_commit = metadata.get("base_commit")
     if not base_commit:
         raise ValueError(f"SWE-bench Pro sample {instance_id} is missing base_commit")
@@ -487,13 +543,20 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
     turn_iter = itertools.count() if max_tool_calls is None else range(max_tool_calls)
     started_at = time.time()
     try:
-        started = await client.start(
-            instance_id=str(instance_id),
-            image_name=image_name,
-            base_commit=str(base_commit),
-            repo_name=str((metadata.get("sweagent") or {}).get("repo_name") or metadata.get("repo_name") or "app"),
-            sample=metadata.get("raw_row") or metadata,
-        )
+        with trace_span(trace_profile, "session.start", instance_id=instance_id):
+            started = await _await_with_timeout(
+                client.start(
+                    instance_id=str(instance_id),
+                    image_name=image_name,
+                    base_commit=str(base_commit),
+                    repo_name=str(
+                        (metadata.get("sweagent") or {}).get("repo_name") or metadata.get("repo_name") or "app"
+                    ),
+                    sample=metadata.get("raw_row") or metadata,
+                ),
+                timeout=_session_call_timeout_s("start", 900.0),
+                label=f"SWE-agent session start for {instance_id}",
+            )
         session_id = started["session_id"]
         tools = started["tools"]
         prompt_token_ids = model.encode_prompt(messages, tools=tools)
@@ -531,16 +594,36 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
             if remaining_context is not None:
                 max_turn_tokens = min(max_turn_tokens, remaining_context)
 
-            result = await asyncio.to_thread(
-                model.complete_prompt_ids,
-                current_ids,
-                trace_messages=messages,
-                max_tokens=max_turn_tokens,
-                temperature=sampling_params.get("temperature", getattr(args, "rollout_temperature", 1.0)),
-                top_p=sampling_params.get("top_p", getattr(args, "rollout_top_p", 1.0)),
-                top_k=sampling_params.get("top_k", getattr(args, "rollout_top_k", None)),
-                stop=sampling_params.get("stop") or GLM_TOOL_STOPS,
-            )
+            inference_start = trace_now()
+            try:
+                result = await _await_with_timeout(
+                    asyncio.to_thread(
+                        model.complete_prompt_ids,
+                        current_ids,
+                        trace_messages=messages,
+                        max_tokens=max_turn_tokens,
+                        temperature=sampling_params.get("temperature", getattr(args, "rollout_temperature", 1.0)),
+                        top_p=sampling_params.get("top_p", getattr(args, "rollout_top_p", 1.0)),
+                        top_k=sampling_params.get("top_k", getattr(args, "rollout_top_k", None)),
+                        stop=sampling_params.get("stop") or GLM_TOOL_STOPS,
+                    ),
+                    timeout=_model_call_timeout_s(),
+                    label=f"model completion for {instance_id} turn {turn}",
+                )
+            except Exception as exc:
+                record_span(
+                    trace_profile,
+                    "inference.complete",
+                    inference_start,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    turn=turn,
+                    prompt_tokens=len(current_ids),
+                    max_tokens=max_turn_tokens,
+                    error=repr(exc),
+                )
+                raise
+            inference_end = trace_now()
             content = result["content"]
             extra = result["extra"]
             generated_ids = list(extra.get("generated_token_ids") or [])
@@ -549,6 +632,20 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 generated_logprobs.extend([0.0] * (len(generated_ids) - len(generated_logprobs)))
             generated_logprobs = generated_logprobs[: len(generated_ids)]
             finish_reason = extra.get("finish_reason") or "stop"
+            record_span(
+                trace_profile,
+                "inference.complete",
+                inference_start,
+                inference_end,
+                instance_id=instance_id,
+                session_id=session_id,
+                turn=turn,
+                prompt_tokens=len(current_ids),
+                completion_tokens=len(generated_ids),
+                generated_tokens=len(generated_ids),
+                max_tokens=max_turn_tokens,
+                finish_reason=finish_reason,
+            )
 
             content_for_history = content
             normal_text, tool_calls, needs_tool_close = _parse_tool_call_from_generated_tokens(model, content, generated_ids)
@@ -623,13 +720,49 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                     break
                 continue
 
-            step = await client.step(session_id, tool_calls[0], thought=normal_text)
+            tool_name = tool_calls[0].get("function", {}).get("name")
+            session_step_start = trace_now()
+            step = None
+            try:
+                step = await _await_with_timeout(
+                    client.step(session_id, tool_calls[0], thought=normal_text),
+                    timeout=_session_call_timeout_s("step", 180.0),
+                    label=f"SWE-agent session step for {instance_id} turn {turn}",
+                )
+            finally:
+                record_span(
+                    trace_profile,
+                    f"session.step {tool_name or 'unknown'}",
+                    session_step_start,
+                    instance_id=instance_id,
+                    session_id=session_id,
+                    turn=turn,
+                    worker_id=step.get("worker_id") if isinstance(step, dict) else None,
+                    tool_error=step.get("tool_error") if isinstance(step, dict) else None,
+                )
             observation = step.get("observation") or ""
             submitted = bool(step.get("submitted"))
+            if step.get("tool_error"):
+                trace_event["tool_error"] = step.get("tool_error")
+            if step.get("resources"):
+                trace_event["resources"] = step.get("resources")
+            if step.get("session_dropped"):
+                finish_reason = "session_dropped"
+                metadata["retryable_session_error"] = step.get("tool_error") or "session_dropped"
+                trace_event["session_dropped"] = True
+                trace_event["observation_tail"] = observation[-2000:]
+                trace.append(trace_event)
+                session_id = None
+                break
             if submitted:
                 submission = step.get("submission") or ""
                 if not submission:
-                    submit_result = await client.submit(session_id)
+                    with trace_span(trace_profile, "session.submit", instance_id=instance_id, session_id=session_id):
+                        submit_result = await _await_with_timeout(
+                            client.submit(session_id),
+                            timeout=_session_call_timeout_s("submit", 300.0),
+                            label=f"SWE-agent session submit for {instance_id}",
+                        )
                     submission = submit_result.get("submission") or ""
                 trace_event["submitted"] = True
                 trace.append(trace_event)
@@ -678,11 +811,20 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
             finish_reason = "length"
 
         if not submission and session_id:
-            submit_result = await client.submit(session_id)
+            with trace_span(trace_profile, "session.submit", instance_id=instance_id, session_id=session_id):
+                submit_result = await _await_with_timeout(
+                    client.submit(session_id),
+                    timeout=_session_call_timeout_s("submit", 300.0),
+                    label=f"SWE-agent session submit for {instance_id}",
+                )
             submission = submit_result.get("submission") or ""
 
     except Exception as exc:
         logger.exception("SWE-agent session rollout failed for %s", instance_id)
+        if isinstance(exc, TimeoutError):
+            metadata["rollout_timeout_error"] = repr(exc)
+            if str(exc).startswith("SWE-agent session "):
+                metadata["retryable_session_error"] = repr(exc)
         if response_token_ids and sum(loss_mask) > 0:
             metadata["session_error"] = repr(exc)
             metadata["session_error_traceback"] = traceback.format_exc()
@@ -714,9 +856,24 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
     finally:
         if session_id:
             try:
-                await client.close(session_id)
+                with trace_span(trace_profile, "session.close", instance_id=instance_id, session_id=session_id):
+                    await _await_with_timeout(
+                        client.close(session_id),
+                        timeout=_session_call_timeout_s("close", 60.0),
+                        label=f"SWE-agent session close for {instance_id}",
+                    )
             except Exception:
                 logger.exception("failed to close SWE-agent session %s", session_id)
+        record_span(
+            trace_profile,
+            "rollout.sample",
+            rollout_span_start,
+            instance_id=instance_id,
+            session_id=session_id,
+            turns=len(trace),
+            response_tokens=len(response_token_ids),
+            finish_reason=finish_reason,
+        )
 
     if not response_token_ids or sum(loss_mask) <= 0:
         return _mark_untrainable_sample(
@@ -743,6 +900,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
         submission=submission,
         finish_reason=finish_reason,
         started_at=started_at,
+        status=Sample.Status.FAILED if metadata.get("retryable_session_error") else None,
         max_context_len=max_context,
     )
 
@@ -759,7 +917,25 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     max_context = _max_context_len(args)
 
     if mode == "sweagent_session":
-        return await _generate_sweagent_session(args, sample, sampling_params)
+        retries = _nonnegative_int_env("SWEPRO_SESSION_ROLLOUT_RETRIES", 0)
+        original_sample = copy.deepcopy(sample)
+        last_result = sample
+        for attempt in range(retries + 1):
+            attempt_sample = sample if attempt == 0 else copy.deepcopy(original_sample)
+            result = await _generate_sweagent_session(args, attempt_sample, sampling_params)
+            result.metadata["session_attempt"] = attempt + 1
+            last_result = result
+            retryable_error = _metadata(result).get("retryable_session_error")
+            if not retryable_error or attempt >= retries:
+                return result
+            logger.warning(
+                "Retrying SWE-agent session rollout for %s after %s (attempt %s/%s)",
+                _metadata(result).get("instance_id") or result.label,
+                retryable_error,
+                attempt + 1,
+                retries + 1,
+            )
+        return last_result
 
     if mode == "gold_patch":
         content = metadata.get("gold_patch", "")
@@ -769,15 +945,21 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         extra = {"generated_token_ids": [], "token_logprobs": [], "finish_reason": "stop", "mode": mode}
     elif mode == "direct_patch":
         model = _get_model(args)
-        result = await asyncio.to_thread(
-            model.query,
-            messages,
-            max_tokens=_turn_max_tokens(args, sampling_params),
-            temperature=sampling_params.get("temperature", getattr(args, "rollout_temperature", 1.0)),
-            top_p=sampling_params.get("top_p", getattr(args, "rollout_top_p", 1.0)),
-            top_k=sampling_params.get("top_k", getattr(args, "rollout_top_k", None)),
-            stop=sampling_params.get("stop"),
-        )
+        with trace_span(
+            _rollout_trace_profile(metadata.get("instance_id") or sample.label, sample),
+            "inference.complete",
+            instance_id=metadata.get("instance_id") or sample.label,
+            mode=mode,
+        ):
+            result = await asyncio.to_thread(
+                model.query,
+                messages,
+                max_tokens=_turn_max_tokens(args, sampling_params),
+                temperature=sampling_params.get("temperature", getattr(args, "rollout_temperature", 1.0)),
+                top_p=sampling_params.get("top_p", getattr(args, "rollout_top_p", 1.0)),
+                top_k=sampling_params.get("top_k", getattr(args, "rollout_top_k", None)),
+                stop=sampling_params.get("stop"),
+            )
         content = result["content"]
         extra = result["extra"]
     else:
