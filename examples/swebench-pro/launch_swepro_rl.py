@@ -34,6 +34,16 @@ def env_str(env: dict[str, str], name: str, default: str) -> str:
     return default if value is None or value == "" else value
 
 
+def default_run_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"swepro_{stamp}"
+
+
+def ray_submission_id(run_id: str) -> str:
+    submission_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id).strip(".-")
+    return submission_id or default_run_id()
+
+
 def detect_nvlink() -> str:
     try:
         topo = subprocess.check_output(["nvidia-smi", "topo", "-m"], text=True, stderr=subprocess.DEVNULL)
@@ -57,11 +67,10 @@ def apply_profile_defaults(env: dict[str, str], profile: str, repo_root: Path, *
     if profile != "speedscope-current":
         raise ValueError(f"unknown profile: {profile}")
 
-    run_id = env.get("SWEPRO_RUN_ID")
-    if not run_id:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        run_id = f"gcp02_speedscope_8gpu_tp1_pp1_cp8_ep8_131k_16kpg_{stamp}"
-        env["SWEPRO_RUN_ID"] = run_id
+    run_id = env.setdefault(
+        "SWEPRO_RUN_ID",
+        f"gcp02_speedscope_8gpu_tp1_pp1_cp8_ep8_131k_16kpg_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+    )
 
     trace_dir = repo_root / ".traces"
     if write_state:
@@ -84,6 +93,7 @@ def apply_profile_defaults(env: dict[str, str], profile: str, repo_root: Path, *
         "SWEPRO_N_SAMPLES_PER_PROMPT": "4",
         "SWEPRO_GLOBAL_BATCH_SIZE": "64",
         "SWEPRO_ASYNC_MAX_INFLIGHT": "16",
+        "SWEPRO_ASYNC_GROUP_MAX_ATTEMPTS": "2",
         "SWEPRO_ACTOR_NUM_NODES": "2",
         "SWEPRO_ACTOR_NUM_GPUS_PER_NODE": "4",
         "SWEPRO_TP": "1",
@@ -139,6 +149,15 @@ class DerivedConfig:
     log_probs_chunk_size: int
 
 
+@dataclass(frozen=True)
+class DurableLogConfig:
+    enabled: bool
+    run_id: str
+    submission_id: str
+    log_dir: Path
+    poll_seconds: int
+
+
 def derive_config(env: dict[str, str]) -> DerivedConfig:
     actor_num_nodes = env_int(env, "SWEPRO_ACTOR_NUM_NODES", 1)
     actor_num_gpus_per_node = env_int(env, "SWEPRO_ACTOR_NUM_GPUS_PER_NODE", 4)
@@ -174,48 +193,114 @@ def derive_config(env: dict[str, str]) -> DerivedConfig:
     )
 
 
+def durable_log_config(env: dict[str, str]) -> DurableLogConfig:
+    run_id = env.setdefault("SWEPRO_RUN_ID", default_run_id())
+    submission_id = env_str(env, "SWEPRO_RAY_SUBMISSION_ID", ray_submission_id(run_id))
+    log_dir = Path(env_str(env, "SWEPRO_DURABLE_LOG_DIR", f"/data/swebench-pro/runs/{submission_id}"))
+    return DurableLogConfig(
+        enabled=env_flag(env, "SWEPRO_DURABLE_LOGS", True),
+        run_id=run_id,
+        submission_id=submission_id,
+        log_dir=log_dir,
+        poll_seconds=env_int(env, "SWEPRO_DURABLE_LOG_POLL_SECONDS", 30),
+    )
+
+
 def runtime_env(env: dict[str, str], repo_root: Path, has_nvlink: str) -> dict[str, dict[str, str]]:
     swepro_dir = str(repo_root / "examples/swebench-pro")
     fully_async_dir = str(repo_root / "examples/fully_async")
     trace_path = env.get("SLIME_SPEEDSCOPE_TRACE_PATH", "")
     swepro_trace_path = env.get("SWEPRO_SPEEDSCOPE_TRACE_PATH", trace_path)
+    env_vars = {
+        "PYTHONPATH": f"/root/src/Megatron-LM/:{swepro_dir}:{fully_async_dir}:{repo_root}",
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "NCCL_NVLS_ENABLE": env_str(env, "NCCL_NVLS_ENABLE", has_nvlink),
+        "NCCL_MNNVL_ENABLE": env_str(env, "NCCL_MNNVL_ENABLE", "0"),
+        "NCCL_CUMEM_ENABLE": env_str(env, "NCCL_CUMEM_ENABLE", "1"),
+        "NCCL_CUMEM_HOST_ENABLE": env_str(env, "NCCL_CUMEM_HOST_ENABLE", "1"),
+        "MC_FORCE_MNNVL": env_str(env, "MC_FORCE_MNNVL", ""),
+        "NCCL_IB_DISABLE": env_str(env, "NCCL_IB_DISABLE", ""),
+        "NCCL_SHM_DISABLE": env_str(env, "NCCL_SHM_DISABLE", ""),
+        "NCCL_P2P_DISABLE": env_str(env, "NCCL_P2P_DISABLE", ""),
+        "NCCL_ALGO": env_str(env, "NCCL_ALGO", ""),
+        "NCCL_PROTO": env_str(env, "NCCL_PROTO", ""),
+        "NCCL_STORE_TIMEOUT": env_str(env, "NCCL_STORE_TIMEOUT", "7200"),
+        "NCCL_GRAPH_MIXING_SUPPORT": env_str(env, "NCCL_GRAPH_MIXING_SUPPORT", ""),
+        "NCCL_IB_GID_INDEX": env_str(env, "NCCL_IB_GID_INDEX", ""),
+        "NCCL_SOCKET_IFNAME": env_str(env, "NCCL_SOCKET_IFNAME", "eth0"),
+        "GLOO_SOCKET_IFNAME": env_str(env, "GLOO_SOCKET_IFNAME", "eth0"),
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING": env_str(env, "TORCH_NCCL_ASYNC_ERROR_HANDLING", "1"),
+        "NCCL_DEBUG": env_str(env, "NCCL_DEBUG", ""),
+        "NVIDIA_GDRCOPY": env_str(env, "NVIDIA_GDRCOPY", "1"),
+        "UCX_TLS": env_str(env, "UCX_TLS", "cuda_ipc,cuda_copy,rc"),
+        "UCX_IB_GID_INDEX": env_str(env, "UCX_IB_GID_INDEX", "3"),
+        "UCX_RC_TIMEOUT": env_str(env, "UCX_RC_TIMEOUT", "600s"),
+        "UCX_KEEPALIVE_INTERVAL": env_str(env, "UCX_KEEPALIVE_INTERVAL", "300s"),
+        "NIXL_LOG_LEVEL": env_str(env, "NIXL_LOG_LEVEL", ""),
+        "NIXL_TELEMETRY_ENABLE": env_str(env, "NIXL_TELEMETRY_ENABLE", ""),
+        "NIXL_TELEMETRY_EXPORTER": env_str(env, "NIXL_TELEMETRY_EXPORTER", ""),
+        "NIXL_TELEMETRY_PROMETHEUS_PORT": env_str(env, "NIXL_TELEMETRY_PROMETHEUS_PORT", ""),
+        "RAY_DEDUP_LOGS": "0",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "SLIME_ASYNC_ALLOW_STALE_ROLLOUTS": env_str(env, "SLIME_ASYNC_ALLOW_STALE_ROLLOUTS", "1"),
+        "SLIME_WEIGHT_UPDATE_FLATTENED_BUCKET": env_str(env, "SLIME_WEIGHT_UPDATE_FLATTENED_BUCKET", "1"),
+        "SLIME_WEIGHT_UPDATE_NCCL_IB_DISABLE": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_IB_DISABLE", ""),
+        "SLIME_WEIGHT_UPDATE_NCCL_IB_HCA": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_IB_HCA", ""),
+        "SLIME_WEIGHT_UPDATE_NCCL_IB_GID_INDEX": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_IB_GID_INDEX", ""),
+        "SLIME_WEIGHT_UPDATE_NCCL_MNNVL_ENABLE": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_MNNVL_ENABLE", "0"),
+        "SLIME_WEIGHT_UPDATE_MC_FORCE_MNNVL": env_str(env, "SLIME_WEIGHT_UPDATE_MC_FORCE_MNNVL", ""),
+        "SLIME_WEIGHT_UPDATE_NCCL_NVLS_ENABLE": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_NVLS_ENABLE", ""),
+        "SLIME_WEIGHT_UPDATE_NCCL_DEBUG": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_DEBUG", ""),
+        "SLIME_WEIGHT_UPDATE_NCCL_DEBUG_SUBSYS": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_DEBUG_SUBSYS", ""),
+        "SLIME_SPEEDSCOPE_TRACE_PATH": trace_path,
+        "SWEPRO_SPEEDSCOPE_TRACE_PATH": swepro_trace_path,
+        "SWEPRO_NATS_URL": env_str(env, "SWEPRO_NATS_URL", "nats://warnold-swepro-nats:4222"),
+        "SWEPRO_AGENT_MODE": env_str(env, "SWEPRO_AGENT_MODE", "sweagent_session"),
+        "SWEPRO_MAX_TOOL_CALLS": env_str(env, "SWEPRO_MAX_TOOL_CALLS", "20"),
+        "SWEPRO_EPISODE_WALL_TIMEOUT": env_str(env, "SWEPRO_EPISODE_WALL_TIMEOUT", "0"),
+        "SWEPRO_TURN_MAX_TOKENS": env_str(env, "SWEPRO_TURN_MAX_TOKENS", "8192"),
+        "SWEPRO_MODEL": env_str(env, "SWEPRO_MODEL", "/data/glm-4.7-30b-a3b"),
+        "SWEPRO_MODEL_TRACE_PATH": env.get("SWEPRO_MODEL_TRACE_PATH", ""),
+        "SWEPRO_MODEL_CALL_TIMEOUT": env_str(env, "SWEPRO_MODEL_CALL_TIMEOUT", "600"),
+        "SWEPRO_REQUEST_TIMEOUT": env_str(env, "SWEPRO_REQUEST_TIMEOUT", "540"),
+        "SWEPRO_REQUEST_RETRIES": env_str(env, "SWEPRO_REQUEST_RETRIES", "2"),
+        "SWEPRO_SESSION_START_TIMEOUT": env_str(env, "SWEPRO_SESSION_START_TIMEOUT", "900"),
+        "SWEPRO_SESSION_START_CALL_TIMEOUT": env_str(
+            env,
+            "SWEPRO_SESSION_START_CALL_TIMEOUT",
+            env_str(env, "SWEPRO_SESSION_START_TIMEOUT", "900"),
+        ),
+        "SWEPRO_SESSION_STEP_REQUEST_TIMEOUT": env_str(env, "SWEPRO_SESSION_STEP_REQUEST_TIMEOUT", "180"),
+        "SWEPRO_SESSION_STEP_CALL_TIMEOUT": env_str(
+            env,
+            "SWEPRO_SESSION_STEP_CALL_TIMEOUT",
+            env_str(env, "SWEPRO_SESSION_STEP_REQUEST_TIMEOUT", "180"),
+        ),
+        "SWEPRO_SESSION_SUBMIT_REQUEST_TIMEOUT": env_str(env, "SWEPRO_SESSION_SUBMIT_REQUEST_TIMEOUT", "300"),
+        "SWEPRO_SESSION_SUBMIT_CALL_TIMEOUT": env_str(
+            env,
+            "SWEPRO_SESSION_SUBMIT_CALL_TIMEOUT",
+            env_str(env, "SWEPRO_SESSION_SUBMIT_REQUEST_TIMEOUT", "300"),
+        ),
+        "SWEPRO_SESSION_CLOSE_TIMEOUT": env_str(env, "SWEPRO_SESSION_CLOSE_TIMEOUT", "60"),
+        "SWEPRO_SESSION_CLOSE_CALL_TIMEOUT": env_str(
+            env,
+            "SWEPRO_SESSION_CLOSE_CALL_TIMEOUT",
+            env_str(env, "SWEPRO_SESSION_CLOSE_TIMEOUT", "60"),
+        ),
+        "SWEPRO_SESSION_HEALTH_TIMEOUT": env_str(env, "SWEPRO_SESSION_HEALTH_TIMEOUT", "30"),
+        "SWEPRO_SESSION_HEALTH_CALL_TIMEOUT": env_str(
+            env,
+            "SWEPRO_SESSION_HEALTH_CALL_TIMEOUT",
+            env_str(env, "SWEPRO_SESSION_HEALTH_TIMEOUT", "30"),
+        ),
+        "SWEPRO_SESSION_CAPACITY_RETRY_DELAY": env_str(env, "SWEPRO_SESSION_CAPACITY_RETRY_DELAY", "10"),
+        "SWEPRO_SESSION_ROLLOUT_RETRIES": env_str(env, "SWEPRO_SESSION_ROLLOUT_RETRIES", "0"),
+        "SWEPRO_ASYNC_MAX_INFLIGHT": env.get("SWEPRO_ASYNC_MAX_INFLIGHT", ""),
+        "SWEPRO_ASYNC_GROUP_MAX_ATTEMPTS": env_str(env, "SWEPRO_ASYNC_GROUP_MAX_ATTEMPTS", "1"),
+    }
     return {
-        "env_vars": {
-            "PYTHONPATH": f"/root/src/Megatron-LM/:{swepro_dir}:{fully_async_dir}:{repo_root}",
-            "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-            "NCCL_NVLS_ENABLE": has_nvlink,
-            "NCCL_MNNVL_ENABLE": env_str(env, "NCCL_MNNVL_ENABLE", "0"),
-            "NCCL_NET": env_str(env, "NCCL_NET", "Socket"),
-            "NCCL_IB_DISABLE": env_str(env, "NCCL_IB_DISABLE", "1"),
-            "NCCL_SHM_DISABLE": env_str(env, "NCCL_SHM_DISABLE", "0"),
-            "NCCL_SOCKET_IFNAME": env_str(env, "NCCL_SOCKET_IFNAME", "eth0"),
-            "GLOO_SOCKET_IFNAME": env_str(env, "GLOO_SOCKET_IFNAME", "eth0"),
-            "TORCH_NCCL_ASYNC_ERROR_HANDLING": env_str(env, "TORCH_NCCL_ASYNC_ERROR_HANDLING", "1"),
-            "NCCL_DEBUG": env_str(env, "NCCL_DEBUG", "WARN"),
-            "RAY_DEDUP_LOGS": "0",
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-            "SLIME_ASYNC_ALLOW_STALE_ROLLOUTS": env_str(env, "SLIME_ASYNC_ALLOW_STALE_ROLLOUTS", "1"),
-            "SLIME_SPEEDSCOPE_TRACE_PATH": trace_path,
-            "SWEPRO_SPEEDSCOPE_TRACE_PATH": swepro_trace_path,
-            "SWEPRO_NATS_URL": env_str(env, "SWEPRO_NATS_URL", "nats://warnold-swepro-nats:4222"),
-            "SWEPRO_AGENT_MODE": env_str(env, "SWEPRO_AGENT_MODE", "sweagent_session"),
-            "SWEPRO_MAX_TOOL_CALLS": env_str(env, "SWEPRO_MAX_TOOL_CALLS", "20"),
-            "SWEPRO_EPISODE_WALL_TIMEOUT": env_str(env, "SWEPRO_EPISODE_WALL_TIMEOUT", "0"),
-            "SWEPRO_TURN_MAX_TOKENS": env_str(env, "SWEPRO_TURN_MAX_TOKENS", "8192"),
-            "SWEPRO_MODEL": env_str(env, "SWEPRO_MODEL", "/data/glm-4.7-30b-a3b"),
-            "SWEPRO_MODEL_TRACE_PATH": env.get("SWEPRO_MODEL_TRACE_PATH", ""),
-            "SWEPRO_MODEL_CALL_TIMEOUT": env_str(env, "SWEPRO_MODEL_CALL_TIMEOUT", "600"),
-            "SWEPRO_REQUEST_TIMEOUT": env_str(env, "SWEPRO_REQUEST_TIMEOUT", "540"),
-            "SWEPRO_REQUEST_RETRIES": env_str(env, "SWEPRO_REQUEST_RETRIES", "2"),
-            "SWEPRO_SESSION_START_TIMEOUT": env_str(env, "SWEPRO_SESSION_START_TIMEOUT", "900"),
-            "SWEPRO_SESSION_STEP_REQUEST_TIMEOUT": env_str(env, "SWEPRO_SESSION_STEP_REQUEST_TIMEOUT", "180"),
-            "SWEPRO_SESSION_SUBMIT_REQUEST_TIMEOUT": env_str(env, "SWEPRO_SESSION_SUBMIT_REQUEST_TIMEOUT", "300"),
-            "SWEPRO_SESSION_CLOSE_TIMEOUT": env_str(env, "SWEPRO_SESSION_CLOSE_TIMEOUT", "60"),
-            "SWEPRO_SESSION_HEALTH_TIMEOUT": env_str(env, "SWEPRO_SESSION_HEALTH_TIMEOUT", "30"),
-            "SWEPRO_SESSION_CAPACITY_RETRY_DELAY": env_str(env, "SWEPRO_SESSION_CAPACITY_RETRY_DELAY", "10"),
-            "SWEPRO_SESSION_ROLLOUT_RETRIES": env_str(env, "SWEPRO_SESSION_ROLLOUT_RETRIES", "0"),
-            "SWEPRO_ASYNC_MAX_INFLIGHT": env.get("SWEPRO_ASYNC_MAX_INFLIGHT", ""),
-        }
+        "env_vars": {key: value for key, value in env_vars.items() if value != ""}
     }
 
 
@@ -223,6 +308,7 @@ def build_command(
     env: dict[str, str],
     repo_root: Path,
     derived: DerivedConfig,
+    durable_logs: DurableLogConfig,
     extra_train_args: list[str],
     ray_address: str,
     *,
@@ -249,6 +335,20 @@ def build_command(
 
     weight_backuper_args = ["--disable-weights-backuper"] if env_flag(env, "SWEPRO_DISABLE_WEIGHTS_BACKUPER", True) else []
     ray_job_submit_args = ["--no-wait"] if env_flag(env, "SWEPRO_RAY_JOB_NO_WAIT", True) else []
+    debug_args: list[str] = []
+    if dump_details := env.get("SWEPRO_DUMP_DETAILS"):
+        debug_args.extend(["--dump-details", dump_details])
+    if save_debug_rollout_data := env.get("SWEPRO_SAVE_DEBUG_ROLLOUT_DATA"):
+        debug_args.extend(["--save-debug-rollout-data", save_debug_rollout_data])
+    if load_debug_rollout_data := env.get("SWEPRO_LOAD_DEBUG_ROLLOUT_DATA"):
+        debug_args.extend(["--load-debug-rollout-data", load_debug_rollout_data])
+        if env_flag(env, "SWEPRO_LOAD_DEBUG_ROLLOUT_DATA_WITH_UPDATES", False):
+            debug_args.append("--load-debug-rollout-data-with-updates")
+    if load_debug_subsample := env.get("SWEPRO_LOAD_DEBUG_ROLLOUT_DATA_SUBSAMPLE"):
+        debug_args.extend(["--load-debug-rollout-data-subsample", load_debug_subsample])
+    train_env_args: list[str] = []
+    if train_env_vars := env.get("SWEPRO_TRAIN_ENV_VARS"):
+        train_env_args.extend(["--train-env-vars", train_env_vars])
 
     model_parallel_args = [
         "--tensor-model-parallel-size",
@@ -291,6 +391,7 @@ def build_command(
         str(derived.actor_num_gpus_per_node),
         "--distributed-backend",
         env_str(env, "SWEPRO_DISTRIBUTED_BACKEND", "cpu:gloo,cuda:nccl"),
+        *train_env_args,
         *model_args,
         "--seq-length",
         str(derived.seq_length),
@@ -354,6 +455,10 @@ def build_command(
         "--disable-rewards-normalization",
         "--update-weights-interval",
         env_str(env, "SWEPRO_UPDATE_WEIGHTS_INTERVAL", "2"),
+        "--update-weight-buffer-size",
+        env_str(env, "SWEPRO_UPDATE_WEIGHT_BUFFER_SIZE", str(512 * 1024 * 1024)),
+        "--distributed-timeout-minutes",
+        env_str(env, "SWEPRO_DISTRIBUTED_TIMEOUT_MINUTES", "30"),
         "--recompute-granularity",
         "full",
         "--recompute-method",
@@ -382,6 +487,7 @@ def build_command(
         "generate_with_swebench_pro.generate",
         "--custom-rm-path",
         "generate_with_swebench_pro.reward_func",
+        *debug_args,
         *extra_train_args,
     ]
 
@@ -392,12 +498,105 @@ def build_command(
         "job",
         "submit",
         f"--address={ray_address}",
+        f"--submission-id={durable_logs.submission_id}",
         *ray_job_submit_args,
         f"--working-dir={repo_root}",
+        f"--metadata-json={json.dumps({'swepro_run_id': durable_logs.run_id, 'swepro_log_dir': str(durable_logs.log_dir)}, separators=(',', ':'))}",
         f"--runtime-env-json={json.dumps(ray_env, separators=(',', ':'))}",
         "--",
         *train_args,
     ]
+
+
+def tee_command(command: list[str], log_path: Path, *, env: dict[str, str], cwd: Path) -> int:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(f"\n===== {datetime.now(timezone.utc).isoformat()} =====\n")
+        log.write(f"$ {shlex.join(command)}\n")
+        log.flush()
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            sys.stdout.write(line)
+            log.write(line)
+        return_code = process.wait()
+        log.write(f"===== exit_code={return_code} {datetime.now(timezone.utc).isoformat()} =====\n")
+        return return_code
+
+
+def ray_log_follower_script(durable_logs: DurableLogConfig, ray_address: str) -> str:
+    return f"""
+set -u
+log_dir={shlex.quote(str(durable_logs.log_dir))}
+job_id={shlex.quote(durable_logs.submission_id)}
+address={shlex.quote(ray_address)}
+poll_seconds={durable_logs.poll_seconds}
+mkdir -p "$log_dir/ray-logs"
+sentinel="$log_dir/.ray-log-follower-start"
+touch "$sentinel"
+echo "===== $(date -Is) starting Ray log follower for $job_id ====="
+
+(
+  ray job logs --address="$address" --log-style=record --log-color=false --follow "$job_id"
+) >> "$log_dir/ray-driver.log" 2>> "$log_dir/ray-log-follower.log" &
+logs_pid=$!
+
+while true; do
+  {{
+    echo "===== $(date -Is) ====="
+    ray job status --address="$address" --log-style=record --log-color=false "$job_id"
+  }} >> "$log_dir/ray-status.log" 2>&1
+
+  if tail -40 "$log_dir/ray-status.log" | grep -Eq "SUCCEEDED|FAILED|STOPPED"; then
+    break
+  fi
+  if ! kill -0 "$logs_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep "$poll_seconds"
+done
+
+wait "$logs_pid" || true
+{{
+  echo "===== final $(date -Is) ====="
+  ray job status --address="$address" --log-style=record --log-color=false "$job_id" || true
+  ray job list --address="$address" --log-style=record --log-color=false || true
+}} >> "$log_dir/ray-status.log" 2>&1
+
+if [ -d /tmp/ray/session_latest/logs ]; then
+  find /tmp/ray/session_latest/logs -maxdepth 1 -type f \\
+    \\( -name "job-driver-$job_id.log" -o -name "worker-*.err" -o -name "worker-*.out" -o -name "ray_process_exit.log" \\) \\
+    -newer "$sentinel" -print0 | while IFS= read -r -d '' file; do
+      cp -n "$file" "$log_dir/ray-logs/$(basename "$file")" 2>/dev/null || true
+    done
+fi
+echo "===== $(date -Is) Ray log follower complete for $job_id ====="
+"""
+
+
+def start_ray_log_follower(durable_logs: DurableLogConfig, ray_address: str) -> None:
+    if not durable_logs.enabled:
+        return
+
+    durable_logs.log_dir.mkdir(parents=True, exist_ok=True)
+    monitor_log = durable_logs.log_dir / "ray-log-follower.log"
+    script = ray_log_follower_script(durable_logs, ray_address)
+    with monitor_log.open("a", encoding="utf-8") as monitor:
+        subprocess.Popen(
+            ["bash", "-lc", script],
+            stdout=monitor,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -419,6 +618,7 @@ def main() -> int:
     env = dict(os.environ)
     apply_profile_defaults(env, args.profile, repo_root, write_state=not args.dry_run)
     derived = derive_config(env)
+    durable_logs = durable_log_config(env)
 
     print(
         "SWEPRO trainer: "
@@ -439,11 +639,15 @@ def main() -> int:
     )
     if args.profile != "env":
         print(f"SWEPRO run_id: {env['SWEPRO_RUN_ID']}")
+    if durable_logs.enabled:
+        print(f"SWEPRO durable logs: {durable_logs.log_dir}")
+        print(f"SWEPRO Ray submission_id: {durable_logs.submission_id}")
 
     command = build_command(
         env,
         repo_root,
         derived,
+        durable_logs,
         extra_train_args,
         args.ray_address,
         create_dirs=not args.dry_run,
@@ -453,7 +657,38 @@ def main() -> int:
     if args.dry_run:
         print(shlex.join(command))
         return 0
-    subprocess.run(command, check=True, env=env, cwd=repo_root)
+    if durable_logs.enabled:
+        durable_logs.log_dir.mkdir(parents=True, exist_ok=True)
+        (durable_logs.log_dir / "run_id.txt").write_text(f"{durable_logs.run_id}\n", encoding="utf-8")
+        (durable_logs.log_dir / "submission_id.txt").write_text(f"{durable_logs.submission_id}\n", encoding="utf-8")
+        (durable_logs.log_dir / "entrypoint.sh").write_text(f"{shlex.join(command)}\n", encoding="utf-8")
+        debug_env = {
+            key: env[key]
+            for key in sorted(env)
+            if key.startswith(
+                (
+                    "DYNAMO_",
+                    "NCCL_",
+                    "NIXL_",
+                    "NVIDIA_",
+                    "RAY_",
+                    "SLIME_",
+                    "SWEPRO_",
+                    "TORCH_",
+                    "UCX_",
+                )
+            )
+        }
+        (durable_logs.log_dir / "env.json").write_text(json.dumps(debug_env, indent=2) + "\n", encoding="utf-8")
+
+    if durable_logs.enabled:
+        return_code = tee_command(command, durable_logs.log_dir / "ray-submit.log", env=env, cwd=repo_root)
+    else:
+        return_code = subprocess.run(command, env=env, cwd=repo_root).returncode
+    if return_code != 0:
+        return return_code
+    if durable_logs.enabled:
+        start_ray_log_follower(durable_logs, args.ray_address)
     return 0
 
 

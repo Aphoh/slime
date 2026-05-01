@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import time
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 
 import ray
 import torch
@@ -17,10 +19,58 @@ from tqdm import tqdm
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
-from ..sglang import DeltaSpec
+from ..sglang import DeltaSpec, FlattenedTensorBucket
 from .common import all_gather_param, named_params_and_buffers
 
 logger = logging.getLogger(__name__)
+
+
+def _format_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{num_bytes}B"
+
+
+@contextmanager
+def _temporary_nccl_env(overrides: Mapping[str, str]):
+    if not overrides:
+        yield
+        return
+
+    previous = {key: os.environ.get(key) for key in overrides}
+    try:
+        os.environ.update(overrides)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _weight_update_nccl_env() -> dict[str, str]:
+    env = {}
+
+    passthroughs = {
+        "SLIME_WEIGHT_UPDATE_NCCL_IB_DISABLE": "NCCL_IB_DISABLE",
+        "SLIME_WEIGHT_UPDATE_NCCL_IB_HCA": "NCCL_IB_HCA",
+        "SLIME_WEIGHT_UPDATE_NCCL_IB_GID_INDEX": "NCCL_IB_GID_INDEX",
+        "SLIME_WEIGHT_UPDATE_NCCL_MNNVL_ENABLE": "NCCL_MNNVL_ENABLE",
+        "SLIME_WEIGHT_UPDATE_MC_FORCE_MNNVL": "MC_FORCE_MNNVL",
+        "SLIME_WEIGHT_UPDATE_NCCL_NVLS_ENABLE": "NCCL_NVLS_ENABLE",
+        "SLIME_WEIGHT_UPDATE_NCCL_DEBUG": "NCCL_DEBUG",
+        "SLIME_WEIGHT_UPDATE_NCCL_DEBUG_SUBSYS": "NCCL_DEBUG_SUBSYS",
+    }
+    for source, target in passthroughs.items():
+        value = os.getenv(source)
+        if value:
+            env[target] = value
+
+    return env
 
 
 class UpdateWeightFromDistributed:
@@ -49,6 +99,7 @@ class UpdateWeightFromDistributed:
         self.weight_version = 0
         self._model_update_groups = None
         self.update_weight_metrics: dict[str, float] = {}
+        self._rank_log_prefix = ""
 
     def pop_metrics(self) -> dict[str, float]:
         """
@@ -80,6 +131,11 @@ class UpdateWeightFromDistributed:
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         if self._is_pp_src_rank:
             self._group_name = f"slime-pp_{pp_rank}"
+        self._rank_log_prefix = (
+            f"[WEIGHT UPDATE rank={dist.get_rank()} pp={pp_rank} "
+            f"tp={mpu.get_tensor_model_parallel_rank()} "
+            f"cp={mpu.get_context_parallel_rank()}]"
+        )
 
         if self._is_pp_src_rank:
             if self._model_update_groups is not None:
@@ -189,15 +245,40 @@ class UpdateWeightFromDistributed:
             param = all_gather_param(name, param)
             if not self._is_pp_src_rank:
                 continue
+            convert_t0 = time.time()
             hf_chunk = convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+            convert_elapsed = time.time() - convert_t0
             chunk_bytes = sum(t.numel() * t.element_size() for _, t in hf_chunk)
             if buffer and buffer_size + chunk_bytes > self.args.update_weight_buffer_size:
+                logger.info(
+                    "%s flushing non-expert bucket before %s bytes=%s tensors=%d next_param=%s",
+                    self._rank_log_prefix,
+                    name,
+                    _format_bytes(buffer_size),
+                    len(buffer),
+                    _format_bytes(chunk_bytes),
+                )
                 yield buffer
                 buffer = []
                 buffer_size = 0
+            if convert_elapsed > 5:
+                logger.info(
+                    "%s converted non-expert param %s in %.3fs size=%s outputs=%d",
+                    self._rank_log_prefix,
+                    name,
+                    convert_elapsed,
+                    _format_bytes(chunk_bytes),
+                    len(hf_chunk),
+                )
             buffer.extend(hf_chunk)
             buffer_size += chunk_bytes
         if buffer:
+            logger.info(
+                "%s flushing final non-expert bucket bytes=%s tensors=%d",
+                self._rank_log_prefix,
+                _format_bytes(buffer_size),
+                len(buffer),
+            )
             yield buffer
 
     def _iter_expert_chunks(
@@ -218,8 +299,18 @@ class UpdateWeightFromDistributed:
             param = all_gather_param(name, param)
             param_size = param.numel() * param.element_size()
             if (
-                buffer_size + param_size
+                batch
+                and buffer_size + param_size
             ) * mpu.get_expert_model_parallel_world_size() > self.args.update_weight_buffer_size:
+                logger.info(
+                    "%s flushing expert bucket before %s bytes=%s tensors=%d next_param=%s ep_world=%d",
+                    self._rank_log_prefix,
+                    name,
+                    _format_bytes(buffer_size),
+                    len(batch),
+                    _format_bytes(param_size),
+                    mpu.get_expert_model_parallel_world_size(),
+                )
                 hf_chunk = self._ep_gather_and_convert(batch)
                 if hf_chunk:
                     yield hf_chunk
@@ -228,6 +319,12 @@ class UpdateWeightFromDistributed:
             batch.append((name, param))
             buffer_size += param_size
         if batch:
+            logger.info(
+                "%s flushing final expert bucket bytes=%s tensors=%d",
+                self._rank_log_prefix,
+                _format_bytes(buffer_size),
+                len(batch),
+            )
             hf_chunk = self._ep_gather_and_convert(batch)
             if hf_chunk:
                 yield hf_chunk
@@ -239,6 +336,7 @@ class UpdateWeightFromDistributed:
         """
         names = [name for name, _ in named_tensors]
         all_names = [None] * mpu.get_expert_model_parallel_world_size()
+        gather_t0 = time.time()
         dist.all_gather_object(all_names, names, group=mpu.get_expert_model_parallel_group())
 
         for names in all_names:
@@ -257,6 +355,15 @@ class UpdateWeightFromDistributed:
                 all_gathered_params[ep_rank].append((names[i], params[ep_rank]))
         for handle in handles:
             handle.wait()
+        gather_elapsed = time.time() - gather_t0
+        if gather_elapsed > 5:
+            logger.info(
+                "%s gathered expert bucket in %.3fs tensors=%d ep_world=%d",
+                self._rank_log_prefix,
+                gather_elapsed,
+                len(named_tensors),
+                mpu.get_expert_model_parallel_world_size(),
+            )
 
         named_tensors.clear()
         if not self._is_pp_src_rank:
@@ -264,8 +371,18 @@ class UpdateWeightFromDistributed:
 
         all_gathered_params = sum(all_gathered_params, [])
         converted_hf_tensors = []
+        convert_t0 = time.time()
         for name, param in all_gathered_params:
             converted_hf_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+        convert_elapsed = time.time() - convert_t0
+        if convert_elapsed > 5:
+            logger.info(
+                "%s converted expert bucket in %.3fs gathered_tensors=%d hf_tensors=%d",
+                self._rank_log_prefix,
+                convert_elapsed,
+                len(all_gathered_params),
+                len(converted_hf_tensors),
+            )
         return converted_hf_tensors
 
     def _update_bucket_weights_from_distributed(
@@ -280,24 +397,53 @@ class UpdateWeightFromDistributed:
         Delta sync passes ``load_format="delta"`` + a ``DeltaSpec`` describing the
         per-param decoding of the (__positions__, __values__) bucket tensors.
         """
-        # lock the rollout engines to prevent dead lock on broadcast.
-        while not ray.get(self.rollout_engine_lock.acquire.remote()):
-            time.sleep(0.1)
+        if self._is_pp_src_rank and converted_named_tensors:
+            bucket_bytes = sum(param.numel() * param.element_size() for _, param in converted_named_tensors)
+            logger.info(
+                "%s bucket update start group=%s tensors=%d bytes=%s format=%s",
+                self._rank_log_prefix,
+                self._group_name,
+                len(converted_named_tensors),
+                _format_bytes(bucket_bytes),
+                load_format or "default",
+            )
+            # Lock the rollout engines to prevent dead lock on broadcast.
+            lock_t0 = time.time()
+            while not ray.get(self.rollout_engine_lock.acquire.remote()):
+                time.sleep(0.1)
+            lock_elapsed = time.time() - lock_t0
+            logger.info(
+                "%s bucket update lock acquired group=%s wait=%.3fs",
+                self._rank_log_prefix,
+                self._group_name,
+                lock_elapsed,
+            )
 
-        refs = update_weights_from_distributed(
-            self._group_name,
-            self._model_update_groups,
-            self.weight_version,
-            self.rollout_engines,
-            converted_named_tensors,
-            load_format=load_format,
-            delta=delta,
-        )
+            update_t0 = time.time()
+            refs = update_weights_from_distributed(
+                self._group_name,
+                self._model_update_groups,
+                self.weight_version,
+                self.rollout_engines,
+                converted_named_tensors,
+                load_format=load_format,
+                delta=delta,
+            )
 
-        ray.get(refs)
-        converted_named_tensors.clear()
-        ray.get(self.rollout_engine_lock.release.remote())
-        pbar.update(1)
+            ray.get(refs)
+            update_elapsed = time.time() - update_t0
+            converted_named_tensors.clear()
+            ray.get(self.rollout_engine_lock.release.remote())
+            if pbar is not None:
+                pbar.update(1)
+            logger.info(
+                "%s bucket update done group=%s lock_wait=%.3fs update=%.3fs bytes=%s",
+                self._rank_log_prefix,
+                self._group_name,
+                lock_elapsed,
+                update_elapsed,
+                _format_bytes(bucket_bytes),
+            )
 
 
 def connect_rollout_engines_from_distributed(
@@ -337,25 +483,26 @@ def connect_rollout_engines_from_distributed(
     for c in engine_gpu_counts:
         cumulative.append(cumulative[-1] + c)
 
-    refs = [
-        engine.init_weights_update_group.remote(
-            master_address=master_address,
-            master_port=master_port,
-            rank_offset=cumulative[i] + 1,
-            world_size=world_size,
-            group_name=group_name,
+    with _temporary_nccl_env(_weight_update_nccl_env()):
+        refs = [
+            engine.init_weights_update_group.remote(
+                master_address=master_address,
+                master_port=master_port,
+                rank_offset=cumulative[i] + 1,
+                world_size=world_size,
+                group_name=group_name,
+                backend="nccl",
+            )
+            for i, engine in enumerate(rollout_engines)
+        ]
+        model_update_groups = init_process_group(
             backend="nccl",
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=0,
+            group_name=group_name,
         )
-        for i, engine in enumerate(rollout_engines)
-    ]
-    model_update_groups = init_process_group(
-        backend="nccl",
-        init_method=f"tcp://{master_address}:{master_port}",
-        world_size=world_size,
-        rank=0,
-        group_name=group_name,
-    )
-    ray.get(refs)
+        ray.get(refs)
     return model_update_groups
 
 
@@ -381,26 +528,100 @@ def update_weights_from_distributed(
     Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines).
     Delta sync passes ``load_format="delta"`` + ``delta`` (DeltaSpec).
     """
-    refs = [
-        engine.update_weights_from_distributed.remote(
-            names=[name for name, _ in converted_named_tensors],
-            dtypes=[param.dtype for _, param in converted_named_tensors],
-            shapes=[param.shape for _, param in converted_named_tensors],
-            group_name=group_name,
-            weight_version=str(weight_version),
-            load_format=load_format,
-            delta=delta,
+    use_flattened_bucket = (
+        os.getenv("SLIME_WEIGHT_UPDATE_FLATTENED_BUCKET", "1") == "1"
+        and load_format is None
+        and delta is None
+    )
+    if use_flattened_bucket:
+        if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+            tensor_groups = [converted_named_tensors]
+        else:
+            grouped_by_dtype = {}
+            for name, tensor in converted_named_tensors:
+                grouped_by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
+            tensor_groups = list(grouped_by_dtype.values())
+    else:
+        tensor_groups = [converted_named_tensors]
+
+    all_refs = []
+    for tensor_group in tensor_groups:
+        names = [name for name, _ in tensor_group]
+        dtypes = [param.dtype for _, param in tensor_group]
+        shapes = [param.shape for _, param in tensor_group]
+        effective_load_format = "flattened_bucket" if use_flattened_bucket else load_format
+
+        request_kwargs = {
+            "names": names,
+            "dtypes": dtypes,
+            "shapes": shapes,
+            "group_name": group_name,
+            "weight_version": str(weight_version),
+            "load_format": effective_load_format,
+        }
+        if delta is not None:
+            request_kwargs["delta"] = delta
+
+        refs = [
+            engine.update_weights_from_distributed.remote(
+                **request_kwargs,
+            )
+            for engine in rollout_engines
+        ]
+        all_refs.extend(refs)
+        logger.info(
+            "[WEIGHT UPDATE group=%s] dispatched engine update requests tensors=%d format=%s",
+            group_name,
+            len(tensor_group),
+            effective_load_format or "default",
         )
-        for engine in rollout_engines
-    ]
 
-    handles = []
-    for _, param in converted_named_tensors:
-        handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
-    for handle in handles:
-        handle.wait()
+        broadcast_t0 = time.time()
+        with _temporary_nccl_env(_weight_update_nccl_env()):
+            if use_flattened_bucket:
+                flatten_t0 = time.time()
+                bucket = FlattenedTensorBucket(named_tensors=tensor_group)
+                flattened_tensor = bucket.get_flattened_tensor()
+                flatten_elapsed = time.time() - flatten_t0
+                total_bytes = flattened_tensor.numel() * flattened_tensor.element_size()
+                logger.info(
+                    "[WEIGHT UPDATE group=%s] flattened tensors=%d bytes=%s dtype=%s device=%s in %.3fs",
+                    group_name,
+                    len(tensor_group),
+                    _format_bytes(total_bytes),
+                    flattened_tensor.dtype,
+                    flattened_tensor.device,
+                    flatten_elapsed,
+                )
+                dist.broadcast(flattened_tensor, 0, group=group)
+            else:
+                handles = []
+                total_bytes = sum(param.numel() * param.element_size() for _, param in tensor_group)
+                logger.info(
+                    "[WEIGHT UPDATE group=%s] broadcasting tensors=%d bytes=%s first_dtype=%s first_device=%s first_shape=%s format=default",
+                    group_name,
+                    len(tensor_group),
+                    _format_bytes(total_bytes),
+                    tensor_group[0][1].dtype if tensor_group else None,
+                    tensor_group[0][1].device if tensor_group else None,
+                    tuple(tensor_group[0][1].shape) if tensor_group else None,
+                )
+                for _, param in tensor_group:
+                    handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
+                for handle in handles:
+                    handle.wait()
 
-    return refs
+        broadcast_elapsed = time.time() - broadcast_t0
+        logger.info(
+            "[WEIGHT UPDATE group=%s] broadcasted tensors=%d bytes=%s format=%s in %.3fs",
+            group_name,
+            len(tensor_group),
+            _format_bytes(total_bytes),
+            effective_load_format or "default",
+            broadcast_elapsed,
+        )
+
+    return all_refs
 
 
 def post_process_weights(

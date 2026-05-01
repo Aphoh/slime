@@ -36,6 +36,20 @@ spec:
               cpu: "2"
               memory: "2Gi"
 ---
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: warnold-swepro-compute-domain
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-trainer
+    owner: warnold
+spec:
+  channel:
+    resourceClaimTemplate:
+      name: warnold-swepro-compute-domain-channel
+  numNodes: 4
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -89,9 +103,13 @@ spec:
           export DYN_DISCOVERY_BACKEND=etcd
           export ETCD_ENDPOINTS=http://warnold-swepro-frontend:2379
           export NATS_SERVER=nats://warnold-swepro-nats:4222
+          export PYTHONHASHSEED=0
           exec python3 -m dynamo.frontend \
             --http-port 3000 \
-            --router-mode round-robin \
+            --router-mode kv \
+            --kv-cache-block-size 16 \
+            --router-kv-events \
+            --router-predict-on-route \
             --discovery-backend etcd \
             --model-path /data/glm-4.7-30b-a3b
       ports:
@@ -278,13 +296,37 @@ metadata:
   labels:
     app: warnold-swepro-trainer
     owner: warnold
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"rdma0","network":"rdma-0"},
+        {"interfaceName":"rdma1","network":"rdma-1"},
+        {"interfaceName":"rdma2","network":"rdma-2"},
+        {"interfaceName":"rdma3","network":"rdma-3"}
+      ]
 spec:
   restartPolicy: Never
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
+  resourceClaims:
+    - name: compute-domain-channel
+      resourceClaimTemplateName: warnold-swepro-compute-domain-channel
   nodeSelector:
     cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+    cloud.google.com/gke-nodepool: customer-gpu-w0e
+    nvidia.com/gpu.product: NVIDIA-GB200
     kubernetes.io/hostname: TRAIN_NODE_PLACEHOLDER
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                  - customer-gpu-w0e
   tolerations:
     - key: "kubernetes.io/arch"
       operator: "Equal"
@@ -293,10 +335,16 @@ spec:
   containers:
     - name: trainer
       image: IMAGE_PLACEHOLDER
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
       command: ["bash", "-c"]
       args:
         - |
           set -eu
+          ulimit -l unlimited
+          ulimit -n 1048576
           mkdir -p /data/swebench-pro/runs
           MEM_LOG="/data/swebench-pro/runs/trainer-memory-$(hostname).log"
           (
@@ -325,16 +373,26 @@ spec:
           ray start --head --node-ip-address="${POD_IP}" --port=6379 --num-gpus=4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
           sleep infinity
       resources:
+        claims:
+          - name: compute-domain-channel
         requests:
           cpu: "48"
           memory: "768Gi"
           ephemeral-storage: "800Gi"
           nvidia.com/gpu: "4"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
         limits:
           cpu: "64"
           memory: "832Gi"
           ephemeral-storage: "800Gi"
           nvidia.com/gpu: "4"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
       volumeMounts:
         - name: model-cache
           mountPath: /data
@@ -388,13 +446,37 @@ metadata:
   labels:
     app: warnold-swepro-trainer-worker
     owner: warnold
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"rdma0","network":"rdma-0"},
+        {"interfaceName":"rdma1","network":"rdma-1"},
+        {"interfaceName":"rdma2","network":"rdma-2"},
+        {"interfaceName":"rdma3","network":"rdma-3"}
+      ]
 spec:
   restartPolicy: Never
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
+  resourceClaims:
+    - name: compute-domain-channel
+      resourceClaimTemplateName: warnold-swepro-compute-domain-channel
   nodeSelector:
     cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+    cloud.google.com/gke-nodepool: customer-gpu-w0e
+    nvidia.com/gpu.product: NVIDIA-GB200
     kubernetes.io/hostname: TRAIN_WORKER_NODE_PLACEHOLDER
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                  - customer-gpu-w0e
   tolerations:
     - key: "kubernetes.io/arch"
       operator: "Equal"
@@ -403,10 +485,16 @@ spec:
   containers:
     - name: trainer-worker
       image: IMAGE_PLACEHOLDER
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
       command: ["bash", "-c"]
       args:
         - |
           set -eu
+          ulimit -l unlimited
+          ulimit -n 1048576
           mkdir -p /data/swebench-pro/runs
           MEM_LOG="/data/swebench-pro/runs/trainer-memory-$(hostname).log"
           (
@@ -440,16 +528,26 @@ spec:
           done
           ray start --address=warnold-swepro-trainer:6379 --node-ip-address="${POD_IP}" --num-gpus=4 --disable-usage-stats --block
       resources:
+        claims:
+          - name: compute-domain-channel
         requests:
           cpu: "48"
           memory: "768Gi"
           ephemeral-storage: "800Gi"
           nvidia.com/gpu: "4"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
         limits:
           cpu: "64"
           memory: "832Gi"
           ephemeral-storage: "800Gi"
           nvidia.com/gpu: "4"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
       volumeMounts:
         - name: model-cache
           mountPath: /data
@@ -481,10 +579,19 @@ metadata:
   labels:
     app: warnold-swepro-engine
     owner: warnold
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"rdma0","network":"rdma-0"},
+        {"interfaceName":"rdma1","network":"rdma-1"}
+      ]
 spec:
   restartPolicy: Never
   nodeSelector:
     cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+    nvidia.com/gpu.product: NVIDIA-GB200
     kubernetes.io/hostname: ENGINE_NODE_PLACEHOLDER
   tolerations:
     - key: "kubernetes.io/arch"
@@ -494,16 +601,38 @@ spec:
   containers:
     - name: engine
       image: IMAGE_PLACEHOLDER
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
       command: ["bash", "-c"]
       args:
         - |
           set -eu
+          ulimit -l unlimited
+          ulimit -n 1048576
           export DYN_DISCOVERY_BACKEND=etcd
           export ETCD_ENDPOINTS=http://warnold-swepro-frontend:2379
           export NATS_SERVER=nats://warnold-swepro-nats:4222
           export DYN_SYSTEM_PORT=30001
           export PYTHONHASHSEED=0
           export DYN_SGL_FORCE_NONSTREAM=1
+          export UCX_TLS=cuda_ipc,cuda_copy,rc
+          export UCX_IB_GID_INDEX=3
+          export UCX_RC_TIMEOUT=600s
+          export UCX_KEEPALIVE_INTERVAL=300s
+          export NCCL_CUMEM_ENABLE=1
+          export NCCL_CUMEM_HOST_ENABLE=1
+          export NCCL_MNNVL_ENABLE=0
+          export NCCL_NVLS_ENABLE=1
+          export NCCL_STORE_TIMEOUT=7200
+          export NCCL_SOCKET_IFNAME=eth0
+          export GLOO_SOCKET_IFNAME=eth0
+          export NVIDIA_GDRCOPY=1
+          export NIXL_LOG_LEVEL=INFO
+          export NIXL_TELEMETRY_ENABLE=y
+          export NIXL_TELEMETRY_EXPORTER=prometheus
+          export NIXL_TELEMETRY_PROMETHEUS_PORT=19090
           exec python3 -m dynamo.sglang \
             --model-path /data/glm-4.7-30b-a3b \
             --tp ENGINE_TP_PLACEHOLDER \
@@ -511,6 +640,8 @@ spec:
             --host 0.0.0.0 \
             --trust-remote-code \
             --enable-rl \
+            --page-size 16 \
+            --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}' \
             --attention-backend triton \
             --sampling-backend pytorch \
             --disable-flashinfer-autotune \
@@ -522,11 +653,15 @@ spec:
           memory: "128Gi"
           ephemeral-storage: "800Gi"
           nvidia.com/gpu: "ENGINE_GPU_PLACEHOLDER"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
         limits:
           cpu: "48"
           memory: "192Gi"
           ephemeral-storage: "800Gi"
           nvidia.com/gpu: "ENGINE_GPU_PLACEHOLDER"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
       volumeMounts:
         - name: model-cache
           mountPath: /data

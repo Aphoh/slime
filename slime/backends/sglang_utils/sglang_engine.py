@@ -231,7 +231,8 @@ class SGLangEngine(RayActor):
             return
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        timeout = float(os.getenv("SLIME_SGLANG_ENGINE_ROUTE_TIMEOUT", "1800"))
+        response = requests.post(url, json=payload or {}, timeout=timeout)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:

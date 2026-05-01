@@ -30,6 +30,27 @@ def _ensure_eval_import(eval_root: Path):
     import swe_bench_pro_eval as eval_mod  # type: ignore
     from helper_code.image_uri import get_dockerhub_image_uri  # type: ignore
 
+    # The upstream helpers read dockerfiles via process-relative paths. Avoid
+    # os.chdir here because eval requests run concurrently in worker threads.
+    def load_base_docker(iid):
+        return (eval_root / "dockerfiles" / "base_dockerfile" / iid / "Dockerfile").read_text()
+
+    def instance_docker(iid):
+        return (eval_root / "dockerfiles" / "instance_dockerfile" / iid / "Dockerfile").read_text()
+
+    def load_local_script(scripts_dir, instance_id, script_name):
+        scripts_path = Path(scripts_dir)
+        if not scripts_path.is_absolute():
+            scripts_path = eval_root / scripts_path
+        script_path = scripts_path / instance_id / script_name
+        if not script_path.exists():
+            raise FileNotFoundError(f"Script not found: {script_path}")
+        return script_path.read_text()
+
+    eval_mod.load_base_docker = load_base_docker
+    eval_mod.instance_docker = instance_docker
+    eval_mod.load_local_script = load_local_script
+
     return eval_mod, get_dockerhub_image_uri
 
 
@@ -73,12 +94,7 @@ def evaluate_request(request: dict[str, Any], *, eval_root: Path, work_root: Pat
     workspace_dir.mkdir(parents=True, exist_ok=True)
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    previous_cwd = os.getcwd()
-    try:
-        os.chdir(eval_root)
-        files, entryscript_content = eval_mod.assemble_workspace_files(instance_id, str(scripts_dir), patch, sample)
-    finally:
-        os.chdir(previous_cwd)
+    files, entryscript_content = eval_mod.assemble_workspace_files(instance_id, str(scripts_dir), patch, sample)
     eval_mod.write_files_local(str(workspace_dir), files)
     (run_output_dir / f"{request_id}_entryscript.sh").write_text(entryscript_content or "")
     (run_output_dir / f"{request_id}_patch.diff").write_text(patch)

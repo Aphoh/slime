@@ -83,26 +83,30 @@ def _env_true(name: str) -> bool:
 
 
 def _broadcast_file_from_rank0(path: Path, local_rank: int, global_rank: int) -> None:
+    backend = dist.get_backend()
+    device = torch.device(f"cuda:{local_rank}") if backend == "nccl" else torch.device("cpu")
+
     if global_rank == 0:
         payload = path.read_bytes() if path.exists() else None
-        size = torch.tensor([-1 if payload is None else len(payload)], dtype=torch.long)
+        size = torch.tensor([-1 if payload is None else len(payload)], dtype=torch.long, device=device)
     else:
         payload = None
-        size = torch.tensor([-1], dtype=torch.long)
+        size = torch.tensor([-1], dtype=torch.long, device=device)
 
     dist.broadcast(size, src=0)
-    if size.item() < 0:
+    size_value = int(size.item())
+    if size_value < 0:
         return
 
     if global_rank == 0:
-        data = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        data = torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(device)
     else:
-        data = torch.empty(size.item(), dtype=torch.uint8)
+        data = torch.empty(size_value, dtype=torch.uint8, device=device)
     dist.broadcast(data, src=0)
 
     if local_rank == 0 and global_rank != 0:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data.numpy().tobytes())
+        path.write_bytes(data.cpu().numpy().tobytes())
 
 
 def main():
@@ -162,7 +166,7 @@ def main():
 
     if _env_true("SLIME_CONVERT_LOCAL_CHECKPOINT"):
         checkpoint_dir = Path(get_checkpoint_name(args.save, -1, True, return_base_dir=True))
-        for filename in ("common.pt", ".metadata"):
+        for filename in ("common.pt", ".metadata", "metadata.json"):
             _broadcast_file_from_rank0(checkpoint_dir / filename, local_rank, global_rank)
         if local_rank == 0:
             tracker_filename = get_checkpoint_tracker_filename(args.save)

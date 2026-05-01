@@ -1352,7 +1352,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The file will be saved to `save_debug_rollout_data.format(rollout_id)`."
                 ),
             )
-            # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
+            # --load-debug-rollout-data, --load-debug-rollout-data-with-updates,
+            # --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(
                 "--load-forge-rollout-data",
@@ -1650,6 +1651,7 @@ def _pre_parse_mode():
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
+    temp_parser.add_argument("--load-debug-rollout-data-with-updates", action="store_true", default=False)
     temp_args, _ = temp_parser.parse_known_args()
     return temp_args
 
@@ -1661,7 +1663,9 @@ def parse_args(add_custom_arguments=None):
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
     pre = _pre_parse_mode()
-    skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None
+    skip_sglang = pre.debug_train_only or (
+        pre.load_debug_rollout_data is not None and not pre.load_debug_rollout_data_with_updates
+    )
 
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
     # Skipped when sglang servers are not needed.
@@ -2002,12 +2006,17 @@ def slime_validate_args(args):
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
 
-    if args.load_debug_rollout_data is not None:
+    if args.load_debug_rollout_data is not None and not args.load_debug_rollout_data_with_updates:
         logger.info(
             f"load_debug_rollout_data {args.load_debug_rollout_data} is set, "
             "will not instantiate sglang servers and will only run the training process."
         )
         args.debug_train_only = True
+    elif args.load_debug_rollout_data is not None:
+        logger.info(
+            f"load_debug_rollout_data {args.load_debug_rollout_data} is set with "
+            "load_debug_rollout_data_with_updates; rollout servers will be instantiated for weight updates."
+        )
 
     args.rollout_external = args.rollout_external_engine_addrs is not None
 
