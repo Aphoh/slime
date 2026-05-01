@@ -28,13 +28,14 @@ from __future__ import annotations
 import asyncio
 import atexit
 import concurrent.futures
+import copy
 import logging
 import os
 import queue
 import threading
 import time
 
-from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
+from slime.rollout.sglang_rollout import GenerateState, generate_and_rm, generate_and_rm_group
 from slime.utils.async_utils import run
 from slime.utils.http_utils import get_rollout_num_engines
 from slime.utils.speedscope_trace import trace_span
@@ -66,6 +67,41 @@ def _get_positive_int_env(name: str, default: int) -> int:
         logger.warning("ignoring non-positive %s=%r; using %d", name, value, default)
         return default
     return parsed
+
+
+def _sample_needs_retry(sample: Sample) -> bool:
+    return sample.status == Sample.Status.ABORTED
+
+
+def _fresh_retry_sample(sample: Sample, attempt: int) -> Sample:
+    retry = copy.deepcopy(sample)
+    retry.tokens = []
+    retry.response = ""
+    retry.response_length = 0
+    retry.loss_mask = None
+    retry.rollout_log_probs = None
+    retry.rollout_routed_experts = None
+    retry.teacher_log_probs = None
+    retry.weight_versions = []
+    retry.remove_sample = False
+    retry.reward = None
+    retry.session_id = None
+    retry.non_generation_time = 0.0
+    retry.spec_info = Sample.SpecInfo()
+    retry.prefix_cache_info = Sample.PrefixCacheInfo()
+    retry.status = Sample.Status.PENDING
+
+    metadata = dict(retry.metadata or {})
+    for key in (
+        "retryable_session_error",
+        "rollout_timeout_error",
+        "session_error",
+        "session_error_traceback",
+    ):
+        metadata.pop(key, None)
+    metadata["async_group_retry_attempt"] = attempt
+    retry.metadata = metadata
+    return retry
 
 
 def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
@@ -110,10 +146,15 @@ class AsyncRolloutWorker:
         self.output_queue: queue.Queue[tuple[int, list[Sample]]] = queue.Queue(maxsize=1000)
         self.worker_thread: threading.Thread | None = None
         self.state = GenerateState(args)
+        self.max_group_attempts = _get_positive_int_env("SWEPRO_ASYNC_GROUP_MAX_ATTEMPTS", 1)
         self.active_count = 0
         self.started_count = 0
         self.completed_count = 0
         self.failed_count = 0
+        self.aborted_group_count = 0
+        self.sample_retry_count = 0
+        self.sample_retry_success_count = 0
+        self.exhausted_group_retry_count = 0
 
     # -- public --------------------------------------------------------------
 
@@ -155,14 +196,70 @@ class AsyncRolloutWorker:
             executor.shutdown(wait=False, cancel_futures=True)
             loop.close()
 
-    async def _generate_group_with_trace(self, gid: int, group: list[Sample]) -> list[Sample]:
-        with trace_span("async_rollout", "rollout.group.generate", group_id=gid):
+    async def _generate_group_with_retries(self, gid: int, sample_group: list[Sample]) -> list[Sample]:
+        if getattr(self.args, "group_rm", False):
             return await generate_and_rm_group(
                 self.args,
-                group,
+                sample_group,
                 sampling_params=self.state.sampling_params.copy(),
                 evaluation=False,
             )
+
+        group = await generate_and_rm_group(
+            self.args,
+            sample_group,
+            sampling_params=self.state.sampling_params.copy(),
+            evaluation=False,
+        )
+
+        for attempt in range(2, self.max_group_attempts + 1):
+            retry_positions = [idx for idx, sample in enumerate(group) if _sample_needs_retry(sample)]
+            if not retry_positions:
+                break
+
+            self.sample_retry_count += len(retry_positions)
+            logger.info(
+                "retrying %d aborted samples in group %d (attempt %d/%d)",
+                len(retry_positions),
+                gid,
+                attempt,
+                self.max_group_attempts,
+            )
+
+            retry_tasks = []
+            for idx in retry_positions:
+                retry_sample = _fresh_retry_sample(group[idx], attempt)
+                retry_sampling_params = self.state.sampling_params.copy()
+                if getattr(self.args, "sglang_enable_deterministic_inference", False):
+                    seeds = getattr(self.state, "group_sampling_seeds", None)
+                    if seeds:
+                        retry_sampling_params["sampling_seed"] = seeds[idx % len(seeds)] + attempt * 1000003
+                retry_tasks.append(
+                    asyncio.create_task(generate_and_rm(self.args, retry_sample, retry_sampling_params, evaluation=False))
+                )
+
+            retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
+            for idx, result in zip(retry_positions, retry_results, strict=False):
+                if isinstance(result, Exception):
+                    logger.warning("retry for sample %d in group %d failed: %s", idx, gid, result)
+                    continue
+                if not _sample_needs_retry(result):
+                    self.sample_retry_success_count += 1
+                group[idx] = result
+
+        remaining_aborted = sum(1 for sample in group if _sample_needs_retry(sample))
+        if remaining_aborted:
+            self.exhausted_group_retry_count += 1
+            logger.warning(
+                "group %d exhausted sample retries with %d aborted samples remaining",
+                gid,
+                remaining_aborted,
+            )
+        return group
+
+    async def _generate_group_with_trace(self, gid: int, group: list[Sample]) -> list[Sample]:
+        with trace_span("async_rollout", "rollout.group.generate", group_id=gid):
+            return await self._generate_group_with_retries(gid, group)
 
     async def _loop(self) -> None:
         active_tasks: set[asyncio.Task] = set()
@@ -228,6 +325,7 @@ class AsyncRolloutWorker:
                 return
             # Aborted group → requeue, don't ship to training.
             if any(getattr(s, "status", None) == Sample.Status.ABORTED for s in result):
+                self.aborted_group_count += 1
                 try:
                     self.data_buffer.add_samples([result])
                 except Exception:  # noqa: BLE001
@@ -270,7 +368,8 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
             if now - last_log > LOG_EVERY:
                 logger.info(
                     "fully-async rollout %d: collected %d/%d, queue=%d, active=%d, "
-                    "started=%d, completed=%d, failed=%d, elapsed=%.1fs",
+                    "started=%d, completed=%d, failed=%d, aborted_groups=%d, "
+                    "sample_retries=%d, retry_successes=%d, exhausted_group_retries=%d, elapsed=%.1fs",
                     rollout_id,
                     len(collected),
                     target,
@@ -279,6 +378,10 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
                     worker.started_count,
                     worker.completed_count,
                     worker.failed_count,
+                    worker.aborted_group_count,
+                    worker.sample_retry_count,
+                    worker.sample_retry_success_count,
+                    worker.exhausted_group_retry_count,
                     now - started,
                 )
                 last_log = now

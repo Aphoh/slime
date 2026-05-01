@@ -291,7 +291,8 @@ class DynamoEngine(RayActor):
         if self.node_rank != 0:
             return
         url = f"http://{self.server_host}:{self.server_port}/engine/{route}"
-        response = requests.post(url, json=body or {})
+        timeout = float(os.getenv("SLIME_DYNAMO_ENGINE_ROUTE_TIMEOUT", "1800"))
+        response = requests.post(url, json=body or {}, timeout=timeout)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -357,6 +358,7 @@ class DynamoEngine(RayActor):
         group_name,
         flush_cache=False,
         weight_version: str | None = None,
+        load_format: str | None = None,
     ):
         body = {
             "names": names,
@@ -367,6 +369,8 @@ class DynamoEngine(RayActor):
         }
         if weight_version is not None:
             body["weight_version"] = weight_version
+        if load_format is not None:
+            body["load_format"] = load_format
         return self._call_engine_route("update_weights_from_distributed", body)
 
     def update_weights_from_disk(self, model_path, load_format=None):

@@ -118,9 +118,15 @@ def _model_call_timeout_s() -> float:
 
 
 def _session_call_timeout_s(kind: str, default: float) -> float:
-    specific = f"SWEPRO_SESSION_{kind.upper()}_CALL_TIMEOUT"
-    if os.getenv(specific):
-        return _positive_float_env(specific, default)
+    kind_upper = kind.upper()
+    candidates = [
+        f"SWEPRO_SESSION_{kind_upper}_CALL_TIMEOUT",
+        f"SWEPRO_SESSION_{kind_upper}_REQUEST_TIMEOUT",
+        f"SWEPRO_SESSION_{kind_upper}_TIMEOUT",
+    ]
+    for specific in candidates:
+        if os.getenv(specific):
+            return _positive_float_env(specific, default)
     return _positive_float_env("SWEPRO_SESSION_CALL_TIMEOUT", default)
 
 
