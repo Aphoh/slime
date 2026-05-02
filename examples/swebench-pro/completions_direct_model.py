@@ -120,6 +120,9 @@ class DirectCompletionsModel:
         stop = kwargs.get("stop")
         if stop:
             payload["stop"] = stop
+        stop_token_ids = kwargs.get("stop_token_ids")
+        if stop_token_ids:
+            payload["stop_token_ids"] = [int(token_id) for token_id in stop_token_ids]
         return payload
 
     def complete_prompt_ids(
@@ -180,6 +183,7 @@ class DirectCompletionsModel:
             "generated_token_ids": generated_token_ids,
             "token_logprobs": token_logprobs,
             "finish_reason": choice.get("finish_reason"),
+            "stop_reason": choice.get("stop_reason"),
         }
         result = {"content": choice.get("text", ""), "message": choice.get("text", ""), "extra": extra}
         self._write_trace(
@@ -225,6 +229,70 @@ GLM_TOOL_STOP_TOKEN_IDS = [
     GLM_TOOL_CLOSE_TOKEN_ID,
     GLM_EOS_TOKEN_ID,
 ]
+
+
+def stop_reason_token_ids(stop_reason: Any) -> list[int]:
+    """Return token IDs from Dynamo/OpenAI stop_reason values, without tokenizing."""
+
+    if stop_reason is None or isinstance(stop_reason, bool):
+        return []
+    if isinstance(stop_reason, int):
+        return [stop_reason]
+    if isinstance(stop_reason, str):
+        stop_reason = stop_reason.strip()
+        if stop_reason == "</tool_call>":
+            return [GLM_TOOL_CLOSE_TOKEN_ID]
+        if stop_reason == "<|endoftext|>":
+            return [GLM_EOS_TOKEN_ID]
+        if stop_reason.startswith("token_id:"):
+            stop_reason = stop_reason[len("token_id:") :]
+        try:
+            return [int(stop_reason)]
+        except ValueError:
+            return []
+    if isinstance(stop_reason, list):
+        token_ids: list[int] = []
+        for item in stop_reason:
+            token_ids.extend(stop_reason_token_ids(item))
+        return token_ids
+    return []
+
+
+def _rfind_token(token_ids: list[int], token_id: int) -> int:
+    for idx in range(len(token_ids) - 1, -1, -1):
+        if token_ids[idx] == token_id:
+            return idx
+    return -1
+
+
+def parse_glm_tool_call_from_completion(
+    tokenizer: Any,
+    content: str,
+    generated_ids: list[int],
+    matched_stop_token_ids: list[int],
+) -> tuple[str, list[dict[str, Any]], bool]:
+    """Parse a GLM tool call only when the matched stop was `</tool_call>`."""
+
+    if GLM_TOOL_CLOSE_TOKEN_ID not in matched_stop_token_ids:
+        return content, [], False
+
+    tool_start = _rfind_token(generated_ids, GLM_TOOL_CALL_TOKEN_ID)
+    if tool_start < 0:
+        return content, [], False
+
+    tool_text = tokenizer.decode(generated_ids[tool_start:], skip_special_tokens=False)
+    has_tool_close = GLM_TOOL_CLOSE_TOKEN_ID in generated_ids[tool_start:]
+    if not has_tool_close:
+        tool_text = tool_text + "</tool_call>"
+
+    marker_idx = content.rfind("<tool_call>")
+    if marker_idx >= 0:
+        normal_text = content[:marker_idx]
+    else:
+        normal_text = tokenizer.decode(generated_ids[:tool_start], skip_special_tokens=False)
+
+    _, tool_calls = parse_glm_tool_calls(tool_text)
+    return normal_text, tool_calls, not has_tool_close
 
 
 def _extract_tag_value(text: str, tag: str) -> str | None:

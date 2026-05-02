@@ -293,6 +293,9 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
     stop = sampling_params.get("stop")
     if stop:
         payload["stop"] = stop
+    stop_token_ids = sampling_params.get("stop_token_ids")
+    if stop_token_ids:
+        payload["stop_token_ids"] = [int(token_id) for token_id in stop_token_ids]
 
     _req_t0 = _time.time()
     with trace_span(sample, "dynamo_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"], "prompt_len": len(token_ids)}) as span:
@@ -335,6 +338,7 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
         f"latency={_req_elapsed:.3f}s | "
         f"tok/s={_tok_per_sec:.1f} | "
         f"finish={choice.get('finish_reason', 'unknown')} | "
+        f"stop_reason={choice.get('stop_reason')} | "
         f"fallback_tokenize={_had_fallback_tokenize} | "
         f"logprob_mismatch={_logprob_mismatch}"
     )

@@ -21,14 +21,14 @@ from completions_direct_model import (
     GLM_ASSISTANT_TOKEN_ID,
     GLM_OBSERVATION_TOKEN_ID,
     GLM_THINK_START_TOKEN_ID,
-    GLM_TOOL_CALL_TOKEN_ID,
     GLM_TOOL_CLOSE_TOKEN_ID,
     GLM_TOOL_RESPONSE_END_TOKEN_ID,
     GLM_TOOL_RESPONSE_START_TOKEN_ID,
-    GLM_TOOL_STOPS,
+    GLM_TOOL_STOP_TOKEN_IDS,
     DirectCompletionsConfig,
     DirectCompletionsModel,
-    parse_glm_tool_calls,
+    parse_glm_tool_call_from_completion,
+    stop_reason_token_ids,
 )
 from sweagent_session import SweAgentSessionClient
 
@@ -235,35 +235,13 @@ def _align_logprobs(
     return aligned
 
 
-def _rfind_token(token_ids: list[int], token_id: int) -> int:
-    for idx in range(len(token_ids) - 1, -1, -1):
-        if token_ids[idx] == token_id:
-            return idx
-    return -1
-
-
 def _parse_tool_call_from_generated_tokens(
     model: DirectCompletionsModel,
     content: str,
     generated_ids: list[int],
+    matched_stop_token_ids: list[int],
 ) -> tuple[str, list[dict[str, Any]], bool]:
-    tool_start = _rfind_token(generated_ids, GLM_TOOL_CALL_TOKEN_ID)
-    if tool_start < 0:
-        return content, [], False
-
-    tool_text = model.tokenizer.decode(generated_ids[tool_start:], skip_special_tokens=False)
-    has_tool_close = GLM_TOOL_CLOSE_TOKEN_ID in generated_ids[tool_start:]
-    if not has_tool_close:
-        tool_text = tool_text + "</tool_call>"
-
-    marker_idx = content.rfind("<tool_call>")
-    if marker_idx >= 0:
-        normal_text = content[:marker_idx]
-    else:
-        normal_text = model.tokenizer.decode(generated_ids[:tool_start], skip_special_tokens=False)
-
-    _, tool_calls = parse_glm_tool_calls(tool_text)
-    return normal_text, tool_calls, not has_tool_close
+    return parse_glm_tool_call_from_completion(model.tokenizer, content, generated_ids, matched_stop_token_ids)
 
 
 def _tool_observation_delta_ids(model: DirectCompletionsModel, observation: str) -> list[int]:
@@ -611,7 +589,8 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                         temperature=sampling_params.get("temperature", getattr(args, "rollout_temperature", 1.0)),
                         top_p=sampling_params.get("top_p", getattr(args, "rollout_top_p", 1.0)),
                         top_k=sampling_params.get("top_k", getattr(args, "rollout_top_k", None)),
-                        stop=sampling_params.get("stop") or GLM_TOOL_STOPS,
+                        stop=sampling_params.get("stop"),
+                        stop_token_ids=sampling_params.get("stop_token_ids") or GLM_TOOL_STOP_TOKEN_IDS,
                     ),
                     timeout=_model_call_timeout_s(),
                     label=f"model completion for {instance_id} turn {turn}",
@@ -638,6 +617,8 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 generated_logprobs.extend([0.0] * (len(generated_ids) - len(generated_logprobs)))
             generated_logprobs = generated_logprobs[: len(generated_ids)]
             finish_reason = extra.get("finish_reason") or "stop"
+            stop_reason = extra.get("stop_reason")
+            matched_stop_token_ids = stop_reason_token_ids(stop_reason)
             record_span(
                 trace_profile,
                 "inference.complete",
@@ -651,10 +632,17 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 generated_tokens=len(generated_ids),
                 max_tokens=max_turn_tokens,
                 finish_reason=finish_reason,
+                stop_reason=stop_reason,
+                matched_stop_token_ids=matched_stop_token_ids,
             )
 
             content_for_history = content
-            normal_text, tool_calls, needs_tool_close = _parse_tool_call_from_generated_tokens(model, content, generated_ids)
+            normal_text, tool_calls, needs_tool_close = _parse_tool_call_from_generated_tokens(
+                model,
+                content,
+                generated_ids,
+                matched_stop_token_ids,
+            )
             if needs_tool_close:
                 content_for_history = content_for_history + "</tool_call>"
                 stop_closer_ids = [GLM_TOOL_CLOSE_TOKEN_ID]
@@ -679,6 +667,8 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 "tool_calls": tool_calls,
                 "prompt_tokens": len(current_ids),
                 "generated_tokens": len(generated_ids),
+                "stop_reason": stop_reason,
+                "matched_stop_token_ids": matched_stop_token_ids,
             }
 
             if _trim_response_to_context(
