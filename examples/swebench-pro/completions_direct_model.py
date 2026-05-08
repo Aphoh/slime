@@ -42,6 +42,22 @@ def token_ids_from_logprob_tokens(tokens: list[Any], tokenizer) -> list[int]:
     return ids
 
 
+def glm_stop_strings_from_token_ids(token_ids: list[int]) -> list[str]:
+    """Return GLM stop strings for the GLM special stop token IDs we use."""
+    stops: list[str] = []
+    for token_id in token_ids:
+        if token_id == GLM_TOOL_CLOSE_TOKEN_ID:
+            stops.append("</tool_call>")
+        elif token_id == GLM_EOS_TOKEN_ID:
+            stops.append("<|endoftext|>")
+        else:
+            raise ValueError(
+                f"/v1/completions does not accept stop_token_ids; "
+                f"no GLM stop string mapping for token_id:{token_id}"
+            )
+    return stops
+
+
 @dataclass
 class DirectCompletionsConfig:
     base_url: str
@@ -113,16 +129,20 @@ class DirectCompletionsModel:
             "logprobs": 0,
             "return_tokens_as_token_ids": True,
             "stream": False,
+            "nvext": {"extra_fields": ["stop_reason"]},
         }
         top_k = kwargs.get("top_k", self.config.top_k)
         if top_k is not None and int(top_k) > 0:
             payload["top_k"] = int(top_k)
+        stop_token_ids = kwargs.get("stop_token_ids")
         stop = kwargs.get("stop")
+        if stop_token_ids:
+            mapped_stops = glm_stop_strings_from_token_ids([int(token_id) for token_id in stop_token_ids])
+            stop = list(stop or []) + mapped_stops if isinstance(stop, list) else ([stop] if stop else []) + mapped_stops
         if stop:
             payload["stop"] = stop
-        stop_token_ids = kwargs.get("stop_token_ids")
-        if stop_token_ids:
-            payload["stop_token_ids"] = [int(token_id) for token_id in stop_token_ids]
+        # The updated Dynamo OpenAI frontend rejects stop_token_ids as an unsupported
+        # top-level parameter, so we send GLM special stops as strings instead.
         return payload
 
     def complete_prompt_ids(
@@ -169,6 +189,7 @@ class DirectCompletionsModel:
             raise RuntimeError(f"completion request failed: {last_error}")
 
         choice = data["choices"][0]
+        response_nvext = data.get("nvext") or {}
         logprobs = choice.get("logprobs") or {}
         generated_token_ids = token_ids_from_logprob_tokens(logprobs.get("tokens") or [], self.tokenizer)
         token_logprobs = list(logprobs.get("token_logprobs") or [])
@@ -183,7 +204,7 @@ class DirectCompletionsModel:
             "generated_token_ids": generated_token_ids,
             "token_logprobs": token_logprobs,
             "finish_reason": choice.get("finish_reason"),
-            "stop_reason": choice.get("stop_reason"),
+            "stop_reason": response_nvext.get("stop_reason", choice.get("stop_reason")),
         }
         result = {"content": choice.get("text", ""), "message": choice.get("text", ""), "extra": extra}
         self._write_trace(

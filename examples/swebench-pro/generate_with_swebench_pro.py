@@ -589,7 +589,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                         temperature=sampling_params.get("temperature", getattr(args, "rollout_temperature", 1.0)),
                         top_p=sampling_params.get("top_p", getattr(args, "rollout_top_p", 1.0)),
                         top_k=sampling_params.get("top_k", getattr(args, "rollout_top_k", None)),
-                        stop=sampling_params.get("stop"),
+                        stop=sampling_params.get("stop") or GLM_TOOL_STOPS,
                         stop_token_ids=sampling_params.get("stop_token_ids") or GLM_TOOL_STOP_TOKEN_IDS,
                     ),
                     timeout=_model_call_timeout_s(),
