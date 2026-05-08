@@ -109,7 +109,6 @@ spec:
             --router-mode kv \
             --kv-cache-block-size 16 \
             --router-kv-events \
-            --router-predict-on-route \
             --discovery-backend etcd \
             --model-path /data/glm-4.7-30b-a3b
       ports:

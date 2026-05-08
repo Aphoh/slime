@@ -15,20 +15,27 @@ from completions_direct_model import (  # noqa: E402
     GLM_EOS_TOKEN_ID,
     GLM_TOOL_CALL_TOKEN_ID,
     GLM_TOOL_CLOSE_TOKEN_ID,
+    GLM_TOOL_STOPS,
+    glm_stop_strings_from_token_ids,
     parse_glm_tool_call_from_completion,
     stop_reason_token_ids,
 )
 
 
-def test_direct_completions_payload_sends_stop_token_ids():
+def test_direct_completions_payload_maps_glm_stop_token_ids_to_stop_strings():
     model = DirectCompletionsModel.__new__(DirectCompletionsModel)
     model.config = DirectCompletionsConfig(base_url="http://dynamo", tokenizer_path="unused")
 
     payload = model._build_payload_from_ids([1, 2, 3], max_tokens=4, stop_token_ids=[GLM_TOOL_CLOSE_TOKEN_ID])
 
     assert payload["prompt"] == [1, 2, 3]
-    assert payload["stop_token_ids"] == [GLM_TOOL_CLOSE_TOKEN_ID]
-    assert "stop" not in payload
+    assert payload["stop"] == ["</tool_call>"]
+    assert "stop_token_ids" not in payload
+    assert payload["nvext"] == {"extra_fields": ["stop_reason"]}
+
+
+def test_glm_stop_strings_from_token_ids_normalizes_known_stops():
+    assert glm_stop_strings_from_token_ids([GLM_TOOL_CLOSE_TOKEN_ID, GLM_EOS_TOKEN_ID]) == GLM_TOOL_STOPS
 
 
 def test_stop_reason_token_ids_normalizes_dynamo_values():
@@ -90,13 +97,13 @@ def test_direct_completions_carries_stop_reason(monkeypatch):
                     {
                         "text": "<tool_call>",
                         "finish_reason": "stop",
-                        "stop_reason": f"token_id:{GLM_TOOL_CLOSE_TOKEN_ID}",
                         "logprobs": {
                             "tokens": [f"token_id:{GLM_TOOL_CALL_TOKEN_ID}"],
                             "token_logprobs": [-0.25],
                         },
                     }
-                ]
+                ],
+                "nvext": {"stop_reason": f"token_id:{GLM_TOOL_CLOSE_TOKEN_ID}"},
             }
 
     posted_payloads = []
@@ -112,6 +119,8 @@ def test_direct_completions_carries_stop_reason(monkeypatch):
 
     result = model.complete_prompt_ids([1, 2], stop_token_ids=[GLM_TOOL_CLOSE_TOKEN_ID])
 
-    assert posted_payloads[0]["stop_token_ids"] == [GLM_TOOL_CLOSE_TOKEN_ID]
+    assert posted_payloads[0]["stop"] == ["</tool_call>"]
+    assert "stop_token_ids" not in posted_payloads[0]
+    assert posted_payloads[0]["nvext"] == {"extra_fields": ["stop_reason"]}
     assert result["extra"]["stop_reason"] == f"token_id:{GLM_TOOL_CLOSE_TOKEN_ID}"
     assert result["extra"]["generated_token_ids"] == [GLM_TOOL_CALL_TOKEN_ID]
