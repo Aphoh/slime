@@ -286,6 +286,7 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
         "logprobs": 0,
         "return_tokens_as_token_ids": True,
         "stream": False,
+        "nvext": {"extra_fields": ["stop_reason"]},
     }
     top_k = sampling_params.get("top_k", -1)
     if top_k > 0:
@@ -303,6 +304,7 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
     _req_elapsed = _time.time() - _req_t0
 
     choice = output["choices"][0]
+    response_nvext = output.get("nvext") or {}
     response_text = choice["text"]
 
     # Extract token IDs and logprobs directly — no re-tokenization needed.
@@ -338,7 +340,7 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
         f"latency={_req_elapsed:.3f}s | "
         f"tok/s={_tok_per_sec:.1f} | "
         f"finish={choice.get('finish_reason', 'unknown')} | "
-        f"stop_reason={choice.get('stop_reason')} | "
+        f"stop_reason={response_nvext.get('stop_reason', choice.get('stop_reason'))} | "
         f"fallback_tokenize={_had_fallback_tokenize} | "
         f"logprob_mismatch={_logprob_mismatch}"
     )
