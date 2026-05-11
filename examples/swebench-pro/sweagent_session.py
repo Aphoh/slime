@@ -72,6 +72,8 @@ class SweAgentSessionClient:
         repo_name: str = "app",
         session_id: str | None = None,
         sample: dict[str, Any] | None = None,
+        agent_context: dict[str, Any] | None = None,
+        tool_events_zmq_endpoint: str | None = None,
     ) -> dict[str, Any]:
         start_timeout = float(os.getenv("SWEPRO_SESSION_START_TIMEOUT", "2400"))
         retry_delay = float(os.getenv("SWEPRO_SESSION_CAPACITY_RETRY_DELAY", "10"))
@@ -84,6 +86,10 @@ class SweAgentSessionClient:
             "repo_name": repo_name,
             "sample": sample or {},
         }
+        if agent_context:
+            payload["agent_context"] = dict(agent_context)
+        if tool_events_zmq_endpoint:
+            payload["tool_events_zmq_endpoint"] = tool_events_zmq_endpoint
         while True:
             try:
                 response = await self._request("swepro.sessions.start", payload, timeout=start_timeout)
