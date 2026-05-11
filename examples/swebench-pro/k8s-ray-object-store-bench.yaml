@@ -1,0 +1,166 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: warnold-ray-obj-bench-head
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-ray-obj-bench
+    role: head
+    owner: warnold
+spec:
+  selector:
+    app: warnold-ray-obj-bench
+    role: head
+  ports:
+    - name: gcs
+      port: 6379
+      targetPort: 6379
+    - name: dashboard
+      port: 8265
+      targetPort: 8265
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warnold-ray-obj-bench-head
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-ray-obj-bench
+    role: head
+    owner: warnold
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-nodepool: customer-cpu
+    kubernetes.io/arch: amd64
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - warnold-ray-obj-bench
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: ray-head
+      image: rayproject/ray:2.47.1-py311
+      imagePullPolicy: IfNotPresent
+      command: ["bash", "-lc"]
+      args:
+        - |
+          set -eux
+          ray start \
+            --head \
+            --node-ip-address="${POD_IP}" \
+            --port=6379 \
+            --num-cpus=2 \
+            --object-store-memory=8589934592 \
+            --disable-usage-stats \
+            --dashboard-host=0.0.0.0 \
+            --dashboard-port=8265
+          tail -f /dev/null
+      env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      ports:
+        - containerPort: 6379
+          name: gcs
+        - containerPort: 8265
+          name: dashboard
+      resources:
+        requests:
+          cpu: "2"
+          memory: "14Gi"
+        limits:
+          cpu: "4"
+          memory: "15Gi"
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: bench-script
+          mountPath: /bench
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 10Gi
+    - name: bench-script
+      configMap:
+        name: warnold-ray-obj-bench-script
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: warnold-ray-obj-bench-worker
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-ray-obj-bench
+    role: worker
+    owner: warnold
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: warnold-ray-obj-bench
+      role: worker
+  template:
+    metadata:
+      labels:
+        app: warnold-ray-obj-bench
+        role: worker
+        owner: warnold
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-nodepool: customer-cpu
+        kubernetes.io/arch: amd64
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - warnold-ray-obj-bench
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: ray-worker
+          image: rayproject/ray:2.47.1-py311
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -eux
+              until ray start \
+                --address=warnold-ray-obj-bench-head:6379 \
+                --node-ip-address="${POD_IP}" \
+                --num-cpus=2 \
+                --object-store-memory=8589934592 \
+                --disable-usage-stats \
+                --block; do
+                sleep 5
+              done
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            requests:
+              cpu: "2"
+              memory: "14Gi"
+            limits:
+              cpu: "4"
+              memory: "15Gi"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 10Gi
