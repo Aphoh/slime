@@ -1,0 +1,257 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warnold-swepro-engine-0
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-engine
+    owner: warnold
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"rdma0","network":"rdma-0"},
+        {"interfaceName":"rdma1","network":"rdma-1"}
+      ]
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+    nvidia.com/gpu.product: NVIDIA-GB200
+  tolerations:
+    - key: "kubernetes.io/arch"
+      operator: "Equal"
+      value: "arm64"
+      effect: "NoSchedule"
+  containers:
+    - name: engine
+      image: aphoh/slime:swepro-qwen35-122b-fp8fix-20260508-0925
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+      command: ["bash", "-c"]
+      args:
+        - |
+          set -eu
+          ulimit -l unlimited
+          ulimit -n 1048576
+          export DYN_DISCOVERY_BACKEND=etcd
+          export ETCD_ENDPOINTS=http://warnold-swepro-frontend:2379
+          export NATS_SERVER=nats://warnold-swepro-nats:4222
+          export DYN_SYSTEM_PORT=30001
+          export PYTHONHASHSEED=0
+          export DYN_SGL_FORCE_NONSTREAM=1
+          export UCX_TLS=cuda_ipc,cuda_copy,rc
+          export UCX_IB_GID_INDEX=3
+          export UCX_RC_TIMEOUT=600s
+          export UCX_KEEPALIVE_INTERVAL=300s
+          export NCCL_CUMEM_ENABLE=1
+          export NCCL_CUMEM_HOST_ENABLE=1
+          export NCCL_MNNVL_ENABLE=0
+          export NCCL_NVLS_ENABLE=1
+          export NCCL_STORE_TIMEOUT=7200
+          export NCCL_SOCKET_IFNAME=eth0
+          export GLOO_SOCKET_IFNAME=eth0
+          export NVIDIA_GDRCOPY=1
+          export NIXL_LOG_LEVEL=INFO
+          export NIXL_TELEMETRY_ENABLE=y
+          export NIXL_TELEMETRY_EXPORTER=prometheus
+          export NIXL_TELEMETRY_PROMETHEUS_PORT=19090
+          exec python3 -m dynamo.sglang \
+            --model-path /shared/Qwen3.5-122B-A10B \
+            --tp 2 \
+            --port 30001 \
+            --host 0.0.0.0 \
+            --trust-remote-code \
+            --enable-rl \
+            --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}' \
+            --page-size 64 \
+            --attention-backend trtllm_mha \
+            --moe-runner-backend flashinfer_trtllm \
+            --kv-cache-dtype fp8_e4m3 \
+            --mamba-ssm-dtype bfloat16 \
+            --mamba-scheduler-strategy extra_buffer \
+            --mamba-track-interval 256 \
+            --cuda-graph-max-bs 32 \
+            --max-running-requests 32 \
+            --context-length 131072 \
+            --max-prefill-tokens 16384 \
+            --chunked-prefill-size 16384 \
+            --stream-interval 50 \
+            --scheduler-recv-interval 30 \
+            --tokenizer-worker-num 1 \
+            --skip-server-warmup \
+            --mem-fraction-static 0.75
+      resources:
+        requests:
+          cpu: "32"
+          memory: "128Gi"
+          ephemeral-storage: "800Gi"
+          nvidia.com/gpu: "2"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+        limits:
+          cpu: "48"
+          memory: "192Gi"
+          ephemeral-storage: "800Gi"
+          nvidia.com/gpu: "2"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+      volumeMounts:
+        - name: model-cache
+          mountPath: /data
+        - name: code-cache
+          mountPath: /code
+        - name: shared-cache
+          mountPath: /shared
+        - name: shm
+          mountPath: /dev/shm
+        - name: scratch
+          mountPath: /scratch
+  volumes:
+    - name: model-cache
+      persistentVolumeClaim:
+        claimName: model-cache
+    - name: code-cache
+      persistentVolumeClaim:
+        claimName: code-cache
+    - name: shared-cache
+      persistentVolumeClaim:
+        claimName: shared-model-cache
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
+    - name: scratch
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warnold-swepro-engine-1
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-engine
+    owner: warnold
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"rdma0","network":"rdma-0"},
+        {"interfaceName":"rdma1","network":"rdma-1"}
+      ]
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+    nvidia.com/gpu.product: NVIDIA-GB200
+  tolerations:
+    - key: "kubernetes.io/arch"
+      operator: "Equal"
+      value: "arm64"
+      effect: "NoSchedule"
+  containers:
+    - name: engine
+      image: aphoh/slime:swepro-qwen35-122b-fp8fix-20260508-0925
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+      command: ["bash", "-c"]
+      args:
+        - |
+          set -eu
+          ulimit -l unlimited
+          ulimit -n 1048576
+          export DYN_DISCOVERY_BACKEND=etcd
+          export ETCD_ENDPOINTS=http://warnold-swepro-frontend:2379
+          export NATS_SERVER=nats://warnold-swepro-nats:4222
+          export DYN_SYSTEM_PORT=30001
+          export PYTHONHASHSEED=0
+          export DYN_SGL_FORCE_NONSTREAM=1
+          export UCX_TLS=cuda_ipc,cuda_copy,rc
+          export UCX_IB_GID_INDEX=3
+          export UCX_RC_TIMEOUT=600s
+          export UCX_KEEPALIVE_INTERVAL=300s
+          export NCCL_CUMEM_ENABLE=1
+          export NCCL_CUMEM_HOST_ENABLE=1
+          export NCCL_MNNVL_ENABLE=0
+          export NCCL_NVLS_ENABLE=1
+          export NCCL_STORE_TIMEOUT=7200
+          export NCCL_SOCKET_IFNAME=eth0
+          export GLOO_SOCKET_IFNAME=eth0
+          export NVIDIA_GDRCOPY=1
+          export NIXL_LOG_LEVEL=INFO
+          export NIXL_TELEMETRY_ENABLE=y
+          export NIXL_TELEMETRY_EXPORTER=prometheus
+          export NIXL_TELEMETRY_PROMETHEUS_PORT=19090
+          exec python3 -m dynamo.sglang \
+            --model-path /shared/Qwen3.5-122B-A10B \
+            --tp 2 \
+            --port 30001 \
+            --host 0.0.0.0 \
+            --trust-remote-code \
+            --enable-rl \
+            --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}' \
+            --page-size 64 \
+            --attention-backend trtllm_mha \
+            --moe-runner-backend flashinfer_trtllm \
+            --kv-cache-dtype fp8_e4m3 \
+            --mamba-ssm-dtype bfloat16 \
+            --mamba-scheduler-strategy extra_buffer \
+            --mamba-track-interval 256 \
+            --cuda-graph-max-bs 32 \
+            --max-running-requests 32 \
+            --context-length 131072 \
+            --max-prefill-tokens 16384 \
+            --chunked-prefill-size 16384 \
+            --stream-interval 50 \
+            --scheduler-recv-interval 30 \
+            --tokenizer-worker-num 1 \
+            --skip-server-warmup \
+            --mem-fraction-static 0.75
+      resources:
+        requests:
+          cpu: "32"
+          memory: "128Gi"
+          ephemeral-storage: "800Gi"
+          nvidia.com/gpu: "2"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+        limits:
+          cpu: "48"
+          memory: "192Gi"
+          ephemeral-storage: "800Gi"
+          nvidia.com/gpu: "2"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+      volumeMounts:
+        - name: model-cache
+          mountPath: /data
+        - name: code-cache
+          mountPath: /code
+        - name: shared-cache
+          mountPath: /shared
+        - name: shm
+          mountPath: /dev/shm
+        - name: scratch
+          mountPath: /scratch
+  volumes:
+    - name: model-cache
+      persistentVolumeClaim:
+        claimName: model-cache
+    - name: code-cache
+      persistentVolumeClaim:
+        claimName: code-cache
+    - name: shared-cache
+      persistentVolumeClaim:
+        claimName: shared-model-cache
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
+    - name: scratch
+      emptyDir: {}
