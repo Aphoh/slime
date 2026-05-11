@@ -1,0 +1,52 @@
+import importlib.util
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LAUNCH_PATH = REPO_ROOT / "examples" / "swebench-pro" / "launch_swepro_rl.py"
+K8S_STACK_PATH = REPO_ROOT / "examples" / "swebench-pro" / "k8s-gcp02-swepro-stack.yaml"
+
+
+def _load_launch_module():
+    spec = importlib.util.spec_from_file_location("swepro_launch", LAUNCH_PATH)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_runtime_env_passes_dynamo_trace_inputs_without_legacy_swepro_traces():
+    launch = _load_launch_module()
+    env = {
+        "SWEPRO_RUN_ID": "run-123",
+        "DYNAMO_FRONTEND_URL": "http://warnold-swepro-frontend:3000",
+        "SLIME_SPEEDSCOPE_TRACE_PATH": "/tmp/old.jsonl",
+        "SWEPRO_SPEEDSCOPE_TRACE_PATH": "/tmp/old-swe.jsonl",
+        "SWEPRO_MODEL_TRACE_PATH": "/tmp/model.jsonl",
+    }
+
+    runtime = launch.runtime_env(env, REPO_ROOT, "0")["env_vars"]
+
+    assert runtime["SWEPRO_RUN_ID"] == "run-123"
+    assert runtime["DYNAMO_FRONTEND_URL"] == "http://warnold-swepro-frontend:3000"
+    assert runtime["SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_PORT"] == "20390"
+    assert "SLIME_SPEEDSCOPE_TRACE_PATH" not in runtime
+    assert "SWEPRO_SPEEDSCOPE_TRACE_PATH" not in runtime
+    assert "SWEPRO_MODEL_TRACE_PATH" not in runtime
+
+
+def test_k8s_stack_exposes_dynamo_agent_trace_port_and_session_dependencies():
+    text = K8S_STACK_PATH.read_text()
+
+    assert "DYN_AGENT_TRACE_SINKS=jsonl_gz" in text
+    assert "DYN_AGENT_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT=tcp://0.0.0.0:20390" in text
+    assert "port: 20390" in text
+    assert "python3 -m pip install --quiet nats-py docker pyyaml pyzmq msgpack" in text
+    assert "COPY dynamo_agent_trace.py /opt/swepro-session/dynamo_agent_trace.py" in (
+        REPO_ROOT / "docker" / "swepro-session" / "Dockerfile"
+    ).read_text()
+    assert "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT" in text
+    assert "SWEPRO_SPEEDSCOPE_TRACE_PATH" not in text

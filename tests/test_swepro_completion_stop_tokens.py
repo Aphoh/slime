@@ -34,6 +34,22 @@ def test_direct_completions_payload_maps_glm_stop_token_ids_to_stop_strings():
     assert payload["nvext"] == {"extra_fields": ["stop_reason"]}
 
 
+def test_direct_completions_payload_merges_dynamo_agent_context():
+    model = DirectCompletionsModel.__new__(DirectCompletionsModel)
+    model.config = DirectCompletionsConfig(base_url="http://dynamo", tokenizer_path="unused")
+    agent_context = {
+        "session_type_id": "slime_swebench_pro",
+        "session_id": "run-1",
+        "trajectory_id": "run-1:swebench_pro:task:0:abc12345",
+    }
+
+    payload = model._build_payload_from_ids([1, 2, 3], agent_context=agent_context)
+
+    assert payload["nvext"]["extra_fields"] == ["stop_reason"]
+    assert payload["nvext"]["agent_context"] == agent_context
+    assert "phase" not in payload["nvext"]["agent_context"]
+
+
 def test_glm_stop_strings_from_token_ids_normalizes_known_stops():
     assert glm_stop_strings_from_token_ids([GLM_TOOL_CLOSE_TOKEN_ID, GLM_EOS_TOKEN_ID]) == GLM_TOOL_STOPS
 
@@ -107,9 +123,11 @@ def test_direct_completions_carries_stop_reason(monkeypatch):
             }
 
     posted_payloads = []
+    posted_headers = []
 
-    def _post(_url, json, timeout):
+    def _post(_url, json, headers, timeout):
         posted_payloads.append(json)
+        posted_headers.append(headers)
         return _Response()
 
     monkeypatch.setattr(completions_direct_model.requests, "post", _post)
@@ -117,10 +135,51 @@ def test_direct_completions_carries_stop_reason(monkeypatch):
     model.config = DirectCompletionsConfig(base_url="http://dynamo", tokenizer_path="unused")
     model.tokenizer = object()
 
-    result = model.complete_prompt_ids([1, 2], stop_token_ids=[GLM_TOOL_CLOSE_TOKEN_ID])
+    result = model.complete_prompt_ids([1, 2], stop_token_ids=[GLM_TOOL_CLOSE_TOKEN_ID], x_request_id="traj:llm:0")
 
     assert posted_payloads[0]["stop"] == ["</tool_call>"]
     assert "stop_token_ids" not in posted_payloads[0]
     assert posted_payloads[0]["nvext"] == {"extra_fields": ["stop_reason"]}
+    assert posted_headers[0] == {"x-request-id": "traj:llm:0:try:0"}
     assert result["extra"]["stop_reason"] == f"token_id:{GLM_TOOL_CLOSE_TOKEN_ID}"
     assert result["extra"]["generated_token_ids"] == [GLM_TOOL_CALL_TOKEN_ID]
+
+
+def test_direct_completions_retry_uses_distinct_x_request_ids(monkeypatch):
+    class _Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [
+                    {
+                        "text": "",
+                        "finish_reason": "stop",
+                        "logprobs": {"tokens": [], "token_logprobs": []},
+                    }
+                ],
+            }
+
+    posted_headers = []
+
+    def _post(_url, json, headers, timeout):
+        posted_headers.append(headers)
+        if len(posted_headers) == 1:
+            raise RuntimeError("transient")
+        return _Response()
+
+    monkeypatch.setattr(completions_direct_model.requests, "post", _post)
+    monkeypatch.setattr(completions_direct_model.time, "sleep", lambda _seconds: None)
+    model = DirectCompletionsModel.__new__(DirectCompletionsModel)
+    model.config = DirectCompletionsConfig(base_url="http://dynamo", tokenizer_path="unused", retries=2)
+    model.tokenizer = object()
+
+    model.complete_prompt_ids([1, 2], x_request_id="traj:llm:7")
+
+    assert posted_headers == [
+        {"x-request-id": "traj:llm:7:try:0"},
+        {"x-request-id": "traj:llm:7:try:1"},
+    ]

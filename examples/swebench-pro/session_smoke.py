@@ -7,8 +7,8 @@ import argparse
 import asyncio
 import json
 import os
-from pathlib import Path
 
+from dynamo_agent_trace import build_agent_context, derive_tool_events_zmq_endpoint
 from sweagent_session import SweAgentSessionClient
 
 
@@ -19,14 +19,18 @@ async def main() -> None:
     parser.add_argument("--image-name", required=True)
     parser.add_argument("--base-commit", required=True)
     parser.add_argument("--repo-name", default="app")
+    parser.add_argument("--dynamo-url", default=os.getenv("SWEPRO_DYNAMO_FRONTEND_URL") or os.getenv("DYNAMO_FRONTEND_URL"))
     args = parser.parse_args()
 
     client = SweAgentSessionClient(args.nats_url)
+    agent_context = build_agent_context(args.instance_id, "smoke")
     started = await client.start(
         instance_id=args.instance_id,
         image_name=args.image_name,
         base_commit=args.base_commit,
         repo_name=args.repo_name,
+        agent_context=agent_context,
+        tool_events_zmq_endpoint=derive_tool_events_zmq_endpoint(args.dynamo_url),
     )
     session_id = started["session_id"]
     print(json.dumps({"started": started}, indent=2))

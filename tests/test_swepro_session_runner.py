@@ -50,6 +50,23 @@ class _Message:
         self.responses.append(json.loads(payload.decode("utf-8")))
 
 
+class _FakePublisher:
+    def __init__(self):
+        self.records = []
+
+    def publish(self, record):
+        self.records.append(record)
+        return True
+
+
+def _trace_context():
+    return {
+        "session_type_id": "slime_swebench_pro",
+        "session_id": "run-1",
+        "trajectory_id": "run-1:swebench_pro:instance-0:0:abcdef12",
+    }
+
+
 def test_step_drops_session_when_deployment_disappears():
     runner = _load_session_runner()
 
@@ -87,6 +104,7 @@ def test_step_drops_session_when_deployment_disappears():
             return False
 
     env = _Env()
+    publisher = _FakePublisher()
     manager = runner.SessionManager.__new__(runner.SessionManager)
     manager.worker_id = "worker-0"
     manager.sessions = {
@@ -97,11 +115,14 @@ def test_step_drops_session_when_deployment_disappears():
             tools=_Tools(),
             started_at=0,
             last_used_at=0,
+            agent_context=_trace_context(),
+            tool_events_zmq_endpoint="tcp://trace:20390",
         )
     }
     manager._lock = threading.RLock()
     manager._valid_tools = {"bash"}
     manager._tools_config = types.SimpleNamespace(execution_timeout=1)
+    manager._tool_event_publishers = {"tcp://trace:20390": publisher}
     manager._imports = {
         "CommandTimeoutError": CommandTimeoutError,
         "BashIncorrectSyntaxError": BashIncorrectSyntaxError,
@@ -115,6 +136,103 @@ def test_step_drops_session_when_deployment_disappears():
     assert "Deployment not started" in result["state_error"]
     assert "sid" not in manager.sessions
     assert env.closed is True
+    assert [record["event_type"] for record in publisher.records] == ["tool_start", "tool_error"]
+    assert publisher.records[-1]["tool"]["error_type"] == "DeploymentNotStartedError"
+
+
+def test_step_emits_dynamo_tool_start_and_end():
+    runner = _load_session_runner()
+
+    class CommandTimeoutError(Exception):
+        pass
+
+    class BashIncorrectSyntaxError(Exception):
+        pass
+
+    class _Env:
+        def communicate(self, **kwargs):
+            return "hello\n"
+
+    class _Tools:
+        config = types.SimpleNamespace(execution_timeout=1)
+
+        def parse_actions(self, output):
+            return "thought", "echo hello"
+
+        def guard_multiline_input(self, action):
+            return action
+
+        def get_state(self, env):
+            return {"ok": True}
+
+        def check_for_submission_cmd(self, observation):
+            return False
+
+    publisher = _FakePublisher()
+    manager = runner.SessionManager.__new__(runner.SessionManager)
+    manager.worker_id = "worker-0"
+    manager.sessions = {
+        "sid": runner.Session(
+            session_id="sid",
+            instance_id="instance-0",
+            env=_Env(),
+            tools=_Tools(),
+            started_at=0,
+            last_used_at=0,
+            agent_context=_trace_context(),
+            tool_events_zmq_endpoint="tcp://trace:20390",
+        )
+    }
+    manager._lock = threading.RLock()
+    manager._valid_tools = {"bash"}
+    manager._tools_config = types.SimpleNamespace(execution_timeout=1)
+    manager._tool_event_publishers = {"tcp://trace:20390": publisher}
+    manager._imports = {
+        "CommandTimeoutError": CommandTimeoutError,
+        "BashIncorrectSyntaxError": BashIncorrectSyntaxError,
+    }
+
+    result = manager.step({"session_id": "sid", "tool_call": {"id": "call-1", "function": {"name": "bash"}}})
+
+    assert result["tool_error"] is None
+    assert [record["event_type"] for record in publisher.records] == ["tool_start", "tool_end"]
+    assert publisher.records[0]["tool"]["status"] == "running"
+    assert publisher.records[1]["tool"]["status"] == "succeeded"
+    assert publisher.records[1]["tool"]["tool_call_id"] == "call-1"
+    assert publisher.records[1]["tool"]["output_bytes"] == len("hello\n".encode("utf-8"))
+
+
+def test_invalid_tool_emits_dynamo_tool_error():
+    runner = _load_session_runner()
+
+    class _Tools:
+        def get_state(self, env):
+            return {"ok": True}
+
+    publisher = _FakePublisher()
+    manager = runner.SessionManager.__new__(runner.SessionManager)
+    manager.worker_id = "worker-0"
+    manager.sessions = {
+        "sid": runner.Session(
+            session_id="sid",
+            instance_id="instance-0",
+            env=object(),
+            tools=_Tools(),
+            started_at=0,
+            last_used_at=0,
+            agent_context=_trace_context(),
+            tool_events_zmq_endpoint="tcp://trace:20390",
+        )
+    }
+    manager._lock = threading.RLock()
+    manager._valid_tools = {"str_replace_editor"}
+    manager._tool_event_publishers = {"tcp://trace:20390": publisher}
+
+    result = manager.step({"session_id": "sid", "tool_call": {"id": "call-bad", "function": {"name": "bash"}}})
+
+    assert result["tool_error"] == "invalid_tool"
+    assert [record["event_type"] for record in publisher.records] == ["tool_error"]
+    assert publisher.records[0]["tool"]["error_type"] == "invalid_tool"
 
 
 async def _health_completes_while_step_is_blocked(*, shared_semaphore: bool) -> bool:

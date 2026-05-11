@@ -11,9 +11,7 @@ import json
 import os
 import re
 import time
-import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import requests
@@ -69,7 +67,6 @@ class DirectCompletionsConfig:
     top_k: int | None = None
     timeout: float = 600.0
     retries: int = 5
-    trace_path: str | None = None
 
     @classmethod
     def from_env(cls) -> "DirectCompletionsConfig":
@@ -89,7 +86,6 @@ class DirectCompletionsConfig:
             top_k=int(value) if (value := _env("SWEPRO_TOP_K")) else None,
             timeout=float(_env("SWEPRO_REQUEST_TIMEOUT", "600") or "600"),
             retries=int(_env("SWEPRO_REQUEST_RETRIES", "5") or "5"),
-            trace_path=_env("SWEPRO_MODEL_TRACE_PATH"),
         )
 
 
@@ -141,6 +137,9 @@ class DirectCompletionsModel:
             stop = list(stop or []) + mapped_stops if isinstance(stop, list) else ([stop] if stop else []) + mapped_stops
         if stop:
             payload["stop"] = stop
+        agent_context = kwargs.get("agent_context")
+        if agent_context:
+            payload["nvext"]["agent_context"] = dict(agent_context)
         # The updated Dynamo OpenAI frontend rejects stop_token_ids as an unsupported
         # top-level parameter, so we send GLM special stops as strings instead.
         return payload
@@ -150,39 +149,36 @@ class DirectCompletionsModel:
         prompt_ids: list[int],
         *,
         trace_messages: list[dict[str, Any]] | None = None,
+        x_request_id: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         payload = self._build_payload_from_ids(prompt_ids, **kwargs)
-        return self._post_payload(payload, trace_messages or [])
+        return self._post_payload(payload, trace_messages or [], x_request_id=x_request_id)
 
     def query(self, messages: list[dict[str, Any]], **kwargs) -> dict[str, Any]:
         payload = self._build_payload(messages, **kwargs)
-        return self._post_payload(payload, messages)
+        return self._post_payload(payload, messages, x_request_id=kwargs.get("x_request_id"))
 
-    def _post_payload(self, payload: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, Any]:
+    def _post_payload(
+        self,
+        payload: dict[str, Any],
+        _messages: list[dict[str, Any]],
+        *,
+        x_request_id: str | None = None,
+    ) -> dict[str, Any]:
         url = f"{self.config.base_url}/v1/completions"
         last_error: Exception | None = None
-        trace_id = str(uuid.uuid4())
-        start = time.time()
         for attempt in range(self.config.retries):
             try:
-                response = requests.post(url, json=payload, timeout=self.config.timeout)
+                request_id = f"{x_request_id}:try:{attempt}" if x_request_id else None
+                headers = {"x-request-id": request_id} if request_id else None
+                response = requests.post(url, json=payload, headers=headers, timeout=self.config.timeout)
                 response.raise_for_status()
                 data = response.json()
                 break
             except Exception as exc:
                 last_error = exc
                 if attempt + 1 >= self.config.retries:
-                    self._write_trace(
-                        messages,
-                        {
-                            "trace_id": trace_id,
-                            "url": url,
-                            "payload": payload,
-                            "elapsed_s": time.time() - start,
-                            "error": repr(exc),
-                        },
-                    )
                     raise
                 time.sleep(min(2**attempt, 30))
         else:
@@ -207,25 +203,7 @@ class DirectCompletionsModel:
             "stop_reason": response_nvext.get("stop_reason", choice.get("stop_reason")),
         }
         result = {"content": choice.get("text", ""), "message": choice.get("text", ""), "extra": extra}
-        self._write_trace(
-            messages,
-            {
-                "trace_id": trace_id,
-                "url": url,
-                "payload": payload,
-                "elapsed_s": time.time() - start,
-                "result": result,
-            },
-        )
         return result
-
-    def _write_trace(self, messages: list[dict[str, Any]], event: dict[str, Any]) -> None:
-        if not self.config.trace_path:
-            return
-        path = Path(self.config.trace_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"messages": messages, **event}, ensure_ascii=False) + "\n")
 
 
 def query(messages: list[dict[str, Any]], **kwargs) -> dict[str, Any]:

@@ -103,6 +103,11 @@ spec:
           export DYN_DISCOVERY_BACKEND=etcd
           export ETCD_ENDPOINTS=http://warnold-swepro-frontend:2379
           export NATS_SERVER=nats://warnold-swepro-nats:4222
+          export DYN_AGENT_TRACE_SINKS=jsonl_gz
+          export DYN_AGENT_TRACE_OUTPUT_PATH=/data/swebench-pro/traces/dynamo-agent-trace
+          export DYN_AGENT_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT=tcp://0.0.0.0:20390
+          export DYN_AGENT_TRACE_TOOL_EVENTS_ZMQ_TOPIC=agent-tool-events
+          mkdir -p /data/swebench-pro/traces
           export PYTHONHASHSEED=0
           MODEL_PATH="${SWEPRO_STACK_MODEL_PATH:-/data/glm-4.7-30b-a3b}"
           KV_CACHE_BLOCK_SIZE="${SWEPRO_KV_CACHE_BLOCK_SIZE:-16}"
@@ -121,6 +126,8 @@ spec:
       ports:
         - containerPort: 3000
           name: http
+        - containerPort: 20390
+          name: agent-trace
         - containerPort: 2379
           name: etcd
       resources:
@@ -163,6 +170,9 @@ spec:
     - name: http
       port: 3000
       targetPort: 3000
+    - name: agent-trace
+      port: 20390
+      targetPort: 20390
     - name: etcd
       port: 2379
       targetPort: 2379
@@ -248,7 +258,7 @@ spec:
                 sleep 2
               done
               docker info >/dev/null
-              python3 -m pip install --quiet nats-py docker pyyaml
+              python3 -m pip install --quiet nats-py docker pyyaml pyzmq msgpack
               python3 -m pip install --quiet -e /code/SWE-bench_Pro-os/SWE-agent
               if [ ! -d /tmp/SWE-ReX ]; then
                 git clone --depth 1 --branch v1.2.0 https://github.com/SWE-Agent/SWE-ReX.git /tmp/SWE-ReX
@@ -290,8 +300,8 @@ spec:
               value: swepro-session-start
             - name: SWEPRO_SESSION_LEGACY_SUBJECTS
               value: "0"
-            - name: SWEPRO_SPEEDSCOPE_TRACE_PATH
-              value: /data/swebench-pro/traces/swepro-current.spans.jsonl
+            - name: SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT
+              value: tcp://warnold-swepro-frontend:20390
           resources:
             requests:
               cpu: "5"
