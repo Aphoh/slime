@@ -67,22 +67,13 @@ def apply_profile_defaults(env: dict[str, str], profile: str, repo_root: Path, *
     if profile != "speedscope-current":
         raise ValueError(f"unknown profile: {profile}")
 
-    run_id = env.setdefault(
+    env.setdefault(
         "SWEPRO_RUN_ID",
-        f"gcp02_speedscope_8gpu_tp1_pp1_cp8_ep8_131k_16kpg_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+        f"gcp02_dynamo_trace_8gpu_tp1_pp1_cp8_ep8_131k_16kpg_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
     )
 
-    trace_dir = repo_root / ".traces"
-    if write_state:
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        for stale_trace in trace_dir.glob("swepro-current.spans*.jsonl"):
-            stale_trace.unlink()
-        (trace_dir / "current-run-id.txt").write_text(f"{run_id}\n")
-
     defaults = {
-        "SLIME_SPEEDSCOPE_TRACE_PATH": str(trace_dir / "swepro-current.spans.jsonl"),
-        "SWEPRO_SPEEDSCOPE_TRACE_PATH": str(trace_dir / "swepro-current.spans.jsonl"),
-        "SWEPRO_MODEL_TRACE_PATH": f"/data/swebench-pro/traces/{run_id}.model.jsonl",
+        "DYNAMO_FRONTEND_URL": "http://warnold-swepro-frontend:3000",
         "SWEPRO_PROMPT_DATA": "/data/swebench-pro/swebench_pro_train_cached_images.jsonl",
         "SWEPRO_REF_LOAD": "/data/swebench-pro/checkpoints/GLM-4.7-Flash_torch_dist_tp1_pp1_cp8_ep8_shared_v4",
         "SWEPRO_ROLLOUT_FUNCTION_PATH": "fully_async_rollout.generate_rollout_fully_async",
@@ -209,8 +200,6 @@ def durable_log_config(env: dict[str, str]) -> DurableLogConfig:
 def runtime_env(env: dict[str, str], repo_root: Path, has_nvlink: str) -> dict[str, dict[str, str]]:
     swepro_dir = str(repo_root / "examples/swebench-pro")
     fully_async_dir = str(repo_root / "examples/fully_async")
-    trace_path = env.get("SLIME_SPEEDSCOPE_TRACE_PATH", "")
-    swepro_trace_path = env.get("SWEPRO_SPEEDSCOPE_TRACE_PATH", trace_path)
     env_vars = {
         "PYTHONPATH": f"/root/src/Megatron-LM/:{swepro_dir}:{fully_async_dir}:{repo_root}",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
@@ -260,15 +249,17 @@ def runtime_env(env: dict[str, str], repo_root: Path, has_nvlink: str) -> dict[s
         "SLIME_WEIGHT_UPDATE_NCCL_SOCKET_IFNAME": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_SOCKET_IFNAME", ""),
         "SLIME_WEIGHT_UPDATE_NCCL_DEBUG": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_DEBUG", ""),
         "SLIME_WEIGHT_UPDATE_NCCL_DEBUG_SUBSYS": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_DEBUG_SUBSYS", ""),
-        "SLIME_SPEEDSCOPE_TRACE_PATH": trace_path,
-        "SWEPRO_SPEEDSCOPE_TRACE_PATH": swepro_trace_path,
+        "SWEPRO_RUN_ID": env_str(env, "SWEPRO_RUN_ID", default_run_id()),
+        "DYNAMO_FRONTEND_URL": env_str(env, "DYNAMO_FRONTEND_URL", "http://warnold-swepro-frontend:3000"),
+        "SWEPRO_DYNAMO_FRONTEND_URL": env.get("SWEPRO_DYNAMO_FRONTEND_URL", ""),
+        "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT": env.get("SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT", ""),
+        "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_PORT": env_str(env, "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_PORT", "20390"),
         "SWEPRO_NATS_URL": env_str(env, "SWEPRO_NATS_URL", "nats://warnold-swepro-nats:4222"),
         "SWEPRO_AGENT_MODE": env_str(env, "SWEPRO_AGENT_MODE", "sweagent_session"),
         "SWEPRO_MAX_TOOL_CALLS": env_str(env, "SWEPRO_MAX_TOOL_CALLS", "20"),
         "SWEPRO_EPISODE_WALL_TIMEOUT": env_str(env, "SWEPRO_EPISODE_WALL_TIMEOUT", "0"),
         "SWEPRO_TURN_MAX_TOKENS": env_str(env, "SWEPRO_TURN_MAX_TOKENS", "8192"),
         "SWEPRO_MODEL": env_str(env, "SWEPRO_MODEL", "/data/glm-4.7-30b-a3b"),
-        "SWEPRO_MODEL_TRACE_PATH": env.get("SWEPRO_MODEL_TRACE_PATH", ""),
         "SWEPRO_MODEL_CALL_TIMEOUT": env_str(env, "SWEPRO_MODEL_CALL_TIMEOUT", "600"),
         "SWEPRO_REQUEST_TIMEOUT": env_str(env, "SWEPRO_REQUEST_TIMEOUT", "540"),
         "SWEPRO_REQUEST_RETRIES": env_str(env, "SWEPRO_REQUEST_RETRIES", "2"),
@@ -683,7 +674,7 @@ def main() -> int:
         create_dirs=not args.dry_run,
     )
     if args.print_env:
-        print(json.dumps({k: env[k] for k in sorted(env) if k.startswith(("SWEPRO_", "SLIME_"))}, indent=2))
+        print(json.dumps({k: env[k] for k in sorted(env) if k.startswith(("DYNAMO_", "SWEPRO_", "SLIME_"))}, indent=2))
     if args.dry_run:
         print(shlex.join(command))
         return 0

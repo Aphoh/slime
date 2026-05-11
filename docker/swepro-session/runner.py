@@ -24,8 +24,11 @@ from nats.aio.client import Client as NATS
 SLIME_ROOT = Path(__file__).resolve().parents[2]
 if str(SLIME_ROOT) not in sys.path:
     sys.path.insert(0, str(SLIME_ROOT))
+SWEPRO_EXAMPLE_ROOT = SLIME_ROOT / "examples" / "swebench-pro"
+if str(SWEPRO_EXAMPLE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SWEPRO_EXAMPLE_ROOT))
 
-from slime.utils.speedscope_trace import trace_span
+from dynamo_agent_trace import DynamoToolEventPublisher, build_tool_trace_record, now_ms
 
 CONTROL_PLANE_METHODS = {"close", "health"}
 
@@ -250,10 +253,6 @@ def _observation_looks_like_oom(observation: str) -> bool:
     return bool(re.search(r"\b(killed|oom|out of memory|cannot allocate memory)\b", observation, re.IGNORECASE))
 
 
-def _log_tool_resource_event(event: dict[str, Any]) -> None:
-    print("swepro-session-tool-resource " + json.dumps(event, default=_json_default), flush=True)
-
-
 @dataclass
 class Session:
     session_id: str
@@ -262,6 +261,8 @@ class Session:
     tools: Any
     started_at: float
     last_used_at: float
+    agent_context: dict[str, Any] | None = None
+    tool_events_zmq_endpoint: str | None = None
 
 
 class SessionManager:
@@ -288,6 +289,8 @@ class SessionManager:
         self._tools_config = self._load_tools_config()
         self._tool_schema = self._tools_config.tools
         self._valid_tools = _tool_names(self._tool_schema)
+        self._tool_event_publishers: dict[str, DynamoToolEventPublisher] = {}
+        self._tool_event_publishers_lock = threading.RLock()
 
     def _load_tools_config(self):
         yaml = self._imports["yaml"]
@@ -296,12 +299,90 @@ class SessionManager:
         agent_cfg = yaml.safe_load(config_path.read_text())["agent"]
         return ToolConfig.model_validate(agent_cfg["tools"])
 
+    def _publisher_for(self, endpoint: str | None) -> DynamoToolEventPublisher | None:
+        if not endpoint:
+            return None
+        if not hasattr(self, "_tool_event_publishers"):
+            self._tool_event_publishers = {}
+        if not hasattr(self, "_tool_event_publishers_lock"):
+            self._tool_event_publishers_lock = threading.RLock()
+        with self._tool_event_publishers_lock:
+            publisher = self._tool_event_publishers.get(endpoint)
+            if publisher is None:
+                publisher = DynamoToolEventPublisher(endpoint)
+                self._tool_event_publishers[endpoint] = publisher
+            return publisher
+
+    def _publish_tool_event(
+        self,
+        session: Session,
+        *,
+        event_type: str,
+        tool_call_id: str,
+        tool_class: str,
+        event_time_unix_ms: int | None = None,
+        started_at_unix_ms: int | None = None,
+        ended_at_unix_ms: int | None = None,
+        status: str | None = None,
+        duration_ms: float | None = None,
+        output_bytes: int | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        if not session.agent_context:
+            return
+        publisher = self._publisher_for(session.tool_events_zmq_endpoint)
+        if publisher is None:
+            return
+        publisher.publish(
+            build_tool_trace_record(
+                agent_context=session.agent_context,
+                event_type=event_type,
+                tool_call_id=tool_call_id,
+                tool_class=tool_class,
+                event_time_unix_ms=event_time_unix_ms,
+                started_at_unix_ms=started_at_unix_ms,
+                ended_at_unix_ms=ended_at_unix_ms,
+                status=status,
+                duration_ms=duration_ms,
+                output_bytes=output_bytes,
+                error_type=error_type,
+            )
+        )
+
+    def _publish_tool_error(
+        self,
+        session: Session,
+        *,
+        tool_call_id: str,
+        tool_class: str,
+        started_at_unix_ms: int,
+        error_type: str,
+        output: str = "",
+        status: str = "error",
+    ) -> None:
+        ended_at = now_ms()
+        self._publish_tool_event(
+            session,
+            event_type="tool_error",
+            tool_call_id=tool_call_id,
+            tool_class=tool_class,
+            event_time_unix_ms=ended_at,
+            started_at_unix_ms=started_at_unix_ms,
+            ended_at_unix_ms=ended_at,
+            status=status,
+            duration_ms=float(ended_at - started_at_unix_ms),
+            output_bytes=len(output.encode("utf-8")),
+            error_type=error_type,
+        )
+
     def start(self, request: dict[str, Any]) -> dict[str, Any]:
         session_id = request.get("session_id") or str(uuid.uuid4())
         instance_id = request["instance_id"]
         image_name = request["image_name"]
         base_commit = request["base_commit"]
         repo_name = request.get("repo_name") or "app"
+        agent_context = request.get("agent_context") if isinstance(request.get("agent_context"), dict) else None
+        tool_events_zmq_endpoint = request.get("tool_events_zmq_endpoint") or os.getenv("SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT")
 
         with self._lock:
             active_or_starting = len(self.sessions) + self._starting_sessions
@@ -350,26 +431,19 @@ class SessionManager:
         )
         env = None
         try:
-            with trace_span(
-                f"session/{self.worker_id}/{session_id}",
-                "session.bootstrap",
-                worker_id=self.worker_id,
-                session_id=session_id,
-                instance_id=instance_id,
-            ):
-                env = SWEEnv.from_config(env_cfg)
-                tools = ToolHandler(self._tools_config)
-                env.start()
-                tools.install(env)
-                env.set_env_variables(
-                    {
-                        "PAGER": "cat",
-                        "GIT_PAGER": "cat",
-                        "GH_PAGER": "cat",
-                        "LESS": "-F -X",
-                        "TERM": "dumb",
-                    }
-                )
+            env = SWEEnv.from_config(env_cfg)
+            tools = ToolHandler(self._tools_config)
+            env.start()
+            tools.install(env)
+            env.set_env_variables(
+                {
+                    "PAGER": "cat",
+                    "GIT_PAGER": "cat",
+                    "GH_PAGER": "cat",
+                    "LESS": "-F -X",
+                    "TERM": "dumb",
+                }
+            )
         except Exception:
             if env is not None:
                 try:
@@ -390,6 +464,8 @@ class SessionManager:
                 tools=tools,
                 started_at=now,
                 last_used_at=now,
+                agent_context=agent_context,
+                tool_events_zmq_endpoint=tool_events_zmq_endpoint,
             )
         state = tools.get_state(env)
         return {
@@ -445,8 +521,18 @@ class SessionManager:
         session = self._get(request["session_id"])
         tool_call = request["tool_call"]
         name = tool_call.get("function", {}).get("name")
+        tool_class = str(name or "unknown")
+        tool_call_id = str(tool_call.get("id") or f"call_{tool_class}_{uuid.uuid4().hex[:8]}")
         if name not in self._valid_tools:
             observation = f"Invalid tool {name!r}; valid tools: {sorted(self._valid_tools)}"
+            self._publish_tool_error(
+                session,
+                tool_call_id=tool_call_id,
+                tool_class=tool_class,
+                started_at_unix_ms=now_ms(),
+                error_type="invalid_tool",
+                output=observation,
+            )
             state = session.tools.get_state(session.env)
             return {
                 "session_id": session.session_id,
@@ -468,6 +554,15 @@ class SessionManager:
             thought, action = session.tools.parse_actions(output)
             run_action = session.tools.guard_multiline_input(action).strip()
         except Exception as exc:
+            observation = _tool_error_observation(exc)
+            self._publish_tool_error(
+                session,
+                tool_call_id=tool_call_id,
+                tool_class=tool_class,
+                started_at_unix_ms=now_ms(),
+                error_type=type(exc).__name__,
+                output=observation,
+            )
             state = session.tools.get_state(session.env)
             return {
                 "session_id": session.session_id,
@@ -476,7 +571,7 @@ class SessionManager:
                 "thought": request.get("thought", ""),
                 "action": "",
                 "run_action": "",
-                "observation": _tool_error_observation(exc),
+                "observation": observation,
                 "state": state,
                 "submitted": False,
                 "done": False,
@@ -485,42 +580,42 @@ class SessionManager:
                 "error": None,
             }
         timeout = self._execution_timeout()
-        started_at = time.time()
-        before_resources = _session_resource_snapshot(session.session_id)
+        started_at_unix_ms = now_ms()
         tool_error = None
         communication_error = None
         session_dropped = False
-        with trace_span(
-            f"session/{self.worker_id}/{session.session_id}",
-            f"tool.run {name}",
-            worker_id=self.worker_id,
-            session_id=session.session_id,
-            instance_id=session.instance_id,
-            timeout_s=timeout,
-        ):
+        self._publish_tool_event(
+            session,
+            event_type="tool_start",
+            tool_call_id=tool_call_id,
+            tool_class=tool_class,
+            event_time_unix_ms=started_at_unix_ms,
+            started_at_unix_ms=started_at_unix_ms,
+            status="running",
+        )
+        try:
+            observation = session.env.communicate(
+                input=run_action,
+                timeout=timeout,
+                check="ignore",
+            )
+        except self._imports["BashIncorrectSyntaxError"] as exc:
+            observation = _tool_error_observation(exc)
+            tool_error = type(exc).__name__
+        except self._imports["CommandTimeoutError"]:
             try:
-                observation = session.env.communicate(
-                    input=run_action,
-                    timeout=timeout,
-                    check="ignore",
-                )
-            except self._imports["BashIncorrectSyntaxError"] as exc:
-                observation = _tool_error_observation(exc)
-                tool_error = type(exc).__name__
-            except self._imports["CommandTimeoutError"]:
-                try:
-                    session.env.interrupt_session()
-                except Exception:
-                    traceback.print_exc()
-                observation = (
-                    f"The command was cancelled because it took more than {timeout:g} seconds. "
-                    "Please inspect less broadly or run a narrower command."
-                )
-                tool_error = "timeout"
-            except Exception as exc:
-                observation = _tool_error_observation(exc)
-                tool_error = type(exc).__name__
-                communication_error = exc
+                session.env.interrupt_session()
+            except Exception:
+                traceback.print_exc()
+            observation = (
+                f"The command was cancelled because it took more than {timeout:g} seconds. "
+                "Please inspect less broadly or run a narrower command."
+            )
+            tool_error = "timeout"
+        except Exception as exc:
+            observation = _tool_error_observation(exc)
+            tool_error = type(exc).__name__
+            communication_error = exc
 
         after_resources = _session_resource_snapshot(session.session_id)
         docker_oom = _snapshot_has_oom(after_resources)
@@ -546,24 +641,44 @@ class SessionManager:
                     state_error = f"{state_error}; close_error={close_error}"
                 session_dropped = True
             else:
+                self._publish_tool_error(
+                    session,
+                    tool_call_id=tool_call_id,
+                    tool_class=tool_class,
+                    started_at_unix_ms=started_at_unix_ms,
+                    error_type=type(exc).__name__,
+                    output=observation,
+                )
                 raise
 
-        elapsed = time.time() - started_at
-        _log_tool_resource_event(
-            {
-                "event": "step",
-                "worker_id": self.worker_id,
-                "session_id": session.session_id,
-                "instance_id": session.instance_id,
-                "tool": name,
-                "elapsed_s": elapsed,
-                "tool_error": tool_error,
-                "session_dropped": session_dropped,
-                "state_error": state_error,
-                "before": before_resources,
-                "after": after_resources,
-            }
-        )
+        ended_at_unix_ms = now_ms()
+        if tool_error:
+            self._publish_tool_event(
+                session,
+                event_type="tool_error",
+                tool_call_id=tool_call_id,
+                tool_class=tool_class,
+                event_time_unix_ms=ended_at_unix_ms,
+                started_at_unix_ms=started_at_unix_ms,
+                ended_at_unix_ms=ended_at_unix_ms,
+                status="cancelled" if tool_error == "timeout" else "error",
+                duration_ms=float(ended_at_unix_ms - started_at_unix_ms),
+                output_bytes=len(observation.encode("utf-8")),
+                error_type=tool_error,
+            )
+        else:
+            self._publish_tool_event(
+                session,
+                event_type="tool_end",
+                tool_call_id=tool_call_id,
+                tool_class=tool_class,
+                event_time_unix_ms=ended_at_unix_ms,
+                started_at_unix_ms=started_at_unix_ms,
+                ended_at_unix_ms=ended_at_unix_ms,
+                status="succeeded",
+                duration_ms=float(ended_at_unix_ms - started_at_unix_ms),
+                output_bytes=len(observation.encode("utf-8")),
+            )
         submission = _extract_submission(observation)
         submitted = submission is not None or session.tools.check_for_submission_cmd(observation)
         return {
@@ -581,7 +696,6 @@ class SessionManager:
             "tool_error": tool_error,
             "session_dropped": session_dropped,
             "state_error": state_error,
-            "resources": {"before": before_resources, "after": after_resources, "elapsed_s": elapsed},
             "error": None,
         }
 
@@ -589,19 +703,47 @@ class SessionManager:
         session = self._get(request["session_id"])
         output = {"message": "", "tool_calls": [{"id": "call_submit", "type": "function", "function": {"name": "submit", "arguments": "{}"}}]}
         _, action = session.tools.parse_actions(output)
-        with trace_span(
-            f"session/{self.worker_id}/{session.session_id}",
-            "tool.submit",
-            worker_id=self.worker_id,
-            session_id=session.session_id,
-            instance_id=session.instance_id,
-        ):
+        started_at_unix_ms = now_ms()
+        self._publish_tool_event(
+            session,
+            event_type="tool_start",
+            tool_call_id="call_submit",
+            tool_class="submit",
+            event_time_unix_ms=started_at_unix_ms,
+            started_at_unix_ms=started_at_unix_ms,
+            status="running",
+        )
+        try:
             observation = session.env.communicate(
                 input=session.tools.guard_multiline_input(action).strip(),
                 timeout=session.tools.config.execution_timeout,
                 check="ignore",
             )
             state = session.tools.get_state(session.env)
+        except Exception as exc:
+            observation = _tool_error_observation(exc)
+            self._publish_tool_error(
+                session,
+                tool_call_id="call_submit",
+                tool_class="submit",
+                started_at_unix_ms=started_at_unix_ms,
+                error_type=type(exc).__name__,
+                output=observation,
+            )
+            raise
+        ended_at_unix_ms = now_ms()
+        self._publish_tool_event(
+            session,
+            event_type="tool_end",
+            tool_call_id="call_submit",
+            tool_class="submit",
+            event_time_unix_ms=ended_at_unix_ms,
+            started_at_unix_ms=started_at_unix_ms,
+            ended_at_unix_ms=ended_at_unix_ms,
+            status="succeeded",
+            duration_ms=float(ended_at_unix_ms - started_at_unix_ms),
+            output_bytes=len(observation.encode("utf-8")),
+        )
         return {
             "session_id": session.session_id,
             "worker_id": self.worker_id,
@@ -613,8 +755,7 @@ class SessionManager:
 
     def close(self, request: dict[str, Any]) -> dict[str, Any]:
         session_id = request["session_id"]
-        with trace_span(f"session/{self.worker_id}/{session_id}", "session.close", worker_id=self.worker_id, session_id=session_id):
-            close_error = self._drop_session(session_id, reason="explicit close")
+        close_error = self._drop_session(session_id, reason="explicit close")
         return {
             "session_id": session_id,
             "worker_id": self.worker_id,
