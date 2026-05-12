@@ -248,6 +248,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--defer-fp32-logits",
+                action="store_true",
+                default=False,
+                help="Keep model logits in the model precision instead of materializing fp32 logits.",
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",
@@ -983,6 +989,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=0,
                 help="Number of initial rollout steps that train critic only; set >= num_rollout for critic-only runs",
             )
+            parser.add_argument("--critic-train-only", action="store_true", default=False, help="Only train critic")
             parser.add_argument(
                 "--megatron-config-path",
                 type=str,
@@ -2024,6 +2031,9 @@ def slime_validate_args(args):
         apply_external_engine_info_to_args(args, logger=logger)
 
     args.use_critic = args.advantage_estimator == "ppo"
+    if args.critic_train_only:
+        if not args.use_critic:
+            raise ValueError("--critic-train-only requires --advantage-estimator ppo.")
     # Critic always uses the same GPU count as actor.
     args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
     args.critic_num_nodes = args.actor_num_nodes

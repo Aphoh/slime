@@ -36,6 +36,8 @@ ENV_KEYS = [
     "NCCL_IB_DISABLE",
     "NCCL_IB_HCA",
     "NCCL_IB_GID_INDEX",
+    "NCCL_CROSS_NIC",
+    "NCCL_IB_MERGE_NICS",
     "NCCL_SOCKET_IFNAME",
     "NCCL_SHM_DISABLE",
     "NCCL_NVLS_ENABLE",
@@ -52,9 +54,13 @@ ENV_KEYS = [
     "SLIME_WEIGHT_UPDATE_NCCL_IB_DISABLE",
     "SLIME_WEIGHT_UPDATE_NCCL_IB_HCA",
     "SLIME_WEIGHT_UPDATE_NCCL_IB_GID_INDEX",
+    "SLIME_WEIGHT_UPDATE_NCCL_CROSS_NIC",
+    "SLIME_WEIGHT_UPDATE_NCCL_IB_MERGE_NICS",
     "SLIME_WEIGHT_UPDATE_NCCL_MNNVL_ENABLE",
     "SLIME_WEIGHT_UPDATE_MC_FORCE_MNNVL",
     "SLIME_WEIGHT_UPDATE_NCCL_NVLS_ENABLE",
+    "SLIME_WEIGHT_UPDATE_NCCL_NET",
+    "SLIME_WEIGHT_UPDATE_NCCL_SOCKET_IFNAME",
     "SLIME_WEIGHT_UPDATE_NCCL_DEBUG",
     "SLIME_WEIGHT_UPDATE_NCCL_DEBUG_SUBSYS",
 ]
@@ -105,9 +111,13 @@ def weight_update_nccl_env() -> dict[str, str]:
         "SLIME_WEIGHT_UPDATE_NCCL_IB_DISABLE": "NCCL_IB_DISABLE",
         "SLIME_WEIGHT_UPDATE_NCCL_IB_HCA": "NCCL_IB_HCA",
         "SLIME_WEIGHT_UPDATE_NCCL_IB_GID_INDEX": "NCCL_IB_GID_INDEX",
+        "SLIME_WEIGHT_UPDATE_NCCL_CROSS_NIC": "NCCL_CROSS_NIC",
+        "SLIME_WEIGHT_UPDATE_NCCL_IB_MERGE_NICS": "NCCL_IB_MERGE_NICS",
         "SLIME_WEIGHT_UPDATE_NCCL_MNNVL_ENABLE": "NCCL_MNNVL_ENABLE",
         "SLIME_WEIGHT_UPDATE_MC_FORCE_MNNVL": "MC_FORCE_MNNVL",
         "SLIME_WEIGHT_UPDATE_NCCL_NVLS_ENABLE": "NCCL_NVLS_ENABLE",
+        "SLIME_WEIGHT_UPDATE_NCCL_NET": "NCCL_NET",
+        "SLIME_WEIGHT_UPDATE_NCCL_SOCKET_IFNAME": "NCCL_SOCKET_IFNAME",
         "SLIME_WEIGHT_UPDATE_NCCL_DEBUG": "NCCL_DEBUG",
         "SLIME_WEIGHT_UPDATE_NCCL_DEBUG_SUBSYS": "NCCL_DEBUG_SUBSYS",
     }
@@ -157,6 +167,7 @@ def tokenizer_manager_body(method: str, payload: dict) -> dict:
     io_name = {
         "init_weights_update_group": "io_struct.InitWeightsUpdateGroupReqInput",
         "destroy_weights_update_group": "io_struct.DestroyWeightsUpdateGroupReqInput",
+        "post_process_weights": "io_struct.PostProcessWeightsReqInput",
     }[method]
     return {"method": method, "args": [{io_name: payload}]}
 
@@ -229,6 +240,24 @@ def run_once(args: argparse.Namespace, iteration: int) -> None:
         print("init result", init_future.result(timeout=args.http_timeout + 10), flush=True)
 
         try:
+            if args.restore_before_load:
+                print(
+                    "restore-before-load result",
+                    post_json(
+                        args.engine_url,
+                        "/engine/call_tokenizer_manager",
+                        tokenizer_manager_body(
+                            "post_process_weights",
+                            {
+                                "restore_weights_before_load": True,
+                                "post_process_quantization": False,
+                            },
+                        ),
+                        args.http_timeout,
+                    ),
+                    flush=True,
+                )
+
             named_tensors = make_tensors(args)
             names = [name for name, _ in named_tensors]
             dtypes = [dtype_to_wire_name(tensor.dtype) for _, tensor in named_tensors]
@@ -283,7 +312,25 @@ def run_once(args: argparse.Namespace, iteration: int) -> None:
                 torch.cuda.synchronize()
                 elapsed = time.time() - start
             print(f"trainer broadcast done elapsed={elapsed:.3f}s", flush=True)
-            print("update result", update_future.result(timeout=args.http_timeout + 10), flush=True)
+            update_result = update_future.result(timeout=args.http_timeout + 10)
+            print("update result", update_result, flush=True)
+            if args.post_process_after_load and update_result.get("success"):
+                print(
+                    "post-process-after-load result",
+                    post_json(
+                        args.engine_url,
+                        "/engine/call_tokenizer_manager",
+                        tokenizer_manager_body(
+                            "post_process_weights",
+                            {
+                                "restore_weights_before_load": False,
+                                "post_process_quantization": True,
+                            },
+                        ),
+                        args.http_timeout,
+                    ),
+                    flush=True,
+                )
         finally:
             destroy_future = executor.submit(
                 post_json,
@@ -315,6 +362,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "0")))
     parser.add_argument("--zeros", action="store_true")
     parser.add_argument("--flush-cache", action="store_true")
+    parser.add_argument("--restore-before-load", action="store_true")
+    parser.add_argument("--post-process-after-load", action="store_true")
     parser.add_argument("--http-timeout", type=float, default=float(os.environ.get("HTTP_TIMEOUT", "180")))
     parser.add_argument("--pg-timeout", type=float, default=float(os.environ.get("PG_TIMEOUT", "180")))
     parser.add_argument(

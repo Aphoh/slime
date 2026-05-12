@@ -1,0 +1,45 @@
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index 3d06d85b0..d8e0e3e45 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -320,3 +320,40 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
++    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
++        """Restore canonical BF16 MoE shapes before online weight loading.
++
++        FlashInfer TRT-LLM BF16 MoE post-load processing permutes weights and
++        reshapes them into a block layout. Slime's online updates stream
++        trainer/HF-format BF16 tensors, so the parameters must be reshaped back
++        before ``load_weights`` copies new values into them. The current tensor
++        contents are expected to be overwritten by the following load.
++        """
++        if not self.use_flashinfer_trtllm_moe:
++            return
++
++        w13_rows = (
++            2 * layer.intermediate_size_per_partition
++            if layer.moe_runner_config.is_gated
++            else layer.intermediate_size_per_partition
++        )
++        expected_shapes = {
++            "w13_weight": (layer.num_local_experts, w13_rows, layer.hidden_size),
++            "w2_weight": (
++                layer.num_local_experts,
++                layer.hidden_size,
++                layer.intermediate_size_per_partition,
++            ),
++        }
++        for weight_name, expected_shape in expected_shapes.items():
++            param = getattr(layer, weight_name, None)
++            if param is None or tuple(param.data.shape) == expected_shape:
++                continue
++            expected_numel = expected_shape[0] * expected_shape[1] * expected_shape[2]
++            if param.data.numel() != expected_numel:
++                raise RuntimeError(
++                    f"Cannot restore flashinfer TRT-LLM BF16 MoE weight shape for {weight_name}: "
++                    f"current shape={tuple(param.data.shape)}, expected shape={expected_shape}."
++                )
++            param.data = param.data.reshape(expected_shape)
++
+     def create_moe_runner(
+         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+     ):

@@ -623,6 +623,11 @@ class MegatronTrainRayActor(TrainRayActor):
     def update_weights(self) -> None:
         import time as _time
 
+        if os.getenv("SLIME_SKIP_WEIGHT_UPDATES", "0") == "1":
+            if dist.get_rank() == 0:
+                logger.info("SLIME_SKIP_WEIGHT_UPDATES=1: skipping rollout weight update.")
+            return
+
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 

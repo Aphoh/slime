@@ -34,6 +34,50 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{num_bytes}B"
 
 
+def _format_tensor_manifest(named_tensors: Sequence[tuple[str, torch.Tensor]], *, limit: int | None = None) -> str:
+    lines = []
+    for index, (name, tensor) in enumerate(named_tensors):
+        if limit is not None and index >= limit:
+            lines.append(f"... {len(named_tensors) - limit} more tensors")
+            break
+        shape = tuple(int(dim) for dim in tensor.shape)
+        bytes_ = tensor.numel() * tensor.element_size()
+        lines.append(
+            f"{index:04d} name={name} shape={shape} dtype={tensor.dtype} "
+            f"device={tensor.device} bytes={_format_bytes(bytes_)}"
+        )
+    return "\n".join(lines)
+
+
+def _raise_failed_engine_updates(
+    responses: Sequence[object],
+    *,
+    group_name: str,
+    tensor_group: Sequence[tuple[str, torch.Tensor]],
+) -> None:
+    failures = []
+    for index, response in enumerate(responses):
+        if isinstance(response, dict) and response.get("success") is False:
+            failures.append(f"engine_index={index} response={response}")
+
+    if not failures:
+        return
+
+    manifest = _format_tensor_manifest(tensor_group)
+    raise RuntimeError(
+        f"Weight update failed for group={group_name} with {len(failures)} engine failure(s):\n"
+        + "\n".join(failures)
+        + "\nTensor manifest:\n"
+        + manifest
+    )
+
+
+def should_post_process_rollout_weights(quantization_config: dict[str, object] | None) -> bool:
+    if os.getenv("SLIME_WEIGHT_UPDATE_POST_PROCESS_WEIGHTS", "0") == "1":
+        return True
+    return bool(quantization_config and quantization_config.get("quant_method") in ["compressed-tensors"])
+
+
 @contextmanager
 def _temporary_nccl_env(overrides: Mapping[str, str]):
     if not overrides:
@@ -59,9 +103,13 @@ def _weight_update_nccl_env() -> dict[str, str]:
         "SLIME_WEIGHT_UPDATE_NCCL_IB_DISABLE": "NCCL_IB_DISABLE",
         "SLIME_WEIGHT_UPDATE_NCCL_IB_HCA": "NCCL_IB_HCA",
         "SLIME_WEIGHT_UPDATE_NCCL_IB_GID_INDEX": "NCCL_IB_GID_INDEX",
+        "SLIME_WEIGHT_UPDATE_NCCL_CROSS_NIC": "NCCL_CROSS_NIC",
+        "SLIME_WEIGHT_UPDATE_NCCL_IB_MERGE_NICS": "NCCL_IB_MERGE_NICS",
         "SLIME_WEIGHT_UPDATE_NCCL_MNNVL_ENABLE": "NCCL_MNNVL_ENABLE",
         "SLIME_WEIGHT_UPDATE_MC_FORCE_MNNVL": "MC_FORCE_MNNVL",
         "SLIME_WEIGHT_UPDATE_NCCL_NVLS_ENABLE": "NCCL_NVLS_ENABLE",
+        "SLIME_WEIGHT_UPDATE_NCCL_NET": "NCCL_NET",
+        "SLIME_WEIGHT_UPDATE_NCCL_SOCKET_IFNAME": "NCCL_SOCKET_IFNAME",
         "SLIME_WEIGHT_UPDATE_NCCL_DEBUG": "NCCL_DEBUG",
         "SLIME_WEIGHT_UPDATE_NCCL_DEBUG_SUBSYS": "NCCL_DEBUG_SUBSYS",
     }
@@ -138,15 +186,41 @@ class UpdateWeightFromDistributed:
         )
 
         if self._is_pp_src_rank:
-            if self._model_update_groups is not None:
-                disconnect_rollout_engines_from_distributed(
-                    self.args, self._group_name, self._model_update_groups, self.rollout_engines
-                )
-            self._model_update_groups = connect_rollout_engines_from_distributed(
-                self.args,
+            lock_t0 = time.time()
+            while not ray.get(self.rollout_engine_lock.acquire.remote()):
+                time.sleep(0.1)
+            lock_elapsed = time.time() - lock_t0
+            logger.info(
+                "%s connect lock acquired group=%s wait=%.3fs engines=%d engine_gpu_counts=%s",
+                self._rank_log_prefix,
                 self._group_name,
-                rollout_engines,
-                engine_gpu_counts=engine_gpu_counts,
+                lock_elapsed,
+                len(rollout_engines),
+                engine_gpu_counts,
+            )
+            connect_t0 = time.time()
+            try:
+                if self._model_update_groups is not None:
+                    disconnect_rollout_engines_from_distributed(
+                        self.args, self._group_name, self._model_update_groups, self.rollout_engines
+                    )
+                self._model_update_groups = connect_rollout_engines_from_distributed(
+                    self.args,
+                    self._group_name,
+                    rollout_engines,
+                    engine_gpu_counts=engine_gpu_counts,
+                )
+            except Exception:
+                logger.exception("%s connect failed group=%s", self._rank_log_prefix, self._group_name)
+                raise
+            finally:
+                ray.get(self.rollout_engine_lock.release.remote())
+            logger.info(
+                "%s connect done group=%s lock_wait=%.3fs connect=%.3fs",
+                self._rank_log_prefix,
+                self._group_name,
+                lock_elapsed,
+                time.time() - connect_t0,
             )
 
     def disconnect_rollout_engines(self) -> None:
@@ -181,8 +255,9 @@ class UpdateWeightFromDistributed:
                 f"num_engines={len(self.rollout_engines)}"
             )
 
-            # int4/fp4 pre_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            # Restore inference-side packed/quantized layouts before loading
+            # trainer-format tensors.
+            if should_post_process_rollout_weights(self.quantization_config):
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
@@ -196,8 +271,8 @@ class UpdateWeightFromDistributed:
 
         _sync_elapsed = _time.time() - _sync_t0
         if dist.get_rank() == 0:
-            # int4/fp4 post_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            # Re-apply inference-side weight layout transforms after loading.
+            if should_post_process_rollout_weights(self.quantization_config):
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
@@ -420,20 +495,37 @@ class UpdateWeightFromDistributed:
             )
 
             update_t0 = time.time()
-            refs = update_weights_from_distributed(
-                self._group_name,
-                self._model_update_groups,
-                self.weight_version,
-                self.rollout_engines,
-                converted_named_tensors,
-                load_format=load_format,
-                delta=delta,
-            )
+            try:
+                refs = update_weights_from_distributed(
+                    self._group_name,
+                    self._model_update_groups,
+                    self.weight_version,
+                    self.rollout_engines,
+                    converted_named_tensors,
+                    load_format=load_format,
+                    delta=delta,
+                )
 
-            ray.get(refs)
+                responses = ray.get(refs)
+                _raise_failed_engine_updates(
+                    responses,
+                    group_name=self._group_name,
+                    tensor_group=converted_named_tensors,
+                )
+            except Exception:
+                logger.exception(
+                    "%s bucket update failed group=%s tensors=%d manifest:\n%s",
+                    self._rank_log_prefix,
+                    self._group_name,
+                    len(converted_named_tensors),
+                    _format_tensor_manifest(converted_named_tensors),
+                )
+                raise
+            finally:
+                ray.get(self.rollout_engine_lock.release.remote())
+
             update_elapsed = time.time() - update_t0
             converted_named_tensors.clear()
-            ray.get(self.rollout_engine_lock.release.remote())
             if pbar is not None:
                 pbar.update(1)
             logger.info(
@@ -544,6 +636,9 @@ def update_weights_from_distributed(
     else:
         tensor_groups = [converted_named_tensors]
 
+    if os.getenv("SLIME_WEIGHT_UPDATE_SINGLE_TENSOR_BUCKETS", "0") == "1":
+        tensor_groups = [[tensor] for tensor_group in tensor_groups for tensor in tensor_group]
+
     all_refs = []
     for tensor_group in tensor_groups:
         names = [name for name, _ in tensor_group]
@@ -575,6 +670,12 @@ def update_weights_from_distributed(
             len(tensor_group),
             effective_load_format or "default",
         )
+        if os.getenv("SLIME_WEIGHT_UPDATE_DEBUG_MANIFEST", "0") == "1":
+            logger.info(
+                "[WEIGHT UPDATE group=%s] tensor manifest:\n%s",
+                group_name,
+                _format_tensor_manifest(tensor_group),
+            )
 
         broadcast_t0 = time.time()
         with _temporary_nccl_env(_weight_update_nccl_env()):
@@ -621,6 +722,10 @@ def update_weights_from_distributed(
             broadcast_elapsed,
         )
 
+        if os.getenv("SLIME_WEIGHT_UPDATE_VALIDATE_EACH_GROUP", "0") == "1":
+            responses = ray.get(refs)
+            _raise_failed_engine_updates(responses, group_name=group_name, tensor_group=tensor_group)
+
     return all_refs
 
 
@@ -630,7 +735,10 @@ def post_process_weights(
     rollout_engines: Sequence[ActorHandle],
 ):
     """
-    Trigger post-process for int4/fp4 quantization on all rollout engines.
+    Trigger rollout-engine weight restore/repack hooks.
+
+    SGLang's hook is used for compressed-tensor quantization and for other
+    inference-only packed layouts, such as FlashInfer TRT-LLM BF16 MoE weights.
     """
     ray.get(
         [

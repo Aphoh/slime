@@ -497,6 +497,11 @@ metadata:
     owner: warnold
 spec:
   replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: warnold-swepro-trainer-worker
@@ -526,20 +531,6 @@ spec:
         cloud.google.com/gke-nodepool: customer-gpu-w0e
         nvidia.com/gpu.product: NVIDIA-GB200
       affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: cloud.google.com/gke-nodepool
-                    operator: In
-                    values:
-                      - customer-gpu-w0e
-                  - key: kubernetes.io/hostname
-                    operator: In
-                    values:
-                      - TRAIN_WORKER_NODE_PLACEHOLDER
-                      - TRAIN_WORKER_NODE_1_PLACEHOLDER
-                      - TRAIN_WORKER_NODE_2_PLACEHOLDER
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -717,7 +708,7 @@ spec:
             engine_args=(
               --page-size "${SGLANG_QWEN35_PAGE_SIZE:-64}"
               --attention-backend "${SGLANG_QWEN35_ATTENTION_BACKEND:-trtllm_mha}"
-              --moe-runner-backend flashinfer_trtllm
+              --moe-runner-backend "${SGLANG_QWEN35_MOE_RUNNER_BACKEND:-triton}"
               --mamba-ssm-dtype bfloat16
               --mamba-scheduler-strategy "${SGLANG_QWEN35_MAMBA_SCHEDULER_STRATEGY:-extra_buffer}"
               --mamba-track-interval "${SGLANG_QWEN35_MAMBA_TRACK_INTERVAL:-256}"

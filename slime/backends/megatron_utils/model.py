@@ -40,6 +40,11 @@ from .model_provider import get_model_provider_func
 logger = logging.getLogger(__name__)
 
 
+def _maybe_defer_fp32_logits(args: Namespace, forward_kwargs: dict) -> None:
+    if getattr(args, "defer_fp32_logits", False):
+        forward_kwargs["fp32_output"] = False
+
+
 def _disable_tqdm_for_non_main_rank() -> bool:
     return not (
         mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -358,6 +363,7 @@ def forward_only(
             }
             if batch["multimodal_train_inputs"] is not None:
                 forward_kwargs.update(batch["multimodal_train_inputs"])
+            _maybe_defer_fp32_logits(args, forward_kwargs)
             output_tensor = model(**forward_kwargs)
 
         return output_tensor, partial(
@@ -567,6 +573,7 @@ def train_one_step(
                 if args.enable_mtp_training:
                     forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
+                _maybe_defer_fp32_logits(args, forward_kwargs)
                 output_tensor = model(**forward_kwargs)
 
             if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":

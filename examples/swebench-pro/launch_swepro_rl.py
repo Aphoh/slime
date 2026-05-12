@@ -244,12 +244,20 @@ def runtime_env(env: dict[str, str], repo_root: Path, has_nvlink: str) -> dict[s
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "SLIME_ASYNC_ALLOW_STALE_ROLLOUTS": env_str(env, "SLIME_ASYNC_ALLOW_STALE_ROLLOUTS", "1"),
         "SLIME_WEIGHT_UPDATE_FLATTENED_BUCKET": env_str(env, "SLIME_WEIGHT_UPDATE_FLATTENED_BUCKET", "1"),
+        "SLIME_WEIGHT_UPDATE_POST_PROCESS_WEIGHTS": env_str(env, "SLIME_WEIGHT_UPDATE_POST_PROCESS_WEIGHTS", ""),
+        "SLIME_WEIGHT_UPDATE_SINGLE_TENSOR_BUCKETS": env_str(env, "SLIME_WEIGHT_UPDATE_SINGLE_TENSOR_BUCKETS", ""),
+        "SLIME_WEIGHT_UPDATE_DEBUG_MANIFEST": env_str(env, "SLIME_WEIGHT_UPDATE_DEBUG_MANIFEST", ""),
+        "SLIME_WEIGHT_UPDATE_VALIDATE_EACH_GROUP": env_str(env, "SLIME_WEIGHT_UPDATE_VALIDATE_EACH_GROUP", ""),
         "SLIME_WEIGHT_UPDATE_NCCL_IB_DISABLE": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_IB_DISABLE", ""),
         "SLIME_WEIGHT_UPDATE_NCCL_IB_HCA": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_IB_HCA", ""),
         "SLIME_WEIGHT_UPDATE_NCCL_IB_GID_INDEX": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_IB_GID_INDEX", ""),
+        "SLIME_WEIGHT_UPDATE_NCCL_CROSS_NIC": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_CROSS_NIC", ""),
+        "SLIME_WEIGHT_UPDATE_NCCL_IB_MERGE_NICS": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_IB_MERGE_NICS", ""),
         "SLIME_WEIGHT_UPDATE_NCCL_MNNVL_ENABLE": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_MNNVL_ENABLE", "0"),
         "SLIME_WEIGHT_UPDATE_MC_FORCE_MNNVL": env_str(env, "SLIME_WEIGHT_UPDATE_MC_FORCE_MNNVL", ""),
         "SLIME_WEIGHT_UPDATE_NCCL_NVLS_ENABLE": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_NVLS_ENABLE", ""),
+        "SLIME_WEIGHT_UPDATE_NCCL_NET": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_NET", ""),
+        "SLIME_WEIGHT_UPDATE_NCCL_SOCKET_IFNAME": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_SOCKET_IFNAME", ""),
         "SLIME_WEIGHT_UPDATE_NCCL_DEBUG": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_DEBUG", ""),
         "SLIME_WEIGHT_UPDATE_NCCL_DEBUG_SUBSYS": env_str(env, "SLIME_WEIGHT_UPDATE_NCCL_DEBUG_SUBSYS", ""),
         "SLIME_SPEEDSCOPE_TRACE_PATH": trace_path,
@@ -350,6 +358,8 @@ def build_command(
     if train_env_vars := env.get("SWEPRO_TRAIN_ENV_VARS"):
         train_env_args.extend(["--train-env-vars", train_env_vars])
 
+    defer_fp32_logits_args = ["--defer-fp32-logits"] if env_flag(env, "SWEPRO_DEFER_FP32_LOGITS", False) else []
+
     model_parallel_args = [
         "--tensor-model-parallel-size",
         str(derived.tp),
@@ -380,6 +390,36 @@ def build_command(
             "--micro-batch-size",
             env_str(env, "SWEPRO_MICRO_BATCH_SIZE", "1"),
         ]
+
+    optimizer_args = [
+        "--optimizer",
+        "adam",
+        "--lr",
+        env_str(env, "SWEPRO_LR", "1e-6"),
+        "--lr-decay-style",
+        env_str(env, "SWEPRO_LR_DECAY_STYLE", "constant"),
+        "--min-lr",
+        env_str(env, "SWEPRO_MIN_LR", env_str(env, "SWEPRO_LR", "1e-6")),
+        "--weight-decay",
+        env_str(env, "SWEPRO_WEIGHT_DECAY", "0.1"),
+        "--adam-beta1",
+        env_str(env, "SWEPRO_ADAM_BETA1", "0.9"),
+        "--adam-beta2",
+        env_str(env, "SWEPRO_ADAM_BETA2", "0.98"),
+    ]
+    optimizer_cpu_offload = env_flag(env, "SWEPRO_OPTIMIZER_CPU_OFFLOAD", False)
+    if env_flag(env, "SWEPRO_USE_PRECISION_AWARE_OPTIMIZER", False) or optimizer_cpu_offload:
+        optimizer_args.append("--use-precision-aware-optimizer")
+    if optimizer_cpu_offload:
+        optimizer_args.append("--optimizer-cpu-offload")
+    if env_flag(env, "SWEPRO_USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD", False):
+        optimizer_args.append("--use-torch-optimizer-for-cpu-offload")
+    if env_flag(env, "SWEPRO_OVERLAP_CPU_OPTIMIZER_D2H_H2D", False):
+        optimizer_args.append("--overlap-cpu-optimizer-d2h-h2d")
+    if exp_avg_dtype := env.get("SWEPRO_EXP_AVG_DTYPE"):
+        optimizer_args.extend(["--exp-avg-dtype", exp_avg_dtype])
+    if exp_avg_sq_dtype := env.get("SWEPRO_EXP_AVG_SQ_DTYPE"):
+        optimizer_args.extend(["--exp-avg-sq-dtype", exp_avg_sq_dtype])
 
     train_args = [
         "python3",
@@ -448,6 +488,7 @@ def build_command(
         *batch_size_args,
         "--log-probs-chunk-size",
         str(derived.log_probs_chunk_size),
+        *defer_fp32_logits_args,
         *kl_args,
         *weight_backuper_args,
         "--advantage-estimator",
@@ -465,18 +506,7 @@ def build_command(
         "uniform",
         "--recompute-num-layers",
         "1",
-        "--optimizer",
-        "adam",
-        "--lr",
-        "1e-6",
-        "--lr-decay-style",
-        "constant",
-        "--weight-decay",
-        "0.1",
-        "--adam-beta1",
-        "0.9",
-        "--adam-beta2",
-        "0.98",
+        *optimizer_args,
         "--attention-dropout",
         "0.0",
         "--hidden-dropout",

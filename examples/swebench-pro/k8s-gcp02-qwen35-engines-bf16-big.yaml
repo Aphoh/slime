@@ -12,7 +12,9 @@ metadata:
       [
         {"interfaceName":"eth0","network":"default"},
         {"interfaceName":"rdma0","network":"rdma-0"},
-        {"interfaceName":"rdma1","network":"rdma-1"}
+        {"interfaceName":"rdma1","network":"rdma-1"},
+        {"interfaceName":"rdma2","network":"rdma-2"},
+        {"interfaceName":"rdma3","network":"rdma-3"}
       ]
 spec:
   restartPolicy: Never
@@ -69,7 +71,7 @@ spec:
             --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}' \
             --page-size 64 \
             --attention-backend trtllm_mha \
-            --moe-runner-backend flashinfer_trtllm \
+            --moe-runner-backend "${SGLANG_QWEN35_MOE_RUNNER_BACKEND:-triton}" \
             --kv-cache-dtype fp8_e4m3 \
             --mamba-ssm-dtype bfloat16 \
             --mamba-scheduler-strategy extra_buffer \
@@ -92,6 +94,8 @@ spec:
           nvidia.com/gpu: "2"
           networking.gke.io.networks/rdma-0: "1"
           networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
         limits:
           cpu: "48"
           memory: "192Gi"
@@ -99,6 +103,8 @@ spec:
           nvidia.com/gpu: "2"
           networking.gke.io.networks/rdma-0: "1"
           networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
       volumeMounts:
         - name: model-cache
           mountPath: /data
@@ -141,7 +147,9 @@ metadata:
       [
         {"interfaceName":"eth0","network":"default"},
         {"interfaceName":"rdma0","network":"rdma-0"},
-        {"interfaceName":"rdma1","network":"rdma-1"}
+        {"interfaceName":"rdma1","network":"rdma-1"},
+        {"interfaceName":"rdma2","network":"rdma-2"},
+        {"interfaceName":"rdma3","network":"rdma-3"}
       ]
 spec:
   restartPolicy: Never
@@ -198,7 +206,7 @@ spec:
             --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}' \
             --page-size 64 \
             --attention-backend trtllm_mha \
-            --moe-runner-backend flashinfer_trtllm \
+            --moe-runner-backend "${SGLANG_QWEN35_MOE_RUNNER_BACKEND:-triton}" \
             --kv-cache-dtype fp8_e4m3 \
             --mamba-ssm-dtype bfloat16 \
             --mamba-scheduler-strategy extra_buffer \
@@ -221,6 +229,8 @@ spec:
           nvidia.com/gpu: "2"
           networking.gke.io.networks/rdma-0: "1"
           networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
         limits:
           cpu: "48"
           memory: "192Gi"
@@ -228,6 +238,8 @@ spec:
           nvidia.com/gpu: "2"
           networking.gke.io.networks/rdma-0: "1"
           networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
       volumeMounts:
         - name: model-cache
           mountPath: /data
