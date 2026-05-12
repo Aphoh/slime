@@ -1,0 +1,55 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: docker-builder-arm64
+  namespace: warnold-dynamo
+  labels:
+    app: docker-builder-arm64
+    owner: warnold
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-nodepool: customer-gpu-w0e
+    kubernetes.io/arch: arm64
+  tolerations:
+    - key: "kubernetes.io/arch"
+      operator: "Equal"
+      value: "arm64"
+      effect: "NoSchedule"
+  containers:
+    - name: docker
+      image: docker:dind
+      securityContext:
+        privileged: true
+      env:
+        - name: DOCKER_TLS_CERTDIR
+          value: ""
+        - name: DOCKERHUB_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: warnold-dockerhub-cache-auth
+              key: username
+        - name: DOCKERHUB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: warnold-dockerhub-cache-auth
+              key: password
+      resources:
+        requests:
+          cpu: "16"
+          memory: "64Gi"
+        limits:
+          cpu: "48"
+          memory: "256Gi"
+      volumeMounts:
+        - name: docker-storage
+          mountPath: /var/lib/docker
+        - name: build-context
+          mountPath: /build
+  volumes:
+    - name: docker-storage
+      emptyDir:
+        sizeLimit: 450Gi
+    - name: build-context
+      emptyDir:
+        sizeLimit: 80Gi
