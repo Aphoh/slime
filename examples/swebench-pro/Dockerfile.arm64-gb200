@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1.4
+
+ARG BASE_IMAGE="aphoh/slime:0.2.4-arm64-gb200"
+ARG DYNAMO_COMMIT="warnold/agent-context-v1-completions"
+ARG CARGO_BUILD_JOBS="16"
+
+FROM ubuntu:24.04 AS builder
+
+ARG DYNAMO_COMMIT
+ARG CARGO_BUILD_JOBS
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
+WORKDIR /build
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl build-essential pkg-config libclang-dev protobuf-compiler git python3 python3-dev python3-venv; \
+    rm -rf /var/lib/apt/lists/*; \
+    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+
+ENV CARGO_HOME=/root/.cargo \
+    RUSTUP_HOME=/root/.rustup
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    cargo install maturin --locked
+
+RUN git clone https://github.com/ai-dynamo/dynamo.git /build/dynamo && \
+    cd /build/dynamo && git checkout ${DYNAMO_COMMIT}
+
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/dynamo/lib/bindings/python/target,sharing=locked \
+    cd /build/dynamo/lib/bindings/python && \
+    maturin build --release && \
+    mkdir -p /build/dist && \
+    cp target/wheels/*.whl /build/dist/
+
+FROM ${BASE_IMAGE}
+
+COPY --from=builder /build/dynamo /opt/dynamo
+COPY --from=builder /build/dist/*.whl /tmp/
+COPY . /code/slime
+
+RUN pip install --no-cache-dir /tmp/*.whl && \
+    cd /opt/dynamo && \
+    pip install --no-cache-dir -e ".[sglang]" --no-deps && \
+    pip install --no-cache-dir nats-py nixl "transformers>=5.0" "fla-core==0.4.1" && \
+    python3 /code/slime/examples/swebench-pro/patch_sglang_qwen35.py && \
+    ln -sfn /root/src/Megatron-LM /root/Megatron-LM && \
+    rm -f /tmp/*.whl
+
+RUN set -eux; \
+    ARCH="$(dpkg --print-architecture)"; \
+    curl -fsSL "https://github.com/etcd-io/etcd/releases/download/v3.6.7/etcd-v3.6.7-linux-${ARCH}.tar.gz" | \
+    tar xz -C /usr/bin --strip-components=1 \
+        "etcd-v3.6.7-linux-${ARCH}/etcd" \
+        "etcd-v3.6.7-linux-${ARCH}/etcdctl"; \
+    curl -fsSL "https://github.com/nats-io/nats-server/releases/download/v2.12.4/nats-server-v2.12.4-linux-${ARCH}.tar.gz" | \
+    tar xz -C /usr/bin --strip-components=1 \
+        "nats-server-v2.12.4-linux-${ARCH}/nats-server"
+
+WORKDIR /code/slime
