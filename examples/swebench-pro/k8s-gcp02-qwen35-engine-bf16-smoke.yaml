@@ -70,7 +70,7 @@ spec:
             --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}' \
             --page-size 64 \
             --attention-backend trtllm_mha \
-            --moe-runner-backend flashinfer_trtllm \
+            --moe-runner-backend "${SGLANG_QWEN35_MOE_RUNNER_BACKEND:-triton}" \
             --kv-cache-dtype fp8_e4m3 \
             --mamba-ssm-dtype bfloat16 \
             --mamba-scheduler-strategy extra_buffer \

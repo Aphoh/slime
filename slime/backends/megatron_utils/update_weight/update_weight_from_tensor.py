@@ -22,6 +22,7 @@ from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     post_process_weights,
+    should_post_process_rollout_weights,
     update_weights_from_distributed,
 )
 
@@ -283,7 +284,7 @@ class UpdateWeightFromTensor:
         if self.rank == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if should_post_process_rollout_weights(self.quantization_config):
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
@@ -321,7 +322,7 @@ class UpdateWeightFromTensor:
 
         # int4/fp4 post_process
         if self.rank == 0:
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+            if should_post_process_rollout_weights(self.quantization_config):
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,

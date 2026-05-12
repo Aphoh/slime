@@ -70,7 +70,7 @@ def get_responses(
 
     Args:
         logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, 1]`
-            (value). Must be float32.
+            (value). Must be floating point.
         args: Configuration containing `rollout_temperature` for optional scaling.
         unconcat_tokens: List of token tensors (prompt+response) per sample.
         total_lengths: Total sequence lengths (prompt+response) per sample.
@@ -82,10 +82,16 @@ def get_responses(
         `[R, V]` (policy) or `[R, 1]` (value) and `tokens_chunk` is shape `[R]`
         (1D int64), both aligned to response tokens for one sample.
     """
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    qkv_format = args.qkv_format
+
+    assert torch.is_floating_point(logits), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
-    assert logits.size(0) == 1, f"{logits.shape}"
-    logits = logits.squeeze(0)
+    if qkv_format == "thd":
+        assert logits.size(0) == 1, f"{logits.shape}"
+        logits = logits.squeeze(0)
+    else:
+        assert max_seq_lens is not None
+        logits = logits.view(-1, logits.size(-1))
 
     if apply_temperature and args.rollout_temperature != 1.0:
         logits = logits.div(args.rollout_temperature)
@@ -489,10 +495,16 @@ def get_log_probs_and_entropy(
     log-probabilities; entropy is always computed from the unmasked logits.
     """
     assert non_loss_data
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    qkv_format = args.qkv_format
+
+    assert torch.is_floating_point(logits), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
-    assert logits.size(0) == 1, f"{logits.shape}"
-    logits = logits.squeeze(0)
+    if qkv_format == "thd":
+        assert logits.size(0) == 1, f"{logits.shape}"
+        logits = logits.squeeze(0)
+    else:
+        assert max_seq_lens is not None
+        logits = logits.view(-1, logits.size(-1))
 
     # Apply rollout temperature scaling to logits to match rollout-time log-probs.
     rollout_temperature = getattr(args, "rollout_temperature", 1.0)
@@ -957,7 +969,8 @@ def policy_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        with_entropy=True,
+        with_entropy=args.entropy_coef != 0,
+        max_seq_lens=max_seq_lens,
         **get_rollout_top_p_logprob_kwargs(args, batch),
     )
 
@@ -1107,9 +1120,12 @@ def policy_loss_function(
     ppo_kl = sum_of_sample_mean(ppo_kl_for_metrics)
 
     # entropy loss
-    entropy = log_probs_and_entropy["entropy"]
-    entropy = torch.cat(entropy, dim=0)
-    entropy_loss = sum_of_sample_mean(entropy)
+    if args.entropy_coef != 0:
+        entropy = log_probs_and_entropy["entropy"]
+        entropy = torch.cat(entropy, dim=0)
+        entropy_loss = sum_of_sample_mean(entropy)
+    else:
+        entropy_loss = logits.new_zeros(())
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 
