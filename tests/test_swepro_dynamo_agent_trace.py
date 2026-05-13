@@ -2,6 +2,7 @@ import builtins
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ sys.path.insert(0, str(EXAMPLE_DIR))
 from dynamo_agent_trace import (  # noqa: E402
     DynamoToolEventPublisher,
     build_agent_context,
+    build_agent_context_for_sample,
     build_tool_trace_record,
     derive_tool_events_zmq_endpoint,
     llm_request_id,
@@ -37,7 +39,7 @@ def test_build_agent_context_and_tool_record_match_dynamo_schema(monkeypatch):
     monkeypatch.setenv("SWEPRO_RUN_ID", "run-123")
     monkeypatch.delenv("SWEPRO_AGENT_TRACE_SESSION_TYPE_ID", raising=False)
 
-    context = build_agent_context("instance-a", 5, suffix="abcdef12")
+    context = build_agent_context("instance-a", 5, sample_id="sample-a")
     record = build_tool_trace_record(
         agent_context=context,
         event_type="tool_end",
@@ -54,10 +56,10 @@ def test_build_agent_context_and_tool_record_match_dynamo_schema(monkeypatch):
     assert context == {
         "session_type_id": "slime_swebench_pro",
         "session_id": "run-123",
-        "trajectory_id": "run-123:swebench_pro:instance-a:5:abcdef12",
+        "trajectory_id": "run-123:swebench_pro:instance-a:sample:5:id:sample-a",
     }
     assert "phase" not in context
-    assert llm_request_id(context, turn=3) == "run-123:swebench_pro:instance-a:5:abcdef12:llm:3"
+    assert llm_request_id(context, turn=3) == "run-123:swebench_pro:instance-a:sample:5:id:sample-a:llm:3"
     assert llm_request_id(context, turn=3, attempt=1).endswith(":llm:3:try:1")
     assert record["schema"] == "dynamo.agent.trace.v1"
     assert record["event_source"] == "harness"
@@ -66,6 +68,36 @@ def test_build_agent_context_and_tool_record_match_dynamo_schema(monkeypatch):
     assert record["tool"]["tool_call_id"] == "call-1"
     assert record["tool"]["tool_class"] == "bash"
     assert record["tool"]["output_bytes"] == 12
+
+
+def test_build_agent_context_uses_one_perfetto_lane_per_sample(monkeypatch):
+    monkeypatch.setenv("SWEPRO_RUN_ID", "run-123")
+
+    first_sample = SimpleNamespace(index=5, session_id="sample-a")
+    first_turn = build_agent_context_for_sample("instance-a", first_sample)
+    retry_turn = build_agent_context_for_sample("instance-a", first_sample)
+    second_sample = build_agent_context_for_sample(
+        "instance-a", SimpleNamespace(index=6, session_id="sample-b")
+    )
+
+    assert first_turn == retry_turn
+    assert first_turn["session_id"] == second_sample["session_id"] == "run-123"
+    assert first_turn["trajectory_id"] != second_sample["trajectory_id"]
+    assert {
+        (first_turn["session_id"], first_turn["trajectory_id"]),
+        (retry_turn["session_id"], retry_turn["trajectory_id"]),
+        (second_sample["session_id"], second_sample["trajectory_id"]),
+    } == {
+        ("run-123", "run-123:swebench_pro:instance-a:sample:5:id:sample-a"),
+        ("run-123", "run-123:swebench_pro:instance-a:sample:6:id:sample-b"),
+    }
+    assert llm_request_id(first_turn, turn=0) == (
+        "run-123:swebench_pro:instance-a:sample:5:id:sample-a:llm:0"
+    )
+    assert llm_request_id(first_turn, turn=1) == (
+        "run-123:swebench_pro:instance-a:sample:5:id:sample-a:llm:1"
+    )
+    assert build_agent_context("instance-a", 7) == build_agent_context("instance-a", 7)
 
 
 def test_tool_event_publisher_is_noop_without_endpoint():
@@ -103,7 +135,7 @@ def test_tool_event_publisher_sends_zmq_msgpack_frames():
         agent_context={
             "session_type_id": "slime_swebench_pro",
             "session_id": "run-1",
-            "trajectory_id": "run-1:swebench_pro:instance-a:5:abcdef12",
+            "trajectory_id": "run-1:swebench_pro:instance-a:sample:5:id:sample-a",
         },
         event_type="tool_start",
         tool_call_id="call-1",

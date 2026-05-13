@@ -24,18 +24,47 @@ def _env(name: str, default: str | None = None) -> str | None:
     return value if value not in (None, "") else default
 
 
-def build_agent_context(instance_id: Any, sample_index: Any, *, suffix: str | None = None) -> dict[str, str]:
+def _id_part(value: Any, fallback: str = "unknown") -> str:
+    if value in (None, ""):
+        return fallback
+    return str(value).replace(":", "_")
+
+
+def build_agent_context(
+    instance_id: Any,
+    sample_index: Any,
+    *,
+    sample_id: Any | None = None,
+    suffix: str | None = None,
+) -> dict[str, str]:
     session_id = _env("SWEPRO_RUN_ID")
     if not session_id:
         session_id = f"swepro_{uuid.uuid4().hex[:12]}"
         os.environ["SWEPRO_RUN_ID"] = session_id
-    suffix = suffix or uuid.uuid4().hex[:8]
+    stable_sample_id = sample_id if sample_id not in (None, "") else suffix
+    trajectory_parts = [
+        session_id,
+        "swebench_pro",
+        _id_part(instance_id),
+        "sample",
+        _id_part(sample_index),
+    ]
+    if stable_sample_id not in (None, ""):
+        trajectory_parts.extend(["id", _id_part(stable_sample_id)])
     return {
         "session_type_id": _env("SWEPRO_AGENT_TRACE_SESSION_TYPE_ID", DEFAULT_SESSION_TYPE_ID)
         or DEFAULT_SESSION_TYPE_ID,
         "session_id": session_id,
-        "trajectory_id": f"{session_id}:swebench_pro:{instance_id}:{sample_index}:{suffix}",
+        "trajectory_id": ":".join(trajectory_parts),
     }
+
+
+def build_agent_context_for_sample(instance_id: Any, sample: Any) -> dict[str, str]:
+    return build_agent_context(
+        instance_id,
+        getattr(sample, "index", "unknown"),
+        sample_id=getattr(sample, "session_id", None),
+    )
 
 
 def llm_request_id(agent_context: dict[str, Any] | None, *, turn: int, attempt: int | None = None) -> str:

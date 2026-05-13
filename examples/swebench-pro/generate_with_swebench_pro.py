@@ -24,13 +24,14 @@ from completions_direct_model import (
     GLM_TOOL_CLOSE_TOKEN_ID,
     GLM_TOOL_RESPONSE_END_TOKEN_ID,
     GLM_TOOL_RESPONSE_START_TOKEN_ID,
+    GLM_TOOL_STOPS,
     GLM_TOOL_STOP_TOKEN_IDS,
     DirectCompletionsConfig,
     DirectCompletionsModel,
     parse_glm_tool_call_from_completion,
     stop_reason_token_ids,
 )
-from dynamo_agent_trace import build_agent_context, derive_tool_events_zmq_endpoint, llm_request_id
+from dynamo_agent_trace import build_agent_context_for_sample, derive_tool_events_zmq_endpoint, llm_request_id
 from sweagent_session import SweAgentSessionClient
 
 from slime.rollout.sglang_rollout import GenerateState
@@ -500,7 +501,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
     instance_id = metadata.get("instance_id") or sample.label
     if not instance_id:
         raise ValueError("SWE-bench Pro sample is missing instance_id")
-    agent_context = build_agent_context(instance_id, getattr(sample, "index", "unknown"))
+    agent_context = build_agent_context_for_sample(instance_id, sample)
     tool_events_zmq_endpoint = derive_tool_events_zmq_endpoint(_dynamo_frontend_url(args))
     metadata["dynamo_agent_context"] = agent_context
     if tool_events_zmq_endpoint:
@@ -830,7 +831,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     elif mode == "direct_patch":
         model = _get_model(args)
         instance_id = metadata.get("instance_id") or sample.label or "unknown"
-        agent_context = build_agent_context(instance_id, getattr(sample, "index", "unknown"))
+        agent_context = build_agent_context_for_sample(instance_id, sample)
         metadata["dynamo_agent_context"] = agent_context
         tool_events_zmq_endpoint = derive_tool_events_zmq_endpoint(_dynamo_frontend_url(args))
         if tool_events_zmq_endpoint:

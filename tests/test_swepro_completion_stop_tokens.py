@@ -40,7 +40,7 @@ def test_direct_completions_payload_merges_dynamo_agent_context():
     agent_context = {
         "session_type_id": "slime_swebench_pro",
         "session_id": "run-1",
-        "trajectory_id": "run-1:swebench_pro:task:0:abc12345",
+        "trajectory_id": "run-1:swebench_pro:task:sample:0:id:sample-a",
     }
 
     payload = model._build_payload_from_ids([1, 2, 3], agent_context=agent_context)
