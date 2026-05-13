@@ -16,6 +16,8 @@ from completions_direct_model import (  # noqa: E402
     GLM_TOOL_CALL_TOKEN_ID,
     GLM_TOOL_CLOSE_TOKEN_ID,
     GLM_TOOL_STOPS,
+    TOOL_CALL_END,
+    encode_qwen_tool_observation_delta,
     glm_stop_strings_from_token_ids,
     parse_glm_tool_call_from_completion,
     stop_reason_token_ids,
@@ -65,6 +67,24 @@ def test_stop_reason_token_ids_normalizes_dynamo_values():
     ]
 
 
+def test_stop_reason_token_ids_uses_qwen_tokenizer_ids():
+    class _Tokenizer:
+        def __call__(self, text, add_special_tokens=False):
+            return {
+                "input_ids": {
+                    "<tool_call>": [248058],
+                    "</tool_call>": [248059],
+                    "<|endoftext|>": [248044],
+                }[text]
+            }
+
+    tokenizer = _Tokenizer()
+
+    assert stop_reason_token_ids("</tool_call>", tokenizer) == [248059]
+    assert stop_reason_token_ids("<|endoftext|>", tokenizer) == [248044]
+    assert glm_stop_strings_from_token_ids([248059, 248044], tokenizer) == GLM_TOOL_STOPS
+
+
 def test_tool_call_parse_is_gated_by_matched_stop_token():
     class _Tokenizer:
         @staticmethod
@@ -98,6 +118,69 @@ def test_tool_call_parse_is_gated_by_matched_stop_token():
     assert normal_text == content
     assert tool_calls == []
     assert needs_tool_close is False
+
+
+def test_tool_call_parse_uses_tokenizer_specific_qwen_tool_tokens():
+    class _Tokenizer:
+        def __call__(self, text, add_special_tokens=False):
+            return {
+                "input_ids": {
+                    "<tool_call>": [248058],
+                    "</tool_call>": [248059],
+                    "<|endoftext|>": [248044],
+                }[text]
+            }
+
+        @staticmethod
+        def decode(token_ids, skip_special_tokens=False):
+            pieces = {
+                1: "thought",
+                248058: "<tool_call>",
+                2: "<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n",
+                248059: "</tool_call>",
+            }
+            return "".join(pieces[token_id] for token_id in token_ids)
+
+    tokenizer = _Tokenizer()
+    generated_ids = [1, 248058, 2, 248059]
+    content = "thought<tool_call><function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"
+
+    normal_text, tool_calls, needs_tool_close = parse_glm_tool_call_from_completion(
+        tokenizer,
+        content,
+        generated_ids,
+        stop_reason_token_ids(TOOL_CALL_END, tokenizer),
+    )
+
+    assert normal_text == "thought"
+    assert needs_tool_close is False
+    assert tool_calls == [
+        {
+            "id": "call_0_bash",
+            "type": "function",
+            "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+        }
+    ]
+
+
+def test_qwen_tool_observation_delta_matches_chat_template_continuation():
+    class _Tokenizer:
+        captured = None
+
+        def __call__(self, text, add_special_tokens=False):
+            self.captured = text
+            return {"input_ids": [1, 2, 3]}
+
+    tokenizer = _Tokenizer()
+
+    assert encode_qwen_tool_observation_delta(tokenizer, "README.md") == [1, 2, 3]
+    assert tokenizer.captured == (
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        "<tool_response>\nREADME.md\n</tool_response>"
+        "<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n"
+    )
 
 
 def test_direct_completions_carries_stop_reason(monkeypatch):
@@ -143,6 +226,52 @@ def test_direct_completions_carries_stop_reason(monkeypatch):
     assert posted_headers[0] == {"x-request-id": "traj:llm:0:try:0"}
     assert result["extra"]["stop_reason"] == f"token_id:{GLM_TOOL_CLOSE_TOKEN_ID}"
     assert result["extra"]["generated_token_ids"] == [GLM_TOOL_CALL_TOKEN_ID]
+
+
+def test_direct_completions_clamps_oversized_backend_response(monkeypatch):
+    class _Tokenizer:
+        @staticmethod
+        def decode(token_ids, skip_special_tokens=False):
+            return "".join(f"<{token_id}>" for token_id in token_ids)
+
+    class _Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [
+                    {
+                        "text": "uncapped backend text",
+                        "finish_reason": "stop",
+                        "logprobs": {
+                            "tokens": ["token_id:11", "token_id:12", "token_id:13", "token_id:14", "token_id:15"],
+                            "token_logprobs": [-0.1, -0.2, -0.3, -0.4, -0.5],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 5, "total_tokens": 7},
+                "nvext": {"stop_reason": "</tool_call>"},
+            }
+
+    monkeypatch.setattr(completions_direct_model.requests, "post", lambda *_args, **_kwargs: _Response())
+    model = DirectCompletionsModel.__new__(DirectCompletionsModel)
+    model.config = DirectCompletionsConfig(base_url="http://dynamo", tokenizer_path="unused")
+    model.tokenizer = _Tokenizer()
+
+    result = model.complete_prompt_ids([1, 2], max_tokens=3)
+
+    assert result["content"] == "<11><12><13>"
+    assert result["extra"]["generated_token_ids"] == [11, 12, 13]
+    assert result["extra"]["token_logprobs"] == [-0.1, -0.2, -0.3]
+    assert result["extra"]["finish_reason"] == "length"
+    assert result["extra"]["stop_reason"] is None
+    assert result["extra"]["requested_max_tokens"] == 3
+    assert result["extra"]["backend_generated_tokens"] == 5
+    assert result["extra"]["locally_truncated_to_max_tokens"] is True
+    assert result["extra"]["response"]["usage"] == {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
 
 
 def test_direct_completions_retry_uses_distinct_x_request_ids(monkeypatch):
