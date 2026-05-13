@@ -103,6 +103,8 @@ def apply_profile_defaults(env: dict[str, str], profile: str, repo_root: Path, *
         "SWEPRO_ROLLOUT_NUM_GPUS_PER_ENGINE": "1",
         "SWEPRO_MAX_TOKENS_PER_GPU": "16384",
         "SWEPRO_LOG_PROBS_CHUNK_SIZE": "512",
+        "SWEPRO_OPTIMIZER_CPU_OFFLOAD": "1",
+        "SWEPRO_OVERLAP_CPU_OPTIMIZER_D2H_H2D": "1",
         "SWEPRO_UPDATE_WEIGHTS_INTERVAL": "2",
         "SWEPRO_MAX_TOOL_CALLS": "0",
         "SWEPRO_EPISODE_WALL_TIMEOUT": "0",
@@ -164,7 +166,7 @@ def derive_config(env: dict[str, str]) -> DerivedConfig:
     requested_response_len = env_int(env, "SWEPRO_MAX_RESPONSE_LEN", rollout_max_context_len)
     rollout_max_response_len = min(requested_response_len, rollout_max_context_len)
     seq_length = env_int(env, "SWEPRO_SEQ_LENGTH", rollout_max_context_len)
-    log_probs_chunk_size = env_int(env, "SWEPRO_LOG_PROBS_CHUNK_SIZE", 1024)
+    log_probs_chunk_size = env_int(env, "SWEPRO_LOG_PROBS_CHUNK_SIZE", 512)
     return DerivedConfig(
         actor_num_nodes=actor_num_nodes,
         actor_num_gpus_per_node=actor_num_gpus_per_node,
@@ -398,14 +400,14 @@ def build_command(
         "--adam-beta2",
         env_str(env, "SWEPRO_ADAM_BETA2", "0.98"),
     ]
-    optimizer_cpu_offload = env_flag(env, "SWEPRO_OPTIMIZER_CPU_OFFLOAD", False)
+    optimizer_cpu_offload = env_flag(env, "SWEPRO_OPTIMIZER_CPU_OFFLOAD", True)
     if env_flag(env, "SWEPRO_USE_PRECISION_AWARE_OPTIMIZER", False) or optimizer_cpu_offload:
         optimizer_args.append("--use-precision-aware-optimizer")
     if optimizer_cpu_offload:
         optimizer_args.append("--optimizer-cpu-offload")
     if env_flag(env, "SWEPRO_USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD", False):
         optimizer_args.append("--use-torch-optimizer-for-cpu-offload")
-    if env_flag(env, "SWEPRO_OVERLAP_CPU_OPTIMIZER_D2H_H2D", False):
+    if env_flag(env, "SWEPRO_OVERLAP_CPU_OPTIMIZER_D2H_H2D", optimizer_cpu_offload):
         optimizer_args.append("--overlap-cpu-optimizer-d2h-h2d")
     if exp_avg_dtype := env.get("SWEPRO_EXP_AVG_DTYPE"):
         optimizer_args.extend(["--exp-avg-dtype", exp_avg_dtype])
