@@ -40,14 +40,85 @@ def token_ids_from_logprob_tokens(tokens: list[Any], tokenizer) -> list[int]:
     return ids
 
 
-def glm_stop_strings_from_token_ids(token_ids: list[int]) -> list[str]:
-    """Return GLM stop strings for the GLM special stop token IDs we use."""
+def _decode_token_ids(tokenizer: Any, token_ids: list[int]) -> str:
+    if hasattr(tokenizer, "decode"):
+        return tokenizer.decode(token_ids, skip_special_tokens=False)
+    return ""
+
+
+GLM_TOOL_CALL_TOKEN_ID = 154843
+GLM_TOOL_CLOSE_TOKEN_ID = 154844
+GLM_TOOL_RESPONSE_START_TOKEN_ID = 154845
+GLM_TOOL_RESPONSE_END_TOKEN_ID = 154846
+GLM_ASSISTANT_TOKEN_ID = 154828
+GLM_OBSERVATION_TOKEN_ID = 154829
+GLM_THINK_START_TOKEN_ID = 154841
+GLM_EOS_TOKEN_ID = 154820
+
+TOOL_CALL_START = "<tool_call>"
+TOOL_CALL_END = "</tool_call>"
+EOS_TEXT = "<|endoftext|>"
+
+GLM_TOOL_STOPS = [
+    TOOL_CALL_END,
+    EOS_TEXT,
+]
+
+GLM_TOOL_STOP_TOKEN_IDS = [
+    GLM_TOOL_CLOSE_TOKEN_ID,
+    GLM_EOS_TOKEN_ID,
+]
+
+
+def token_ids_for_text(tokenizer: Any, text: str) -> list[int]:
+    if tokenizer is None:
+        return []
+    if callable(tokenizer):
+        encoded = tokenizer(text, add_special_tokens=False)
+        if isinstance(encoded, dict):
+            return list(encoded.get("input_ids") or [])
+    if hasattr(tokenizer, "encode"):
+        return list(tokenizer.encode(text, add_special_tokens=False))
+    return []
+
+
+def single_token_id_for_text(tokenizer: Any, text: str, fallback: int) -> int:
+    token_ids = token_ids_for_text(tokenizer, text)
+    return token_ids[0] if len(token_ids) == 1 else fallback
+
+
+@dataclass(frozen=True)
+class QwenToolTokenIds:
+    tool_call: int
+    tool_close: int
+    eos: int
+
+    @classmethod
+    def from_tokenizer(cls, tokenizer: Any) -> "QwenToolTokenIds":
+        return cls(
+            tool_call=single_token_id_for_text(tokenizer, TOOL_CALL_START, GLM_TOOL_CALL_TOKEN_ID),
+            tool_close=single_token_id_for_text(tokenizer, TOOL_CALL_END, GLM_TOOL_CLOSE_TOKEN_ID),
+            eos=single_token_id_for_text(tokenizer, EOS_TEXT, GLM_EOS_TOKEN_ID),
+        )
+
+
+def _tool_token_ids(tokenizer: Any | None = None) -> QwenToolTokenIds:
+    return QwenToolTokenIds.from_tokenizer(tokenizer) if tokenizer is not None else QwenToolTokenIds(
+        tool_call=GLM_TOOL_CALL_TOKEN_ID,
+        tool_close=GLM_TOOL_CLOSE_TOKEN_ID,
+        eos=GLM_EOS_TOKEN_ID,
+    )
+
+
+def glm_stop_strings_from_token_ids(token_ids: list[int], tokenizer: Any | None = None) -> list[str]:
+    """Return Qwen/GLM stop strings for tool-close and EOS token IDs."""
+    ids = _tool_token_ids(tokenizer)
     stops: list[str] = []
     for token_id in token_ids:
-        if token_id == GLM_TOOL_CLOSE_TOKEN_ID:
-            stops.append("</tool_call>")
-        elif token_id == GLM_EOS_TOKEN_ID:
-            stops.append("<|endoftext|>")
+        if token_id in {GLM_TOOL_CLOSE_TOKEN_ID, ids.tool_close}:
+            stops.append(TOOL_CALL_END)
+        elif token_id in {GLM_EOS_TOKEN_ID, ids.eos}:
+            stops.append(EOS_TEXT)
         else:
             raise ValueError(
                 f"/v1/completions does not accept stop_token_ids; "
@@ -95,6 +166,7 @@ class DirectCompletionsModel:
             raise ImportError("transformers is required to instantiate DirectCompletionsModel")
         self.config = config or DirectCompletionsConfig.from_env()
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer_path, trust_remote_code=True)
+        self.tool_token_ids = QwenToolTokenIds.from_tokenizer(self.tokenizer)
 
     def get_template_vars(self) -> dict[str, Any]:
         return {}
@@ -133,8 +205,15 @@ class DirectCompletionsModel:
         stop_token_ids = kwargs.get("stop_token_ids")
         stop = kwargs.get("stop")
         if stop_token_ids:
-            mapped_stops = glm_stop_strings_from_token_ids([int(token_id) for token_id in stop_token_ids])
-            stop = list(stop or []) + mapped_stops if isinstance(stop, list) else ([stop] if stop else []) + mapped_stops
+            mapped_stops = glm_stop_strings_from_token_ids(
+                [int(token_id) for token_id in stop_token_ids],
+                getattr(self, "tokenizer", None),
+            )
+            stop_list = list(stop or []) if isinstance(stop, list) else ([stop] if stop else [])
+            for mapped_stop in mapped_stops:
+                if mapped_stop not in stop_list:
+                    stop_list.append(mapped_stop)
+            stop = stop_list
         if stop:
             payload["stop"] = stop
         agent_context = kwargs.get("agent_context")
@@ -189,6 +268,19 @@ class DirectCompletionsModel:
         logprobs = choice.get("logprobs") or {}
         generated_token_ids = token_ids_from_logprob_tokens(logprobs.get("tokens") or [], self.tokenizer)
         token_logprobs = list(logprobs.get("token_logprobs") or [])
+        content = choice.get("text", "")
+        requested_max_tokens = int(payload["max_tokens"])
+        backend_generated_tokens = len(generated_token_ids)
+        locally_truncated_to_max_tokens = False
+        if len(generated_token_ids) > requested_max_tokens:
+            generated_token_ids = generated_token_ids[:requested_max_tokens]
+            token_logprobs = token_logprobs[:requested_max_tokens]
+            content = _decode_token_ids(self.tokenizer, generated_token_ids)
+            choice["text"] = content
+            choice["finish_reason"] = "length"
+            response_nvext["stop_reason"] = None
+            locally_truncated_to_max_tokens = True
+
         if len(token_logprobs) > len(generated_token_ids):
             token_logprobs = token_logprobs[: len(generated_token_ids)]
         elif len(token_logprobs) < len(generated_token_ids):
@@ -201,8 +293,15 @@ class DirectCompletionsModel:
             "token_logprobs": token_logprobs,
             "finish_reason": choice.get("finish_reason"),
             "stop_reason": response_nvext.get("stop_reason", choice.get("stop_reason")),
+            "requested_max_tokens": requested_max_tokens,
+            "backend_generated_tokens": backend_generated_tokens,
+            "locally_truncated_to_max_tokens": locally_truncated_to_max_tokens,
         }
-        result = {"content": choice.get("text", ""), "message": choice.get("text", ""), "extra": extra}
+        if locally_truncated_to_max_tokens and data.get("usage"):
+            usage = data["usage"]
+            usage["completion_tokens"] = min(int(usage.get("completion_tokens", 0)), requested_max_tokens)
+            usage["total_tokens"] = int(usage.get("prompt_tokens", len(payload["prompt"]))) + usage["completion_tokens"]
+        result = {"content": content, "message": content, "extra": extra}
         return result
 
 
@@ -210,39 +309,20 @@ def query(messages: list[dict[str, Any]], **kwargs) -> dict[str, Any]:
     return DirectCompletionsModel().query(messages, **kwargs)
 
 
-GLM_TOOL_CALL_TOKEN_ID = 154843
-GLM_TOOL_CLOSE_TOKEN_ID = 154844
-GLM_TOOL_RESPONSE_START_TOKEN_ID = 154845
-GLM_TOOL_RESPONSE_END_TOKEN_ID = 154846
-GLM_ASSISTANT_TOKEN_ID = 154828
-GLM_OBSERVATION_TOKEN_ID = 154829
-GLM_THINK_START_TOKEN_ID = 154841
-GLM_EOS_TOKEN_ID = 154820
-
-GLM_TOOL_STOPS = [
-    "</tool_call>",
-    "<|endoftext|>",
-]
-
-GLM_TOOL_STOP_TOKEN_IDS = [
-    GLM_TOOL_CLOSE_TOKEN_ID,
-    GLM_EOS_TOKEN_ID,
-]
-
-
-def stop_reason_token_ids(stop_reason: Any) -> list[int]:
+def stop_reason_token_ids(stop_reason: Any, tokenizer: Any | None = None) -> list[int]:
     """Return token IDs from Dynamo/OpenAI stop_reason values, without tokenizing."""
 
+    ids = _tool_token_ids(tokenizer)
     if stop_reason is None or isinstance(stop_reason, bool):
         return []
     if isinstance(stop_reason, int):
         return [stop_reason]
     if isinstance(stop_reason, str):
         stop_reason = stop_reason.strip()
-        if stop_reason == "</tool_call>":
-            return [GLM_TOOL_CLOSE_TOKEN_ID]
-        if stop_reason == "<|endoftext|>":
-            return [GLM_EOS_TOKEN_ID]
+        if stop_reason == TOOL_CALL_END:
+            return [ids.tool_close]
+        if stop_reason == EOS_TEXT:
+            return [ids.eos]
         if stop_reason.startswith("token_id:"):
             stop_reason = stop_reason[len("token_id:") :]
         try:
@@ -252,7 +332,7 @@ def stop_reason_token_ids(stop_reason: Any) -> list[int]:
     if isinstance(stop_reason, list):
         token_ids: list[int] = []
         for item in stop_reason:
-            token_ids.extend(stop_reason_token_ids(item))
+            token_ids.extend(stop_reason_token_ids(item, tokenizer))
         return token_ids
     return []
 
@@ -272,19 +352,25 @@ def parse_glm_tool_call_from_completion(
 ) -> tuple[str, list[dict[str, Any]], bool]:
     """Parse a GLM tool call only when the matched stop was `</tool_call>`."""
 
-    if GLM_TOOL_CLOSE_TOKEN_ID not in matched_stop_token_ids:
+    ids = _tool_token_ids(tokenizer)
+    if ids.tool_close not in matched_stop_token_ids and GLM_TOOL_CLOSE_TOKEN_ID not in matched_stop_token_ids:
         return content, [], False
 
-    tool_start = _rfind_token(generated_ids, GLM_TOOL_CALL_TOKEN_ID)
+    tool_start = _rfind_token(generated_ids, ids.tool_call)
+    if tool_start < 0 and ids.tool_call != GLM_TOOL_CALL_TOKEN_ID:
+        tool_start = _rfind_token(generated_ids, GLM_TOOL_CALL_TOKEN_ID)
     if tool_start < 0:
-        return content, [], False
+        if TOOL_CALL_START not in content:
+            return content, [], False
+        normal_text, tool_calls = parse_glm_tool_calls(content)
+        return normal_text, tool_calls, bool(tool_calls and TOOL_CALL_END not in content)
 
     tool_text = tokenizer.decode(generated_ids[tool_start:], skip_special_tokens=False)
-    has_tool_close = GLM_TOOL_CLOSE_TOKEN_ID in generated_ids[tool_start:]
+    has_tool_close = ids.tool_close in generated_ids[tool_start:] or GLM_TOOL_CLOSE_TOKEN_ID in generated_ids[tool_start:]
     if not has_tool_close:
-        tool_text = tool_text + "</tool_call>"
+        tool_text = tool_text + TOOL_CALL_END
 
-    marker_idx = content.rfind("<tool_call>")
+    marker_idx = content.rfind(TOOL_CALL_START)
     if marker_idx >= 0:
         normal_text = content[:marker_idx]
     else:
@@ -292,6 +378,21 @@ def parse_glm_tool_call_from_completion(
 
     _, tool_calls = parse_glm_tool_calls(tool_text)
     return normal_text, tool_calls, not has_tool_close
+
+
+def encode_qwen_tool_observation_delta(tokenizer: Any, observation: str) -> list[int]:
+    """Encode the Qwen chat-template continuation after an assistant tool call."""
+
+    return token_ids_for_text(
+        tokenizer,
+        (
+            "<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"<tool_response>\n{observation}\n</tool_response>"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n"
+        ),
+    )
 
 
 def _extract_tag_value(text: str, tag: str) -> str | None:

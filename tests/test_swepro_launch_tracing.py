@@ -38,6 +38,47 @@ def test_runtime_env_passes_dynamo_trace_inputs_without_legacy_swepro_traces():
     assert "SWEPRO_MODEL_TRACE_PATH" not in runtime
 
 
+def test_default_log_probs_chunk_size_is_throughput_oriented():
+    launch = _load_launch_module()
+    env = {}
+
+    launch.apply_profile_defaults(env, "env", REPO_ROOT, write_state=False)
+    derived = launch.derive_config(env)
+
+    assert derived.log_probs_chunk_size == 512
+
+    profile_env = {}
+    launch.apply_profile_defaults(profile_env, "speedscope-current", REPO_ROOT, write_state=False)
+    assert profile_env["SWEPRO_LOG_PROBS_CHUNK_SIZE"] == "512"
+
+
+def test_optimizer_cpu_offload_is_on_by_default():
+    launch = _load_launch_module()
+    env = {
+        "SWEPRO_RUN_ID": "run-123",
+        "SWEPRO_RAY_SUBMISSION_ID": "run-123",
+        "SWEPRO_DURABLE_LOGS": "0",
+    }
+    derived = launch.derive_config(env)
+    durable_logs = launch.durable_log_config(env)
+
+    command = launch.build_command(
+        env,
+        REPO_ROOT,
+        derived,
+        durable_logs,
+        [],
+        "http://127.0.0.1:8265",
+        create_dirs=False,
+    )
+    command_text = " ".join(command)
+
+    assert "--use-precision-aware-optimizer" in command
+    assert "--optimizer-cpu-offload" in command
+    assert "--overlap-cpu-optimizer-d2h-h2d" in command
+    assert "--use-precision-aware-optimizer --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d" in command_text
+
+
 def test_k8s_stack_exposes_dynamo_agent_trace_port_and_session_dependencies():
     text = K8S_STACK_PATH.read_text()
 

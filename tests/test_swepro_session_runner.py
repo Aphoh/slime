@@ -59,6 +59,11 @@ class _FakePublisher:
         return True
 
 
+def _session_trace_events(output):
+    prefix = "SWEPRO_SESSION_TRACE "
+    return [json.loads(line[len(prefix) :]) for line in output.splitlines() if line.startswith(prefix)]
+
+
 def _trace_context():
     return {
         "session_type_id": "slime_swebench_pro",
@@ -140,7 +145,7 @@ def test_step_drops_session_when_deployment_disappears():
     assert publisher.records[-1]["tool"]["error_type"] == "DeploymentNotStartedError"
 
 
-def test_step_emits_dynamo_tool_start_and_end():
+def test_step_emits_dynamo_tool_start_and_end(capsys):
     runner = _load_session_runner()
 
     class CommandTimeoutError(Exception):
@@ -200,6 +205,17 @@ def test_step_emits_dynamo_tool_start_and_end():
     assert publisher.records[1]["tool"]["status"] == "succeeded"
     assert publisher.records[1]["tool"]["tool_call_id"] == "call-1"
     assert publisher.records[1]["tool"]["output_bytes"] == len("hello\n".encode("utf-8"))
+    trace_events = _session_trace_events(capsys.readouterr().out)
+    assert [event["event"] for event in trace_events] == [
+        "tool_step_request",
+        "tool_start",
+        "tool_step_response",
+    ]
+    assert trace_events[0]["trajectory_id"] == _trace_context()["trajectory_id"]
+    assert trace_events[1]["tool_name"] == "bash"
+    assert trace_events[1]["trace_published"] is True
+    assert trace_events[2]["status"] == "succeeded"
+    assert trace_events[2]["submitted"] is False
 
 
 def test_invalid_tool_emits_dynamo_tool_error():
