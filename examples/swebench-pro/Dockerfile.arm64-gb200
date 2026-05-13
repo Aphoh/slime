@@ -34,6 +34,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,target=/build/dynamo/lib/bindings/python/target,sharing=locked \
     cd /build/dynamo/lib/bindings/python && \
+    rm -rf target/wheels && \
     maturin build --release && \
     mkdir -p /build/dist && \
     cp target/wheels/*.whl /build/dist/
