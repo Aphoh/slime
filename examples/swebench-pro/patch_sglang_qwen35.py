@@ -116,13 +116,65 @@ def cpu(*args, **kwargs):
     )
 
 
+def ensure_network_utils_shim(root: Path) -> None:
+    """Backfill the SGLang network helper module expected by this Dynamo branch."""
+
+    path = root / "srt" / "utils" / "network.py"
+    if path.exists():
+        return
+    path.write_text(
+        '''from __future__ import annotations
+
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+from sglang.srt.utils.common import get_local_ip_auto, get_zmq_socket
+
+
+@dataclass(frozen=True)
+class NetworkAddress:
+    host: str
+    port: int
+
+    @classmethod
+    def parse(cls, address: str) -> "NetworkAddress":
+        parsed = urlparse(address if "://" in address else f"tcp://{address}")
+        host = parsed.hostname
+        port = parsed.port
+        if host is None or port is None:
+            raise ValueError(f"invalid network address: {address!r}")
+        return cls(host, port)
+
+    def resolved(self) -> "NetworkAddress":
+        return self
+
+    def to_tcp(self) -> str:
+        host = self.host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"tcp://{host}:{self.port}"
+
+    def to_host_port_str(self) -> str:
+        host = self.host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"{host}:{self.port}"
+'''
+    )
+
+
 def verify() -> None:
     from sglang.srt.configs.qwen3_5 import Qwen3_5MoeConfig
+    from sglang.srt.utils.network import NetworkAddress
 
     cfg = Qwen3_5MoeConfig(text_config={"num_attention_heads": 32})
     assert hasattr(cfg.text_config, "num_attention_heads")
+    assert NetworkAddress.parse("tcp://127.0.0.1:1234").to_tcp() == "tcp://127.0.0.1:1234"
+    assert NetworkAddress("127.0.0.1", 1234).to_host_port_str() == "127.0.0.1:1234"
 
     if os.environ.get("SGLANG_QWEN35_IMPORT_VERIFY") == "1":
+        import dynamo.sglang.publisher  # noqa: F401
+        import dynamo.sglang.register  # noqa: F401
         import sglang.srt.layers.attention.vision  # noqa: F401
         import sglang.srt.models.qwen3_5  # noqa: F401
         import sglang.srt.multimodal.processors.qwen_vl  # noqa: F401
@@ -133,6 +185,7 @@ def main() -> None:
     patch_qwen35_config(root)
     patch_vision_fa3_import(root)
     ensure_decord_stub(root)
+    ensure_network_utils_shim(root)
     verify()
     print("patched SGLang Qwen3.5 compatibility")
 

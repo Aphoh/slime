@@ -63,7 +63,7 @@ def _trace_context():
     return {
         "session_type_id": "slime_swebench_pro",
         "session_id": "run-1",
-        "trajectory_id": "run-1:swebench_pro:instance-0:0:abcdef12",
+        "trajectory_id": "run-1:swebench_pro:instance-0:sample:0:id:sample-a",
     }
 
 

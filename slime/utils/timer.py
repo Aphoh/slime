@@ -5,6 +5,7 @@ from time import time
 
 import torch.distributed
 
+from .dynamo_trainer_trace import end_trainer_span, start_trainer_span
 from .misc import SingletonMeta
 
 __all__ = ["Timer", "timer"]
@@ -16,10 +17,16 @@ class Timer(metaclass=SingletonMeta):
     def __init__(self):
         self.timers = {}
         self.start_time = {}
+        self.trace_tokens = {}
+
+    def _trace_enabled_on_this_rank(self):
+        return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
 
     def start(self, name):
         assert name not in self.start_time, f"Timer {name} already started."
         self.start_time[name] = time()
+        if self._trace_enabled_on_this_rank():
+            self.trace_tokens[name] = start_trainer_span(name)
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(f"Timer {name} start")
 
@@ -28,6 +35,9 @@ class Timer(metaclass=SingletonMeta):
         elapsed_time = time() - self.start_time[name]
         self.add(name, elapsed_time)
         del self.start_time[name]
+        trace_token = self.trace_tokens.pop(name, None)
+        if self._trace_enabled_on_this_rank():
+            end_trainer_span(name, trace_token)
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(f"Timer {name} end (elapsed: {elapsed_time:.1f}s)")
 
