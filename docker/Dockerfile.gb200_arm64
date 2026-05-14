@@ -74,7 +74,7 @@ RUN NVCC_APPEND_FLAGS="--threads 4" MAX_JOBS=16 \
         --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 16" \
         "git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4"
 
-ARG MEGATRON_COMMIT=3714d81d418c9f1bca4594fc35f9e8289f652862
+ARG MEGATRON_COMMIT=1dcf0dafa884ad52ffb243625717a3471643e087
 RUN git clone https://github.com/NVIDIA/Megatron-LM.git /root/src/Megatron-LM \
     && cd /root/src/Megatron-LM \
     && git checkout ${MEGATRON_COMMIT}
