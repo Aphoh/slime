@@ -33,6 +33,31 @@ from slime.utils.http_utils import get_host_info
 logger = logging.getLogger(__name__)
 
 
+_DTYPE_SIZES = {
+    "bool": 1,
+    "int8": 1,
+    "uint8": 1,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
+    "float16": 2,
+    "bfloat16": 2,
+    "int16": 2,
+    "float32": 4,
+    "int32": 4,
+    "float64": 8,
+    "int64": 8,
+}
+
+
+def _format_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{num_bytes}B"
+
+
 def _format_ipv6(addr):
     """Wrap bare IPv6 addresses in brackets for use in URLs."""
     if not addr or addr.startswith("["):
@@ -43,6 +68,30 @@ def _format_ipv6(addr):
     except ValueError:
         pass
     return addr
+
+
+def _shape_numel(shape) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return numel
+
+
+def _weight_update_body_summary(body) -> tuple[int, int, str | None, str | None, str | None]:
+    names = body.get("names") or []
+    dtypes = body.get("dtypes") or []
+    shapes = body.get("shapes") or []
+    total_bytes = 0
+    for dtype, shape in zip(dtypes, shapes, strict=False):
+        dtype_name = str(dtype).replace("torch.", "")
+        total_bytes += _shape_numel(shape) * _DTYPE_SIZES.get(dtype_name, 0)
+    return (
+        len(names),
+        total_bytes,
+        body.get("group_name"),
+        body.get("weight_version"),
+        body.get("load_format"),
+    )
 
 
 class DynamoEngine(RayActor):
@@ -290,15 +339,75 @@ class DynamoEngine(RayActor):
         """Call a dedicated /engine/{route} endpoint on the system status server."""
         if self.node_rank != 0:
             return
+        body = body or {}
         url = f"http://{self.server_host}:{self.server_port}/engine/{route}"
         timeout = float(os.getenv("SLIME_DYNAMO_ENGINE_ROUTE_TIMEOUT", "1800"))
-        response = requests.post(url, json=body or {}, timeout=timeout)
+        log_route = route == "update_weights_from_distributed" or os.getenv("SLIME_DYNAMO_ENGINE_ROUTE_LOGGING", "0") == "1"
+        route_t0 = time.time()
+        if log_route:
+            if route == "update_weights_from_distributed":
+                tensor_count, total_bytes, group_name, weight_version, load_format = _weight_update_body_summary(body)
+                logger.info(
+                    "[DYNAMO ENGINE rank=%d route=%s host=%s:%s group=%s version=%s tensors=%d bytes=%s format=%s] start",
+                    self.rank,
+                    route,
+                    self.server_host,
+                    self.server_port,
+                    group_name,
+                    weight_version,
+                    tensor_count,
+                    _format_bytes(total_bytes),
+                    load_format or "default",
+                )
+            else:
+                logger.info(
+                    "[DYNAMO ENGINE rank=%d route=%s host=%s:%s] start",
+                    self.rank,
+                    route,
+                    self.server_host,
+                    self.server_port,
+                )
         try:
+            response = requests.post(url, json=body, timeout=timeout)
             response.raise_for_status()
+            result = response.json()
         except requests.exceptions.HTTPError as e:
             e.add_note(f"{response.text=}")
+            if log_route:
+                logger.exception(
+                    "[DYNAMO ENGINE rank=%d route=%s host=%s:%s] failed after %.3fs",
+                    self.rank,
+                    route,
+                    self.server_host,
+                    self.server_port,
+                    time.time() - route_t0,
+                )
             raise
-        return response.json()
+        except Exception:
+            if log_route:
+                logger.exception(
+                    "[DYNAMO ENGINE rank=%d route=%s host=%s:%s] failed after %.3fs",
+                    self.rank,
+                    route,
+                    self.server_host,
+                    self.server_port,
+                    time.time() - route_t0,
+                )
+            raise
+        if log_route:
+            success = result.get("success") if isinstance(result, dict) else None
+            message = result.get("message") if isinstance(result, dict) else None
+            logger.info(
+                "[DYNAMO ENGINE rank=%d route=%s host=%s:%s] done in %.3fs success=%s message=%s",
+                self.rank,
+                route,
+                self.server_host,
+                self.server_port,
+                time.time() - route_t0,
+                success,
+                message,
+            )
+        return result
 
     def _call_tm(self, method, args=None, kwargs=None):
         """Call a tokenizer_manager method via the RLMixin endpoint."""

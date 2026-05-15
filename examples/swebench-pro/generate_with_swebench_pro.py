@@ -98,6 +98,23 @@ def _positive_int_env(name: str, default: int) -> int:
     return parsed
 
 
+def _optional_positive_int_env(name: str, default: int) -> int | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    if value.lower() in {"0", "none", "unlimited"}:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %s", name, value, default)
+        return default
+    if parsed <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using %s", name, value, default)
+        return default
+    return parsed
+
+
 def _nonnegative_int_env(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None or value == "":
@@ -131,11 +148,14 @@ def _positive_float_env(name: str, default: float) -> float:
 def _turn_max_tokens(args, sampling_params: dict[str, Any] | None = None) -> int:
     rollout_max = int(getattr(args, "rollout_max_response_len", 4096))
     default_turn_max = min(8192, rollout_max)
-    turn_max = _positive_int_env("SWEPRO_TURN_MAX_TOKENS", default_turn_max)
+    turn_max = _optional_positive_int_env("SWEPRO_TURN_MAX_TOKENS", default_turn_max)
     requested = rollout_max
     if sampling_params is not None:
         requested = int(sampling_params.get("max_new_tokens") or rollout_max)
-    return max(1, min(turn_max, requested, rollout_max))
+    limits = [requested, rollout_max]
+    if turn_max is not None:
+        limits.append(turn_max)
+    return max(1, min(limits))
 
 
 def _episode_wall_timeout_s() -> float | None:
@@ -389,7 +409,9 @@ def _remaining_context(
 ) -> int | None:
     if max_context_len is None:
         return None
-    return max_context_len - len(prompt_token_ids) - len(response_token_ids)
+    # SGLang rejects requests at the exact context boundary, so keep one token
+    # of headroom while still allowing effectively unbounded turns.
+    return max_context_len - len(prompt_token_ids) - len(response_token_ids) - 1
 
 
 def _trim_response_to_context(

@@ -118,6 +118,35 @@ def load_module(module_name: str):
 
 
 @pytest.mark.unit
+def test_huggingface_attention_synthesizes_cu_seqlens_for_bshd_batches():
+    module = load_module("slime_plugins.models.hf_attention")
+
+    class DummyAttention(module.HuggingfaceAttention):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.args = SimpleNamespace(sequence_parallel=False)
+            self.seen_packed_seq_params = None
+
+        def hf_forward(self, hidden_states, packed_seq_params):
+            self.seen_packed_seq_params = packed_seq_params
+            return hidden_states
+
+    layer = DummyAttention()
+    hidden_states = torch.randn(5, 2, 4)
+
+    output, bias = layer(hidden_states, attention_mask=None, packed_seq_params=None)
+
+    assert output.shape == hidden_states.shape
+    assert bias is None
+    assert layer.seen_packed_seq_params.qkv_format == "bshd"
+    assert layer.seen_packed_seq_params.max_seqlen_q == 5
+    assert torch.equal(
+        layer.seen_packed_seq_params.cu_seqlens_q,
+        torch.tensor([0, 5, 10], dtype=torch.int32),
+    )
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("module_name", "class_name", "args", "expected_backend"),
     [

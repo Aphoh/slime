@@ -48,7 +48,7 @@ spec:
   channel:
     resourceClaimTemplate:
       name: warnold-swepro-compute-domain-channel
-  numNodes: 4
+  numNodes: 6
 ---
 apiVersion: v1
 kind: Service
@@ -120,9 +120,9 @@ spec:
             --model-path "${MODEL_PATH}"
       env:
         - name: SWEPRO_STACK_MODEL_PATH
-          value: /data/glm-4.7-30b-a3b
+          value: /shared/Qwen3.5-122B-A10B
         - name: SWEPRO_KV_CACHE_BLOCK_SIZE
-          value: "KV_CACHE_BLOCK_SIZE_PLACEHOLDER"
+          value: "64"
       ports:
         - containerPort: 3000
           name: http
@@ -371,7 +371,6 @@ spec:
     cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
     cloud.google.com/gke-nodepool: customer-gpu-w0e
     nvidia.com/gpu.product: NVIDIA-GB200
-    kubernetes.io/hostname: TRAIN_NODE_PLACEHOLDER
   affinity:
     nodeAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
@@ -664,19 +663,51 @@ metadata:
       [
         {"interfaceName":"eth0","network":"default"},
         {"interfaceName":"rdma0","network":"rdma-0"},
-        {"interfaceName":"rdma1","network":"rdma-1"}
+        {"interfaceName":"rdma1","network":"rdma-1"},
+        {"interfaceName":"rdma2","network":"rdma-2"},
+        {"interfaceName":"rdma3","network":"rdma-3"}
       ]
 spec:
   restartPolicy: Never
+  resourceClaims:
+    - name: compute-domain-channel
+      resourceClaimTemplateName: warnold-swepro-compute-domain-channel
   nodeSelector:
     cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+    cloud.google.com/gke-nodepool: customer-gpu-w0e
     nvidia.com/gpu.product: NVIDIA-GB200
-    kubernetes.io/hostname: ENGINE_NODE_PLACEHOLDER
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - warnold-swepro-trainer
+                  - warnold-swepro-trainer-worker
+                  - warnold-swepro-engine
+          topologyKey: kubernetes.io/hostname
   tolerations:
     - key: "kubernetes.io/arch"
       operator: "Equal"
       value: "arm64"
       effect: "NoSchedule"
+    - key: networking.gke.io.networks/rdma-0
+      operator: Exists
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-1
+      operator: Exists
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-2
+      operator: Exists
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-3
+      operator: Exists
+      effect: NoSchedule
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
   containers:
     - name: engine
       image: IMAGE_PLACEHOLDER
@@ -702,9 +733,16 @@ spec:
           export UCX_KEEPALIVE_INTERVAL=300s
           export NCCL_CUMEM_ENABLE=1
           export NCCL_CUMEM_HOST_ENABLE=1
-          export NCCL_MNNVL_ENABLE=0
+          export NCCL_MNNVL_ENABLE=1
           export NCCL_NVLS_ENABLE=1
           export NCCL_STORE_TIMEOUT=7200
+          export NCCL_IB_GID_INDEX=3
+          export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3
+          export NCCL_IB_MERGE_NICS=0
+          export NCCL_P2P_PXN_LEVEL=1
+          export NCCL_GRAPH_MIXING_SUPPORT=0
+          export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+          export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,ENV,NET}"
           export NCCL_SOCKET_IFNAME=eth0
           export GLOO_SOCKET_IFNAME=eth0
           export NVIDIA_GDRCOPY=1
@@ -760,10 +798,26 @@ spec:
             --mem-fraction-static ENGINE_MEM_FRACTION_STATIC_PLACEHOLDER
       env:
         - name: SWEPRO_STACK_MODEL_PATH
-          value: /data/glm-4.7-30b-a3b
+          value: /shared/Qwen3.5-122B-A10B
         - name: SWEPRO_ENGINE_PROFILE
-          value: glm47
+          value: qwen35
+        - name: SGLANG_QWEN35_ATTENTION_BACKEND
+          value: triton
+        - name: SGLANG_QWEN35_QUANTIZATION
+          value: bf16
+        - name: SGLANG_CUDA_GRAPH_MAX_BS
+          value: "32"
+        - name: SGLANG_MAX_RUNNING_REQUESTS
+          value: "32"
+        - name: SGLANG_CONTEXT_LENGTH
+          value: "131072"
+        - name: SGLANG_MAX_PREFILL_TOKENS
+          value: "16384"
+        - name: SGLANG_CHUNKED_PREFILL_SIZE
+          value: "16384"
       resources:
+        claims:
+          - name: compute-domain-channel
         requests:
           cpu: "32"
           memory: "128Gi"
@@ -771,6 +825,8 @@ spec:
           nvidia.com/gpu: "ENGINE_GPU_PLACEHOLDER"
           networking.gke.io.networks/rdma-0: "1"
           networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
         limits:
           cpu: "48"
           memory: "192Gi"
@@ -778,6 +834,8 @@ spec:
           nvidia.com/gpu: "ENGINE_GPU_PLACEHOLDER"
           networking.gke.io.networks/rdma-0: "1"
           networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
       volumeMounts:
         - name: model-cache
           mountPath: /data
