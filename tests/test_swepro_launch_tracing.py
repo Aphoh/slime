@@ -52,6 +52,50 @@ def test_default_log_probs_chunk_size_is_throughput_oriented():
     assert profile_env["SWEPRO_LOG_PROBS_CHUNK_SIZE"] == "512"
 
 
+def test_qwen35_command_matches_397b_dispatcher_shape():
+    launch = _load_launch_module()
+    env = {
+        "SWEPRO_RUN_ID": "run-123",
+        "SWEPRO_RAY_SUBMISSION_ID": "run-123",
+        "SWEPRO_DURABLE_LOGS": "0",
+        "SWEPRO_MODEL_ARGS_SCRIPT": "scripts/models/qwen3.5-122B-A10B.sh",
+        "SWEPRO_QKV_FORMAT": "bshd",
+        "SWEPRO_USE_DYNAMIC_BATCH_SIZE": "0",
+        "SWEPRO_MOE_TOKEN_DISPATCHER_TYPE": "allgather",
+        "SLIME_SKIP_WEIGHT_UPDATES": "1",
+    }
+
+    derived = launch.derive_config(env)
+    durable_logs = launch.durable_log_config(env)
+    model_args = launch.load_model_args(REPO_ROOT, env["SWEPRO_MODEL_ARGS_SCRIPT"])
+    command = launch.build_command(
+        env,
+        REPO_ROOT,
+        derived,
+        durable_logs,
+        [],
+        "http://127.0.0.1:8265",
+        create_dirs=False,
+    )
+
+    assert model_args[model_args.index("--moe-token-dispatcher-type") + 1] == "allgather"
+    assert launch.runtime_env(env, REPO_ROOT, "0")["env_vars"]["SLIME_SKIP_WEIGHT_UPDATES"] == "1"
+    assert command[command.index("--qkv-format") + 1] == "bshd"
+    assert "--use-dynamic-batch-size" not in command
+    assert "--micro-batch-size" in command
+    assert command[command.index("--moe-token-dispatcher-type") + 1] == "allgather"
+
+
+def test_runtime_env_defaults_to_unbounded_agent_turns_and_turn_tokens():
+    launch = _load_launch_module()
+    env = {"SWEPRO_RUN_ID": "run-123"}
+
+    runtime = launch.runtime_env(env, REPO_ROOT, "0")["env_vars"]
+
+    assert runtime["SWEPRO_MAX_TOOL_CALLS"] == "0"
+    assert runtime["SWEPRO_TURN_MAX_TOKENS"] == "0"
+
+
 def test_optimizer_cpu_offload_is_on_by_default():
     launch = _load_launch_module()
     env = {

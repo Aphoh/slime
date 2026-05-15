@@ -285,6 +285,25 @@ index ef8527e9e..57fbe5bd7 100644
          def _encode_extra_state(self, state):
              # TE 2.0 changed the format of extra_state to be a byte tensor
              if is_te_min_version("2.0.0"):
+diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
+index 1dde86d7d..270ab22c2 100644
+--- a/megatron/core/transformer/attention.py
++++ b/megatron/core/transformer/attention.py
+@@ -1491,6 +1491,14 @@ class SelfAttention(Attention):
+         if output_gate:
+             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
++            if self.config.num_query_groups < self.world_size:
++                idx = get_tensor_model_parallel_rank() % (
++                    self.world_size // self.config.num_query_groups
++                )
++                size = self.num_attention_heads_per_partition // (
++                    self.world_size // self.config.num_query_groups
++                )
++                gate = gate[:, :, idx * size : (idx + 1) * size, :]
+             return query, key, value, gate
+ 
+         return query, key, value
 diff --git a/megatron/core/fusions/fused_mla_yarn_rope_apply.py b/megatron/core/fusions/fused_mla_yarn_rope_apply.py
 index 1fd5dcfae..75e1072d5 100644
 --- a/megatron/core/fusions/fused_mla_yarn_rope_apply.py

@@ -41,7 +41,7 @@ MODEL_ARGS=(
    --moe-ffn-hidden-size 1024
    --moe-shared-expert-intermediate-size 1024
    --moe-router-score-function softmax
-   --moe-token-dispatcher-type alltoall
+   --moe-token-dispatcher-type allgather
    --moe-router-topk 8
    --moe-layer-freq "$MOE_LAYER_FREQ"
    --num-experts 256
