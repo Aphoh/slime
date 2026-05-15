@@ -101,9 +101,6 @@ class HuggingfaceAttention(MegatronModule, ABC):
         *,
         inference_params: BaseInferenceContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert packed_seq_params is not None
-        cu_seqlens = packed_seq_params.cu_seqlens_q
-
         if self.args.sequence_parallel:
             # tensor_parallel_output_grad=False: the linear attention after this
             # gather is NOT TP-sharded (duplicated on all ranks), so the backward
@@ -113,6 +110,28 @@ class HuggingfaceAttention(MegatronModule, ABC):
                 tensor_parallel_output_grad=False,
                 group=mpu.get_tensor_model_parallel_group(),
             )
+
+        if packed_seq_params is None:
+            assert mpu.get_context_parallel_world_size() == 1, (
+                "HuggingfaceAttention requires packed sequence metadata when context parallelism is enabled."
+            )
+            seq_len, batch_size = hidden_states.shape[:2]
+            cu_seqlens = torch.arange(
+                0,
+                (batch_size + 1) * seq_len,
+                seq_len,
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=seq_len,
+                max_seqlen_kv=seq_len,
+                qkv_format="bshd",
+            )
+        else:
+            cu_seqlens = packed_seq_params.cu_seqlens_q
 
         if mpu.get_context_parallel_world_size() > 1:
             cp_size = mpu.get_context_parallel_world_size()
