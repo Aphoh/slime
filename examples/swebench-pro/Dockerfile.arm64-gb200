@@ -1,12 +1,16 @@
 # syntax=docker/dockerfile:1.4
 
 ARG BASE_IMAGE="aphoh/slime:0.2.4-arm64-gb200"
-ARG DYNAMO_COMMIT="warnold/agent-context-v1-completions"
+ARG DYNAMO_COMMIT="main"
+ARG DYNAMO_EXTRA_FETCH_REF=""
+ARG DYNAMO_CHERRY_PICK=""
 ARG CARGO_BUILD_JOBS="16"
 
 FROM ubuntu:24.04 AS builder
 
 ARG DYNAMO_COMMIT
+ARG DYNAMO_EXTRA_FETCH_REF
+ARG DYNAMO_CHERRY_PICK
 ARG CARGO_BUILD_JOBS
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
@@ -28,7 +32,10 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     cargo install maturin --locked
 
 RUN git clone https://github.com/ai-dynamo/dynamo.git /build/dynamo && \
-    cd /build/dynamo && git checkout ${DYNAMO_COMMIT}
+    cd /build/dynamo && \
+    git checkout ${DYNAMO_COMMIT} && \
+    if [ -n "${DYNAMO_EXTRA_FETCH_REF}" ]; then git fetch origin "${DYNAMO_EXTRA_FETCH_REF}"; fi && \
+    for commit in ${DYNAMO_CHERRY_PICK}; do git cherry-pick -X ours "${commit}"; done
 
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
