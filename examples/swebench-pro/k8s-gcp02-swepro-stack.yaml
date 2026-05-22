@@ -423,7 +423,7 @@ spec:
           ) &
           echo "trainer memory monitor writing to ${MEM_LOG}"
           POD_IP="$(hostname -I | awk '{print $1}')"
-          ray start --head --node-ip-address="${POD_IP}" --port=6379 --num-gpus=4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+          ray start --head --node-ip-address="${POD_IP}" --port=6379 --num-gpus=0 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
           sleep infinity
       resources:
         claims:
@@ -432,7 +432,6 @@ spec:
           cpu: "48"
           memory: "768Gi"
           ephemeral-storage: "800Gi"
-          nvidia.com/gpu: "4"
           networking.gke.io.networks/rdma-0: "1"
           networking.gke.io.networks/rdma-1: "1"
           networking.gke.io.networks/rdma-2: "1"
@@ -441,7 +440,6 @@ spec:
           cpu: "64"
           memory: "832Gi"
           ephemeral-storage: "800Gi"
-          nvidia.com/gpu: "4"
           networking.gke.io.networks/rdma-0: "1"
           networking.gke.io.networks/rdma-1: "1"
           networking.gke.io.networks/rdma-2: "1"
@@ -505,7 +503,7 @@ metadata:
     app: warnold-swepro-trainer-worker
     owner: warnold
 spec:
-  replicas: 3
+  replicas: 8
   strategy:
     type: RollingUpdate
     rollingUpdate:

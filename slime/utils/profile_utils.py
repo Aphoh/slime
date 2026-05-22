@@ -16,7 +16,7 @@ class TrainProfiler:
         self._torch_profiler_overall = None
         self._memory_profiler_overall = None
 
-        if args.use_pytorch_profiler and ("train_overall" in args.profile_target):
+        if args.use_pytorch_profiler and _profile_rank_enabled(args) and ("train_overall" in args.profile_target):
             self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
 
         if args.record_memory_history and ("train_overall" in args.profile_target):
@@ -39,22 +39,50 @@ class TrainProfiler:
             self._memory_profiler_overall.stop()
 
     def iterate_train_actor(self, iterator):
-        return _profile_simple_loop(iterator, self.args, name="train_actor")
+        return profile_iterable(iterator, self.args, name="train_actor")
 
     def iterate_train_log_probs(self, iterator):
-        return _profile_simple_loop(iterator, self.args, name="train_log_probs")
+        return profile_iterable(iterator, self.args, name="train_log_probs")
 
 
-def _profile_simple_loop(iterator, args, name):
-    if not (args.use_pytorch_profiler and (name in args.profile_target)):
+def profile_iterable(iterator, args, name):
+    if not (args.use_pytorch_profiler and _profile_rank_enabled(args) and (name in args.profile_target)):
         yield from iterator
         return
 
+    rank = _distributed_rank()
+    logger.info(
+        "Starting PyTorch profiler target=%s rank=%s trace_dir=%s steps=[%s,%s)",
+        name,
+        rank,
+        args.tensorboard_dir,
+        args.profile_step_start,
+        args.profile_step_end,
+    )
     torch_profiler = _create_torch_profiler(args, name=name)
     torch_profiler.start()
-    for item in iterator:
-        yield item
-        torch_profiler.step()
+    try:
+        for item in iterator:
+            yield item
+            torch_profiler.step()
+    finally:
+        torch_profiler.stop()
+        logger.info("Stopped PyTorch profiler target=%s rank=%s", name, rank)
+
+
+def _profile_rank_enabled(args):
+    profile_ranks = getattr(args, "profile_ranks", None)
+    if profile_ranks is None:
+        return True
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0 in profile_ranks
+    return torch.distributed.get_rank() in profile_ranks
+
+
+def _distributed_rank():
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0
+    return torch.distributed.get_rank()
 
 
 def _create_torch_profiler(args, name):
@@ -68,7 +96,7 @@ def _create_torch_profiler(args, name):
         ),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(
             args.tensorboard_dir,
-            worker_name=f"{name}_rank_{torch.distributed.get_rank()}",
+            worker_name=f"{name}_rank_{_distributed_rank()}",
             use_gzip=True,
         ),
         record_shapes=True,

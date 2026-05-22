@@ -29,6 +29,7 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.profile_utils import profile_iterable
 from slime.utils.speedscope_trace import trace_span
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -400,7 +401,7 @@ def forward_only(
         disable=_disable_tqdm_for_non_main_rank(),
     )
     forward_step_with_progress = _wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar)
-    for step_id in range(num_steps_per_rollout):
+    for step_id in profile_iterable(range(num_steps_per_rollout), args, "train_log_probs"):
         forward_data_store += forward_backward_func(
             forward_step_func=forward_step_with_progress,
             data_iterator=data_iterator,
@@ -775,7 +776,7 @@ def train(
     )
 
     # Run training iterations till done.
-    for step_id in range(num_steps_per_rollout):
+    for step_id in profile_iterable(range(num_steps_per_rollout), args, "train_actor"):
 
         # Run training step.
         loss_dict, grad_norm = train_one_step(
