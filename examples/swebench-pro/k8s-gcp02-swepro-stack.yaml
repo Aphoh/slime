@@ -733,12 +733,13 @@ spec:
           export UCX_KEEPALIVE_INTERVAL=300s
           export NCCL_CUMEM_ENABLE=1
           export NCCL_CUMEM_HOST_ENABLE=1
-          export NCCL_MNNVL_ENABLE=1
+          export NCCL_MNNVL_ENABLE=0
           export NCCL_NVLS_ENABLE=1
           export NCCL_STORE_TIMEOUT=7200
           export NCCL_IB_GID_INDEX=3
-          export NCCL_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3
+          export NCCL_IB_HCA=mlx5_0
           export NCCL_IB_MERGE_NICS=0
+          export NCCL_CROSS_NIC=0
           export NCCL_P2P_PXN_LEVEL=1
           export NCCL_GRAPH_MIXING_SUPPORT=0
           export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
