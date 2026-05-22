@@ -52,16 +52,16 @@ def test_default_log_probs_chunk_size_is_throughput_oriented():
     assert profile_env["SWEPRO_LOG_PROBS_CHUNK_SIZE"] == "512"
 
 
-def test_qwen35_command_matches_397b_dispatcher_shape():
+def test_qwen35_command_uses_upstream_packed_sequence_shape():
     launch = _load_launch_module()
     env = {
         "SWEPRO_RUN_ID": "run-123",
         "SWEPRO_RAY_SUBMISSION_ID": "run-123",
         "SWEPRO_DURABLE_LOGS": "0",
         "SWEPRO_MODEL_ARGS_SCRIPT": "scripts/models/qwen3.5-122B-A10B.sh",
-        "SWEPRO_QKV_FORMAT": "bshd",
+        "SWEPRO_QKV_FORMAT": "thd",
         "SWEPRO_USE_DYNAMIC_BATCH_SIZE": "0",
-        "SWEPRO_MOE_TOKEN_DISPATCHER_TYPE": "allgather",
+        "SWEPRO_MOE_TOKEN_DISPATCHER_TYPE": "alltoall",
         "SLIME_SKIP_WEIGHT_UPDATES": "1",
     }
 
@@ -78,12 +78,12 @@ def test_qwen35_command_matches_397b_dispatcher_shape():
         create_dirs=False,
     )
 
-    assert model_args[model_args.index("--moe-token-dispatcher-type") + 1] == "allgather"
+    assert model_args[model_args.index("--moe-token-dispatcher-type") + 1] == "alltoall"
     assert launch.runtime_env(env, REPO_ROOT, "0")["env_vars"]["SLIME_SKIP_WEIGHT_UPDATES"] == "1"
-    assert command[command.index("--qkv-format") + 1] == "bshd"
+    assert command[command.index("--qkv-format") + 1] == "thd"
     assert "--use-dynamic-batch-size" not in command
     assert "--micro-batch-size" in command
-    assert command[command.index("--moe-token-dispatcher-type") + 1] == "allgather"
+    assert command[command.index("--moe-token-dispatcher-type") + 1] == "alltoall"
 
 
 def test_runtime_env_defaults_to_unbounded_agent_turns_and_turn_tokens():
