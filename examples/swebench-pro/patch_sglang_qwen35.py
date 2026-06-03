@@ -163,16 +163,37 @@ class NetworkAddress:
     )
 
 
+def ensure_observability_trace_shim(root: Path) -> None:
+    """Backfill the SGLang observability trace hook expected by Dynamo main."""
+
+    package_dir = root / "srt" / "observability"
+    package_dir.mkdir(exist_ok=True)
+    init_path = package_dir / "__init__.py"
+    init_path.touch(exist_ok=True)
+
+    trace_path = package_dir / "trace.py"
+    if trace_path.exists():
+        return
+    trace_path.write_text(
+        '''def set_global_trace_level(*args, **kwargs):
+    return None
+'''
+    )
+
+
 def verify() -> None:
     from sglang.srt.configs.qwen3_5 import Qwen3_5MoeConfig
+    from sglang.srt.observability.trace import set_global_trace_level
     from sglang.srt.utils.network import NetworkAddress
 
     cfg = Qwen3_5MoeConfig(text_config={"num_attention_heads": 32})
     assert hasattr(cfg.text_config, "num_attention_heads")
     assert NetworkAddress.parse("tcp://127.0.0.1:1234").to_tcp() == "tcp://127.0.0.1:1234"
     assert NetworkAddress("127.0.0.1", 1234).to_host_port_str() == "127.0.0.1:1234"
+    assert set_global_trace_level() is None
 
     if os.environ.get("SGLANG_QWEN35_IMPORT_VERIFY") == "1":
+        import dynamo.sglang.main  # noqa: F401
         import dynamo.sglang.publisher  # noqa: F401
         import dynamo.sglang.register  # noqa: F401
         import sglang.srt.layers.attention.vision  # noqa: F401
@@ -186,6 +207,7 @@ def main() -> None:
     patch_vision_fa3_import(root)
     ensure_decord_stub(root)
     ensure_network_utils_shim(root)
+    ensure_observability_trace_shim(root)
     verify()
     print("patched SGLang Qwen3.5 compatibility")
 
