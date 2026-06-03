@@ -1423,6 +1423,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="torch",
             )
             reset_arg(parser, "--record-memory-history", action="store_true", default=False)
+            parser.add_argument(
+                "--mock-trainer-tokens-per-second",
+                type=float,
+                default=None,
+                help=(
+                    "When using rollout_with_mock_trainer, sleep for train_tokens / this value to model trainer time. "
+                    "Unset or non-positive disables the mock trainer sleep."
+                ),
+            )
+            parser.add_argument(
+                "--mock-weight-update-seconds",
+                type=float,
+                default=None,
+                help=(
+                    "When using rollout_with_mock_trainer, sleep this many seconds on update-weights intervals "
+                    "to model rollout weight-transfer time."
+                ),
+            )
             parser.add_argument("--check-weight-update-equal", action="store_true")
             return parser
 

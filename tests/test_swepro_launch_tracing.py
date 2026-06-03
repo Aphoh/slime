@@ -129,6 +129,42 @@ def test_optimizer_cpu_offload_is_on_by_default():
     assert "--use-precision-aware-optimizer --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d" in command_text
 
 
+def test_mock_trainer_mode_uses_rollout_only_with_mock_parameters():
+    launch = _load_launch_module()
+    env = {
+        "SWEPRO_RUN_ID": "run-123",
+        "SWEPRO_RAY_SUBMISSION_ID": "run-123",
+        "SWEPRO_DURABLE_LOGS": "0",
+        "SWEPRO_ROLLOUT_WITH_MOCK_TRAINER": "1",
+        "SWEPRO_MOCK_TRAINER_TOKENS_PER_SECOND": "7000",
+        "SWEPRO_MOCK_WEIGHT_UPDATE_SECONDS": "12.5",
+    }
+    derived = launch.derive_config(env)
+    durable_logs = launch.durable_log_config(env)
+
+    command = launch.build_command(
+        env,
+        REPO_ROOT,
+        derived,
+        durable_logs,
+        [],
+        "http://127.0.0.1:8265",
+        create_dirs=False,
+    )
+    runtime = launch.runtime_env(env, REPO_ROOT, "0")["env_vars"]
+
+    assert (
+        command[command.index("--rollout-function-path") + 1]
+        == "slime.rollout.fully_async_rollout.rollout_with_mock_trainer"
+    )
+    assert "--debug-rollout-only" in command
+    assert command[command.index("--mock-trainer-tokens-per-second") + 1] == "7000"
+    assert command[command.index("--mock-weight-update-seconds") + 1] == "12.5"
+    assert runtime["SWEPRO_ROLLOUT_WITH_MOCK_TRAINER"] == "1"
+    assert runtime["SWEPRO_MOCK_TRAINER_TOKENS_PER_SECOND"] == "7000"
+    assert runtime["SWEPRO_MOCK_WEIGHT_UPDATE_SECONDS"] == "12.5"
+
+
 def test_tachometer_config_discovers_expected_engine_count_and_writes_run_metrics():
     launch = _load_launch_module()
     env = {

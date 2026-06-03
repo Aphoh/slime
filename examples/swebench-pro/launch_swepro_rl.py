@@ -76,7 +76,7 @@ def apply_profile_defaults(env: dict[str, str], profile: str, repo_root: Path, *
         "DYNAMO_FRONTEND_URL": "http://warnold-swepro-frontend:3000",
         "SWEPRO_PROMPT_DATA": "/data/swebench-pro/swebench_pro_train_cached_images.jsonl",
         "SWEPRO_REF_LOAD": "/data/swebench-pro/checkpoints/GLM-4.7-Flash_torch_dist_tp1_pp1_cp8_ep8_shared_v4",
-        "SWEPRO_ROLLOUT_FUNCTION_PATH": "fully_async_rollout.generate_rollout_fully_async",
+        "SWEPRO_ROLLOUT_FUNCTION_PATH": "slime.rollout.fully_async_rollout.generate_rollout_fully_async",
         "SWEPRO_DISABLE_SAVE": "1",
         "SWEPRO_NUM_ROLLOUT": "10",
         "SWEPRO_ROLLOUT_BATCH_SIZE": "16",
@@ -359,6 +359,9 @@ def runtime_env(env: dict[str, str], repo_root: Path, has_nvlink: str) -> dict[s
         "SWEPRO_SESSION_ROLLOUT_RETRIES": env_str(env, "SWEPRO_SESSION_ROLLOUT_RETRIES", "0"),
         "SWEPRO_ASYNC_MAX_INFLIGHT": env.get("SWEPRO_ASYNC_MAX_INFLIGHT", ""),
         "SWEPRO_ASYNC_GROUP_MAX_ATTEMPTS": env_str(env, "SWEPRO_ASYNC_GROUP_MAX_ATTEMPTS", "1"),
+        "SWEPRO_ROLLOUT_WITH_MOCK_TRAINER": env.get("SWEPRO_ROLLOUT_WITH_MOCK_TRAINER", ""),
+        "SWEPRO_MOCK_TRAINER_TOKENS_PER_SECOND": env.get("SWEPRO_MOCK_TRAINER_TOKENS_PER_SECOND", ""),
+        "SWEPRO_MOCK_WEIGHT_UPDATE_SECONDS": env.get("SWEPRO_MOCK_WEIGHT_UPDATE_SECONDS", ""),
     }
     return {
         "env_vars": {key: value for key, value in env_vars.items() if value != ""}
@@ -407,6 +410,9 @@ def build_command(
             debug_args.append("--load-debug-rollout-data-with-updates")
     if load_debug_subsample := env.get("SWEPRO_LOAD_DEBUG_ROLLOUT_DATA_SUBSAMPLE"):
         debug_args.extend(["--load-debug-rollout-data-subsample", load_debug_subsample])
+    mock_trainer_enabled = env_flag(env, "SWEPRO_ROLLOUT_WITH_MOCK_TRAINER", False)
+    if mock_trainer_enabled:
+        debug_args.append("--debug-rollout-only")
     train_env_args: list[str] = []
     if train_env_vars := env.get("SWEPRO_TRAIN_ENV_VARS"):
         train_env_args.extend(["--train-env-vars", train_env_vars])
@@ -474,6 +480,20 @@ def build_command(
     if exp_avg_sq_dtype := env.get("SWEPRO_EXP_AVG_SQ_DTYPE"):
         optimizer_args.extend(["--exp-avg-sq-dtype", exp_avg_sq_dtype])
 
+    mock_trainer_args: list[str] = []
+    if mock_trainer_tps := env.get("SWEPRO_MOCK_TRAINER_TOKENS_PER_SECOND"):
+        mock_trainer_args.extend(["--mock-trainer-tokens-per-second", mock_trainer_tps])
+    if mock_weight_update_seconds := env.get("SWEPRO_MOCK_WEIGHT_UPDATE_SECONDS"):
+        mock_trainer_args.extend(["--mock-weight-update-seconds", mock_weight_update_seconds])
+
+    rollout_function_path = env_str(
+        env,
+        "SWEPRO_ROLLOUT_FUNCTION_PATH",
+        "slime.rollout.fully_async_rollout.rollout_with_mock_trainer"
+        if mock_trainer_enabled
+        else "slime.rollout.sglang_rollout.generate_rollout",
+    )
+
     train_args = [
         "python3",
         "train_async.py",
@@ -491,7 +511,7 @@ def build_command(
         "--rollout-backend",
         "dynamo",
         "--rollout-function-path",
-        env_str(env, "SWEPRO_ROLLOUT_FUNCTION_PATH", "slime.rollout.sglang_rollout.generate_rollout"),
+        rollout_function_path,
         "--dynamo-frontend-url",
         env_str(env, "DYNAMO_FRONTEND_URL", "http://warnold-swepro-frontend:3000"),
         "--dynamo-worker-system-port",
@@ -553,6 +573,7 @@ def build_command(
         env_str(env, "SWEPRO_UPDATE_WEIGHT_BUFFER_SIZE", str(512 * 1024 * 1024)),
         "--distributed-timeout-minutes",
         env_str(env, "SWEPRO_DISTRIBUTED_TIMEOUT_MINUTES", "30"),
+        *mock_trainer_args,
         "--recompute-granularity",
         "full",
         "--recompute-method",
