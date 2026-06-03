@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warnold-swepro-trainer
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-trainer
+    owner: warnold
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  imagePullSecrets:
+    - name: acr-token-secret
+  nodeSelector:
+    cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+    cloud.google.com/gke-nodepool: customer-gpu-w0e
+    nvidia.com/gpu.product: NVIDIA-GB200
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - warnold-swepro-trainer-worker
+          topologyKey: kubernetes.io/hostname
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                  - customer-gpu-w0e
+  tolerations:
+    - key: kubernetes.io/arch
+      operator: Equal
+      value: arm64
+      effect: NoSchedule
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: trainer
+      image: aphoh/slime:swepro-tp8-gatefix-20260514-1327
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+      command: ["bash", "-c"]
+      args:
+        - |
+          set -eu
+          ulimit -l unlimited
+          ulimit -n 1048576
+          mkdir -p /data/swebench-pro/runs
+          MEM_LOG="/data/swebench-pro/runs/trainer-memory-$(hostname).log"
+          (
+            while true; do
+              {
+                echo "===== $(date -Is) ====="
+                echo "--- cgroup memory ---"
+                for f in /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory.stat; do
+                  if [ -e "$f" ]; then
+                    echo "### $f"
+                    cat "$f"
+                  fi
+                done
+                echo "--- host meminfo ---"
+                grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|Shmem):' /proc/meminfo || true
+                echo "--- top rss processes ---"
+                ps -eo pid,ppid,rss,vsz,comm,args --sort=-rss | head -40 || true
+                echo "--- gpu memory ---"
+                nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits || true
+              } >> "${MEM_LOG}" 2>&1
+              sleep "${SWEPRO_TRAINER_MEM_LOG_INTERVAL:-30}"
+            done
+          ) &
+          echo "trainer memory monitor writing to ${MEM_LOG}"
+          POD_IP="$(hostname -I | awk '{print $1}')"
+          ray start --head --node-ip-address="${POD_IP}" --port=6379 --num-gpus=0 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+          sleep infinity
+      resources:
+        requests:
+          cpu: "48"
+          memory: 768Gi
+          ephemeral-storage: 800Gi
+        limits:
+          cpu: "64"
+          memory: 832Gi
+          ephemeral-storage: 800Gi
+      volumeMounts:
+        - name: model-cache
+          mountPath: /data
+        - name: code-cache
+          mountPath: /code
+        - name: shared-cache
+          mountPath: /shared
+        - name: shm
+          mountPath: /dev/shm
+        - name: scratch
+          mountPath: /scratch
+  volumes:
+    - name: model-cache
+      persistentVolumeClaim:
+        claimName: model-cache
+    - name: code-cache
+      persistentVolumeClaim:
+        claimName: code-cache
+    - name: shared-cache
+      persistentVolumeClaim:
+        claimName: shared-model-cache
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
+    - name: scratch
+      emptyDir: {}

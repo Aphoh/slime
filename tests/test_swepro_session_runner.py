@@ -72,6 +72,30 @@ def _trace_context():
     }
 
 
+def test_extract_submission_and_patch_diagnostics():
+    runner = _load_session_runner()
+    patch = (
+        "diff --git a/pkg/foo.py b/pkg/foo.py\n"
+        "--- a/pkg/foo.py\n"
+        "+++ b/pkg/foo.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    observation = f"review\n{runner.SUBMISSION_MARKER}\n{patch}{runner.SUBMISSION_MARKER}\n"
+
+    submission = runner._extract_submission(observation)
+    diagnostics = runner._patch_diagnostics(submission or "", observation=observation)
+
+    assert submission == patch
+    assert diagnostics["patch_chars"] == len(patch)
+    assert diagnostics["patch_starts_with_diff"] is True
+    assert diagnostics["patch_file_count"] == 1
+    assert diagnostics["patch_files_preview"] == ["pkg/foo.py"]
+    assert diagnostics["submission_marker_count"] == 2
+    assert len(diagnostics["patch_sha256"]) == 16
+
+
 def test_step_drops_session_when_deployment_disappears():
     runner = _load_session_runner()
 
@@ -270,7 +294,7 @@ async def _health_completes_while_step_is_blocked(*, shared_semaphore: bool) -> 
     try:
         await asyncio.wait_for(asyncio.shield(health_task), timeout=0.1)
         health_completed = True
-    except TimeoutError:
+    except asyncio.TimeoutError:
         health_completed = False
     finally:
         manager.release_step.set()

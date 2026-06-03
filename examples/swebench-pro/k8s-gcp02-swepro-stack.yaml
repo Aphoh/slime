@@ -22,7 +22,13 @@ spec:
       containers:
         - name: nats
           image: nats:2.10-alpine
-          args: ["-js", "-m", "8222"]
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              POD_LOG_DIR="/data/swebench-pro/pod-logs/$(hostname)"
+              mkdir -p "${POD_LOG_DIR}"
+              nats-server -js -m 8222 2>&1 | tee -a "${POD_LOG_DIR}/nats.log"
           ports:
             - containerPort: 4222
               name: client
@@ -35,6 +41,13 @@ spec:
             limits:
               cpu: "2"
               memory: "2Gi"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /data
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
 ---
 apiVersion: resource.nvidia.com/v1beta1
 kind: ComputeDomain
@@ -93,12 +106,15 @@ spec:
       args:
         - |
           set -eu
+          POD_LOG_DIR="/data/swebench-pro/pod-logs/$(hostname)"
+          mkdir -p "${POD_LOG_DIR}"
+          exec > >(tee -a "${POD_LOG_DIR}/frontend.log") 2>&1
           rm -rf /tmp/warnold-swepro-etcd
           etcd \
             --data-dir /tmp/warnold-swepro-etcd \
             --listen-client-urls http://0.0.0.0:2379 \
             --advertise-client-urls http://warnold-swepro-frontend:2379 \
-            >/tmp/etcd.log 2>&1 &
+            >"${POD_LOG_DIR}/etcd.log" 2>&1 &
           sleep 3
           export DYN_DISCOVERY_BACKEND=etcd
           export ETCD_ENDPOINTS=http://warnold-swepro-frontend:2379
@@ -242,6 +258,9 @@ spec:
           args:
             - |
               set -eu
+              POD_LOG_DIR="/data/swebench-pro/pod-logs/$(hostname)"
+              mkdir -p "${POD_LOG_DIR}"
+              exec > >(tee -a "${POD_LOG_DIR}/session.log") 2>&1
               apt-get update
               apt-get install -y --no-install-recommends git ca-certificates docker.io docker-cli
               DOCKER_GRAPH_ROOT="/var/lib/docker"
@@ -252,7 +271,7 @@ spec:
                 --data-root="${DOCKER_GRAPH_ROOT}" \
                 --registry-mirror=http://warnold-dockerhub-cache:5000 \
                 --insecure-registry=warnold-dockerhub-cache:5000 \
-                > /tmp/dockerd.log 2>&1 &
+                > "${POD_LOG_DIR}/dockerd.log" 2>&1 &
               for i in $(seq 1 60); do
                 docker info >/dev/null 2>&1 && break
                 sleep 2
@@ -396,10 +415,30 @@ spec:
       args:
         - |
           set -eu
+          POD_LOG_DIR="/data/swebench-pro/pod-logs/$(hostname)"
+          mkdir -p "${POD_LOG_DIR}"
+          exec > >(tee -a "${POD_LOG_DIR}/trainer.log") 2>&1
           ulimit -l unlimited
           ulimit -n 1048576
           mkdir -p /data/swebench-pro/runs
-          MEM_LOG="/data/swebench-pro/runs/trainer-memory-$(hostname).log"
+          start_ray_log_sync() {
+            (
+              while true; do
+                dest="${POD_LOG_DIR}/ray-logs"
+                mkdir -p "${dest}"
+                if [ -d /tmp/ray/session_latest/logs ]; then
+                  find /tmp/ray/session_latest/logs -maxdepth 1 -type f \
+                    \( -name "job-driver-*.log" -o -name "worker-*.err" -o -name "worker-*.out" -o -name "raylet.*" -o -name "dashboard*.log" -o -name "runtime_env*.log" -o -name "ray_process_exit.log" \) \
+                    -print0 | while IFS= read -r -d '' file; do
+                      cp -u "$file" "${dest}/$(basename "$file")" 2>/dev/null || true
+                    done
+                fi
+                sleep "${SWEPRO_POD_LOG_SYNC_INTERVAL:-30}"
+              done
+            ) &
+          }
+          start_ray_log_sync
+          MEM_LOG="${POD_LOG_DIR}/memory.log"
           (
             while true; do
               {
@@ -566,10 +605,30 @@ spec:
           args:
             - |
               set -eu
+              POD_LOG_DIR="/data/swebench-pro/pod-logs/$(hostname)"
+              mkdir -p "${POD_LOG_DIR}"
+              exec > >(tee -a "${POD_LOG_DIR}/trainer-worker.log") 2>&1
               ulimit -l unlimited
               ulimit -n 1048576
               mkdir -p /data/swebench-pro/runs
-              MEM_LOG="/data/swebench-pro/runs/trainer-memory-$(hostname).log"
+              start_ray_log_sync() {
+                (
+                  while true; do
+                    dest="${POD_LOG_DIR}/ray-logs"
+                    mkdir -p "${dest}"
+                    if [ -d /tmp/ray/session_latest/logs ]; then
+                      find /tmp/ray/session_latest/logs -maxdepth 1 -type f \
+                        \( -name "job-driver-*.log" -o -name "worker-*.err" -o -name "worker-*.out" -o -name "raylet.*" -o -name "dashboard*.log" -o -name "runtime_env*.log" -o -name "ray_process_exit.log" \) \
+                        -print0 | while IFS= read -r -d '' file; do
+                          cp -u "$file" "${dest}/$(basename "$file")" 2>/dev/null || true
+                        done
+                    fi
+                    sleep "${SWEPRO_POD_LOG_SYNC_INTERVAL:-30}"
+                  done
+                ) &
+              }
+              start_ray_log_sync
+              MEM_LOG="${POD_LOG_DIR}/memory.log"
               (
                 while true; do
                   {
@@ -719,6 +778,9 @@ spec:
       args:
         - |
           set -eu
+          POD_LOG_DIR="/data/swebench-pro/pod-logs/$(hostname)"
+          mkdir -p "${POD_LOG_DIR}"
+          exec > >(tee -a "${POD_LOG_DIR}/engine.log") 2>&1
           ulimit -l unlimited
           ulimit -n 1048576
           export DYN_DISCOVERY_BACKEND=etcd
@@ -794,6 +856,7 @@ spec:
             --host 0.0.0.0 \
             --trust-remote-code \
             --enable-rl \
+            --enable-metrics \
             --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}' \
             "${engine_args[@]}" \
             --mem-fraction-static ENGINE_MEM_FRACTION_STATIC_PLACEHOLDER

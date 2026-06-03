@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import json
 import os
 import shutil
@@ -16,6 +17,9 @@ from typing import Any
 
 import docker
 from nats.aio.client import Client as NATS
+
+EVAL_TRACE_LOG_PREFIX = "SWEPRO_EVAL_TRACE"
+TEST_PREVIEW_LIMIT = 50
 
 
 def _json_default(value):
@@ -77,6 +81,10 @@ def _tail(path: Path, limit: int = 8000) -> str:
     except FileNotFoundError:
         return ""
     return text[-limit:]
+
+
+def _eval_result_summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in result.items() if key not in {"tests", "stdout_tail", "stderr_tail"}}
 
 
 def evaluate_request(request: dict[str, Any], *, eval_root: Path, work_root: Path, output_root: Path, timeout: int) -> dict[str, Any]:
@@ -146,20 +154,36 @@ def evaluate_request(request: dict[str, Any], *, eval_root: Path, work_root: Pat
     shutil.copyfile(workspace_dir / "stderr.log", run_output_dir / f"{request_id}_stderr.log") if (workspace_dir / "stderr.log").exists() else None
     shutil.copyfile(output_path, run_output_dir / f"{request_id}_output.json") if output_path.exists() else None
 
-    passed_tests = {test.get("name") for test in output.get("tests", []) if test.get("status") == "PASSED"}
+    tests = output.get("tests", [])
+    status_counts = collections.Counter(test.get("status") or "UNKNOWN" for test in tests)
+    passed_tests = {test.get("name") for test in tests if test.get("status") == "PASSED"}
+    failed_tests = [test.get("name") for test in tests if test.get("status") != "PASSED"]
     required = set(request.get("fail_to_pass") or []) | set(request.get("pass_to_pass") or [])
-    passed = bool(required) and required <= passed_tests and status_code == 0 and error is None
+    missing_required_tests = sorted(test for test in required - passed_tests if test)
+    passed = bool(required) and not missing_required_tests and status_code == 0 and error is None
 
-    return {
+    result = {
         "request_id": request_id,
         "instance_id": instance_id,
         "passed": passed,
         "status_code": status_code,
-        "tests": output.get("tests", []),
+        "tests": tests,
+        "test_status_counts": dict(status_counts),
+        "required_test_count": len(required),
+        "missing_required_count": len(missing_required_tests),
+        "missing_required_tests": missing_required_tests[:TEST_PREVIEW_LIMIT],
+        "failed_tests_preview": failed_tests[:TEST_PREVIEW_LIMIT],
+        "patch_chars": len(patch),
         "stdout_tail": _tail(workspace_dir / "stdout.log"),
         "stderr_tail": _tail(workspace_dir / "stderr.log"),
         "error": error,
     }
+    summary = _eval_result_summary(result)
+    (run_output_dir / f"{request_id}_result.json").write_text(
+        json.dumps(summary, default=_json_default, indent=2, sort_keys=True)
+    )
+    print(f"{EVAL_TRACE_LOG_PREFIX} {json.dumps(summary, default=_json_default, sort_keys=True)}", flush=True)
+    return result
 
 
 async def main() -> None:
