@@ -76,14 +76,13 @@ def start_dynamo_frontend(args, *, has_pd_disaggregation: bool = False, force_ne
 
     if router_mode == "kv":
         # Real KV events from workers (via NATS) give the most accurate tree,
-        # but arrive too late for same-burst sibling requests. predict-on-route
-        # closes that gap by speculatively inserting the routed request's
-        # blocks with a short TTL; the engine's real event later promotes the
-        # entry via TTL-upgrade semantics.
+        # but arrive too late for same-burst sibling requests. Dynamo main
+        # now enables route-time speculative inserts by setting a short
+        # predicted TTL; the engine's real event later promotes the entry via
+        # TTL-upgrade semantics.
         if not getattr(args, "dynamo_router_kv_events", True):
             cmd.append("--no-router-kv-events")
         if getattr(args, "dynamo_router_predict_on_route", True):
-            cmd.append("--router-predict-on-route")
             ttl = getattr(args, "dynamo_router_predicted_ttl_secs", None)
             if ttl is not None:
                 cmd.extend(["--router-predicted-ttl-secs", str(ttl)])

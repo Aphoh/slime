@@ -60,6 +60,10 @@ spec:
           export NIXL_TELEMETRY_ENABLE=y
           export NIXL_TELEMETRY_EXPORTER=prometheus
           export NIXL_TELEMETRY_PROMETHEUS_PORT=19090
+          KV_EVENTS_ARGS=()
+          if [ "${SWEPRO_DYNAMO_ROUTER_KV_EVENTS:-1}" != "0" ]; then
+            KV_EVENTS_ARGS+=(--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}')
+          fi
           exec python3 -m dynamo.sglang \
             --model-path /shared/Qwen3.5-122B-A10B \
             --tp 2 \
@@ -67,7 +71,7 @@ spec:
             --host 0.0.0.0 \
             --trust-remote-code \
             --enable-rl \
-            --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}' \
+            "${KV_EVENTS_ARGS[@]}" \
             --page-size 64 \
             --attention-backend trtllm_mha \
             --moe-runner-backend "${SGLANG_QWEN35_MOE_RUNNER_BACKEND:-triton}" \
