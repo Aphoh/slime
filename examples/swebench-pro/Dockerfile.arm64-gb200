@@ -5,6 +5,7 @@ ARG DYNAMO_COMMIT="main"
 ARG DYNAMO_EXTRA_FETCH_REF=""
 ARG DYNAMO_CHERRY_PICK=""
 ARG CARGO_BUILD_JOBS="16"
+ARG TACHOMETER_SCRAPER_IMAGE="ghcr.io/nvidia-dev/warnold-tachometer-scraper:latest"
 
 FROM ubuntu:24.04 AS builder
 
@@ -48,10 +49,13 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     mkdir -p /build/dist && \
     cp target/wheels/*.whl /build/dist/
 
+FROM ${TACHOMETER_SCRAPER_IMAGE} AS tachometer_scraper
+
 FROM ${BASE_IMAGE}
 
 COPY --from=builder /build/dynamo /opt/dynamo
 COPY --from=builder /build/dist/*.whl /tmp/
+COPY --from=tachometer_scraper /usr/local/bin/tachometer-scraper /usr/local/bin/tachometer-scraper
 COPY . /code/slime
 
 RUN pip install --no-cache-dir /tmp/*.whl && \

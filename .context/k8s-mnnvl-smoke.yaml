@@ -1,0 +1,227 @@
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: warnold-mnnvl-smoke-compute-domain
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-mnnvl-smoke
+    owner: warnold
+spec:
+  channel:
+    resourceClaimTemplate:
+      name: warnold-mnnvl-smoke-compute-domain-channel
+  numNodes: 2
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warnold-mnnvl-smoke-source
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-mnnvl-smoke
+    role: source
+    owner: warnold
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"rdma0","network":"rdma-0"},
+        {"interfaceName":"rdma1","network":"rdma-1"},
+        {"interfaceName":"rdma2","network":"rdma-2"},
+        {"interfaceName":"rdma3","network":"rdma-3"}
+      ]
+spec:
+  restartPolicy: Never
+  resourceClaims:
+    - name: compute-domain-channel
+      resourceClaimTemplateName: warnold-mnnvl-smoke-compute-domain-channel
+  nodeSelector:
+    cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+    cloud.google.com/gke-nodepool: customer-gpu-w0e
+    nvidia.com/gpu.product: NVIDIA-GB200
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - warnold-mnnvl-smoke
+          topologyKey: kubernetes.io/hostname
+  tolerations:
+    - key: kubernetes.io/arch
+      operator: Equal
+      value: arm64
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-0
+      operator: Exists
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-1
+      operator: Exists
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-2
+      operator: Exists
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-3
+      operator: Exists
+      effect: NoSchedule
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: source
+      image: aphoh/slime:swepro-agent-context-v1-arm64-capfix-20260513-0605
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+      command: ["bash", "-lc"]
+      args:
+        - |
+          set -eu
+          ulimit -l unlimited
+          ulimit -n 1048576
+          sleep infinity
+      resources:
+        claims:
+          - name: compute-domain-channel
+        requests:
+          cpu: "8"
+          memory: 32Gi
+          ephemeral-storage: 100Gi
+          nvidia.com/gpu: "1"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
+        limits:
+          cpu: "16"
+          memory: 64Gi
+          ephemeral-storage: 100Gi
+          nvidia.com/gpu: "1"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: scratch
+          mountPath: /scratch
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
+    - name: scratch
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warnold-mnnvl-smoke-engine
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-mnnvl-smoke
+    role: engine
+    owner: warnold
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"rdma0","network":"rdma-0"},
+        {"interfaceName":"rdma1","network":"rdma-1"},
+        {"interfaceName":"rdma2","network":"rdma-2"},
+        {"interfaceName":"rdma3","network":"rdma-3"}
+      ]
+spec:
+  restartPolicy: Never
+  resourceClaims:
+    - name: compute-domain-channel
+      resourceClaimTemplateName: warnold-mnnvl-smoke-compute-domain-channel
+  nodeSelector:
+    cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+    cloud.google.com/gke-nodepool: customer-gpu-w0e
+    nvidia.com/gpu.product: NVIDIA-GB200
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - warnold-mnnvl-smoke
+          topologyKey: kubernetes.io/hostname
+  tolerations:
+    - key: kubernetes.io/arch
+      operator: Equal
+      value: arm64
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-0
+      operator: Exists
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-1
+      operator: Exists
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-2
+      operator: Exists
+      effect: NoSchedule
+    - key: networking.gke.io.networks/rdma-3
+      operator: Exists
+      effect: NoSchedule
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: engine
+      image: aphoh/slime:swepro-agent-context-v1-arm64-capfix-20260513-0605
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+      command: ["bash", "-lc"]
+      args:
+        - |
+          set -eu
+          ulimit -l unlimited
+          ulimit -n 1048576
+          sleep infinity
+      resources:
+        claims:
+          - name: compute-domain-channel
+        requests:
+          cpu: "8"
+          memory: 32Gi
+          ephemeral-storage: 100Gi
+          nvidia.com/gpu: "2"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
+        limits:
+          cpu: "16"
+          memory: 64Gi
+          ephemeral-storage: 100Gi
+          nvidia.com/gpu: "2"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-3: "1"
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: scratch
+          mountPath: /scratch
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
+    - name: scratch
+      emptyDir: {}

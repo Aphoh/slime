@@ -50,3 +50,46 @@ def test_turn_max_tokens_unlimited_still_respects_sampling_and_rollout_limits(mo
         )
         == 32768
     )
+
+
+def test_tool_call_stop_is_reinserted_into_assistant_history_text():
+    content = "thinking<tool_call><function=bash></function>"
+    tool_calls = [{"function": {"name": "bash"}}]
+
+    assert generate_with_swebench_pro._assistant_content_for_history(content, tool_calls).endswith("</tool_call>")
+
+
+def test_tool_call_stop_is_not_duplicated_when_backend_returns_it():
+    content = "thinking<tool_call><function=bash></function></tool_call>"
+    tool_calls = [{"function": {"name": "bash"}}]
+
+    assert generate_with_swebench_pro._assistant_content_for_history(content, tool_calls).count("</tool_call>") == 1
+
+
+def test_submission_trace_fields_include_patch_file_preview():
+    patch = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n"
+        "+++ b/src/a.py\n"
+        "@@ -1 +1 @@\n"
+        "-a\n"
+        "+b\n"
+    )
+
+    fields = generate_with_swebench_pro._submission_trace_fields(patch)
+
+    assert fields["patch_chars"] == len(patch)
+    assert fields["patch_starts_with_diff"] is True
+    assert fields["patch_file_count"] == 1
+    assert fields["patch_files_preview"] == ["src/a.py"]
+    assert len(fields["patch_sha256"]) == 16
+
+
+def test_submission_trace_fields_prefers_session_worker_diagnostics():
+    fields = generate_with_swebench_pro._submission_trace_fields(
+        "",
+        {"patch_diagnostics": {"patch_chars": 12, "submission_marker_count": 2}},
+    )
+
+    assert fields["patch_chars"] == 12
+    assert fields["submission_marker_count"] == 2

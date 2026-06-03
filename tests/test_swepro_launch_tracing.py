@@ -1,5 +1,11 @@
 import importlib.util
+import json
+import os
+import subprocess
 import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 
@@ -123,15 +129,106 @@ def test_optimizer_cpu_offload_is_on_by_default():
     assert "--use-precision-aware-optimizer --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d" in command_text
 
 
+def test_tachometer_config_discovers_expected_engine_count_and_writes_run_metrics():
+    launch = _load_launch_module()
+    env = {
+        "SWEPRO_RUN_ID": "run-123",
+        "SWEPRO_ROLLOUT_NUM_GPUS": "8",
+        "SWEPRO_ROLLOUT_NUM_GPUS_PER_ENGINE": "2",
+    }
+    durable_logs = launch.durable_log_config(env)
+    tachometer = launch.tachometer_config(env)
+
+    script = launch.tachometer_collector_script(
+        durable_logs,
+        tachometer,
+        "http://127.0.0.1:8265",
+        "http://warnold-swepro-frontend:3000",
+    )
+
+    assert tachometer.expected_engines == 4
+    assert "expected_engines=4" in script
+    assert "tachometer-scraper.toml" in script
+    assert "tachometer-data" in script
+    assert "frontend_url=http://warnold-swepro-frontend:3000" in script
+    assert 'f"{frontend_url}/metrics"' in script
+    assert "http://warnold-swepro-trainer:8265/metrics" in script
+    assert "dynamo_engine_{idx}" in script
+    assert "@@" not in script
+    assert "{{" not in script
+    assert "}}" not in script
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(
+                {
+                    "instances": [
+                        {"endpoint": "generate", "instance_id": 0, "transport": {"tcp": "10.0.0.1:30001/a"}},
+                        {"endpoint": "generate", "instance_id": 1, "transport": {"tcp": "10.0.0.2:30001/a"}},
+                        {"endpoint": "generate", "instance_id": 2, "transport": {"tcp": "10.0.0.3:30001/a"}},
+                        {"endpoint": "generate", "instance_id": 3, "transport": {"tcp": "10.0.0.4:30001/a"}},
+                    ]
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "tachometer.toml"
+            discovery_path = Path(tmp) / "workers.json"
+            python_source = script.split('python3 - <<\'PY\' >> "$scraper_log" 2>&1\n', 1)[1].split("\nPY\n", 1)[0]
+            env = dict(os.environ)
+            env.update({
+                "RUN_ID": "run-123",
+                "FRONTEND_URL": f"http://127.0.0.1:{server.server_port}",
+                "EXPECTED_ENGINES": "4",
+                "DYN_SYSTEM_PORT": "30001",
+                "NIXL_PORT": "19090",
+                "FREQUENCY": "0.5",
+                "ROWS_PER_PARQUET": "1000000",
+                "SAVE_INTERVAL_SECS": "5",
+                "DISCOVERY_TIMEOUT": "1",
+                "CONFIG_PATH": str(config_path),
+                "STORAGE_PATH": str(Path(tmp) / "tachometer-data"),
+                "DISCOVERY_JSON": str(discovery_path),
+            })
+            subprocess.run(["python3", "-c", python_source], env=env, check=True)
+            config_text = config_path.read_text()
+            assert config_text.startswith("storage = ")
+            assert "\\nrows_per_parquet" not in config_text
+            assert config_text.count("[[endpoints]]") == 10
+            assert '"endpoint" = "dynamo_engine"' in config_text
+            assert '"endpoint" = "nixl"' in config_text
+    finally:
+        server.shutdown()
+
+
 def test_k8s_stack_exposes_dynamo_agent_trace_port_and_session_dependencies():
     text = K8S_STACK_PATH.read_text()
+    dockerfile = (REPO_ROOT / "examples" / "swebench-pro" / "Dockerfile.arm64-gb200").read_text()
 
     assert "DYN_AGENT_TRACE_SINKS=jsonl_gz" in text
     assert "DYN_AGENT_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT=tcp://0.0.0.0:20390" in text
     assert "port: 20390" in text
+    assert "/data/swebench-pro/pod-logs/$(hostname)" in text
+    assert "start_ray_log_sync" in text
+    assert "nats-server -js -m 8222 2>&1 | tee" in text
+    assert "--enable-metrics" in text
     assert "python3 -m pip install --quiet nats-py docker pyyaml pyzmq msgpack" in text
     assert "COPY dynamo_agent_trace.py /opt/swepro-session/dynamo_agent_trace.py" in (
         REPO_ROOT / "docker" / "swepro-session" / "Dockerfile"
     ).read_text()
+    assert "COPY --from=tachometer_scraper /usr/local/bin/tachometer-scraper" in dockerfile
     assert "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT" in text
     assert "SWEPRO_SPEEDSCOPE_TRACE_PATH" not in text

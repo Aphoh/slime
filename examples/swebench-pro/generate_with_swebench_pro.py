@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import itertools
 import json
 import logging
@@ -36,6 +37,7 @@ from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 AGENT_TRACE_LOG_PREFIX = "SWEPRO_AGENT_TRACE"
+PATCH_FILE_PREVIEW_LIMIT = 20
 
 _MODEL: DirectCompletionsModel | None = None
 _MASK_GENERATOR: MultiTurnLossMaskGenerator | None = None
@@ -303,6 +305,35 @@ def _parse_tool_call_from_generated_tokens(
     matched_stop_token_ids: list[int],
 ) -> tuple[str, list[dict[str, Any]], bool]:
     return parse_glm_tool_call_from_completion(model.tokenizer, content, generated_ids, matched_stop_token_ids)
+
+
+def _assistant_content_for_history(content: str, tool_calls: list[dict[str, Any]]) -> str:
+    if tool_calls and TOOL_CALL_END not in content:
+        return content + TOOL_CALL_END
+    return content
+
+
+def _local_patch_trace_fields(submission: str) -> dict[str, Any]:
+    patch_bytes = submission.encode("utf-8", errors="backslashreplace")
+    files = [
+        match.group(2)
+        for match in re.finditer(r"^diff --git a/(.*?) b/(.*?)$", submission, flags=re.MULTILINE)
+    ]
+    return {
+        "patch_chars": len(submission),
+        "patch_sha256": hashlib.sha256(patch_bytes).hexdigest()[:16] if submission else "",
+        "patch_starts_with_diff": submission.lstrip().startswith("diff --git"),
+        "patch_file_count": len(files),
+        "patch_files_preview": files[:PATCH_FILE_PREVIEW_LIMIT],
+    }
+
+
+def _submission_trace_fields(submission: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
+    fields = _local_patch_trace_fields(submission)
+    if isinstance(result, dict) and isinstance(result.get("patch_diagnostics"), dict):
+        fields.update(result["patch_diagnostics"])
+        fields.setdefault("patch_chars", len(submission))
+    return fields
 
 
 def _tool_observation_delta_ids(model: DirectCompletionsModel, observation: str) -> list[int]:
@@ -673,7 +704,6 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
             stop_reason = extra.get("stop_reason")
             matched_stop_token_ids = stop_reason_token_ids(stop_reason, model.tokenizer)
 
-            content_for_history = content
             normal_text, tool_calls, needs_tool_close = _parse_tool_call_from_generated_tokens(
                 model,
                 content,
@@ -700,15 +730,14 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 parsed_tool_names=[_tool_call_name(tool_call) for tool_call in tool_calls],
                 needs_tool_close=needs_tool_close,
             )
-            if tool_calls and TOOL_CALL_END not in content_for_history:
-                content_for_history = content_for_history + TOOL_CALL_END
+            content_for_history = _assistant_content_for_history(content, tool_calls)
             if needs_tool_close:
                 stop_closer_ids = [model.tool_token_ids.tool_close]
             else:
                 stop_closer_ids = []
 
             messages.append({"role": "assistant", "content": content_for_history})
-            response_text_parts.append(content)
+            response_text_parts.append(content_for_history)
             response_token_ids.extend(generated_ids)
             loss_mask.extend([1] * len(generated_ids))
             rollout_log_probs.extend(float(x) for x in generated_logprobs)
@@ -804,6 +833,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 submitted=submitted,
                 tool_error=step.get("tool_error"),
                 session_dropped=step.get("session_dropped"),
+                **_submission_trace_fields(step.get("submission") or "", step),
             )
             if step.get("session_dropped"):
                 finish_reason = "session_dropped"
@@ -834,7 +864,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                         session_id=session_id,
                         turn=turn,
                         reason="tool_reported_submitted_without_patch",
-                        patch_chars=len(submission),
+                        **_submission_trace_fields(submission, submit_result),
                     )
                 break
 
@@ -887,7 +917,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 instance_id=instance_id,
                 session_id=session_id,
                 reason="fallback_no_submission",
-                patch_chars=len(submission),
+                **_submission_trace_fields(submission, submit_result),
             )
 
     except Exception as exc:
@@ -988,7 +1018,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
         status=final_status or (Sample.Status.TRUNCATED if finish_reason == "length" else Sample.Status.COMPLETED),
         response_tokens=len(response_token_ids),
         trainable_tokens=sum(loss_mask),
-        patch_chars=len(submission),
+        **_submission_trace_fields(submission),
     )
     return _finalize_sweagent_session_sample(
         sample,

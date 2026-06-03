@@ -151,6 +151,20 @@ class DurableLogConfig:
     poll_seconds: int
 
 
+@dataclass(frozen=True)
+class TachometerConfig:
+    enabled: bool
+    binary: str
+    frequency: float
+    rows_per_parquet: int
+    save_interval_secs: int
+    sync_interval_secs: int
+    discovery_timeout: int
+    dyn_system_port: int
+    nixl_port: int
+    expected_engines: int
+
+
 def derive_config(env: dict[str, str]) -> DerivedConfig:
     actor_num_nodes = env_int(env, "SWEPRO_ACTOR_NUM_NODES", 1)
     actor_num_gpus_per_node = env_int(env, "SWEPRO_ACTOR_NUM_GPUS_PER_NODE", 4)
@@ -196,6 +210,24 @@ def durable_log_config(env: dict[str, str]) -> DurableLogConfig:
         submission_id=submission_id,
         log_dir=log_dir,
         poll_seconds=env_int(env, "SWEPRO_DURABLE_LOG_POLL_SECONDS", 30),
+    )
+
+
+def tachometer_config(env: dict[str, str]) -> TachometerConfig:
+    rollout_gpus = env_int(env, "SWEPRO_ROLLOUT_NUM_GPUS", 4)
+    gpus_per_engine = max(1, env_int(env, "SWEPRO_ROLLOUT_NUM_GPUS_PER_ENGINE", 4))
+    expected_engines = max(1, rollout_gpus // gpus_per_engine)
+    return TachometerConfig(
+        enabled=env_flag(env, "SWEPRO_TACHOMETER_ENABLED", True),
+        binary=env_str(env, "SWEPRO_TACHOMETER_BIN", "tachometer-scraper"),
+        frequency=float(env_str(env, "SWEPRO_TACHOMETER_FREQ", "0.5")),
+        rows_per_parquet=env_int(env, "SWEPRO_TACHOMETER_ROWS_PER_PARQUET", 1_000_000),
+        save_interval_secs=env_int(env, "SWEPRO_TACHOMETER_SAVE_INTERVAL_SECS", 5),
+        sync_interval_secs=env_int(env, "SWEPRO_TACHOMETER_SYNC_INTERVAL_SECS", 0),
+        discovery_timeout=env_int(env, "SWEPRO_TACHOMETER_DISCOVERY_TIMEOUT", 600),
+        dyn_system_port=env_int(env, "SWEPRO_DYNAMO_WORKER_SYSTEM_PORT", 30001),
+        nixl_port=env_int(env, "SWEPRO_TACHOMETER_NIXL_PORT", 19090),
+        expected_engines=expected_engines,
     )
 
 
@@ -629,6 +661,10 @@ if [ -d /tmp/ray/session_latest/logs ]; then
       cp -n "$file" "$log_dir/ray-logs/$(basename "$file")" 2>/dev/null || true
     done
 fi
+if [ -d /data/swebench-pro/pod-logs ]; then
+  mkdir -p "$log_dir/pod-logs"
+  cp -a /data/swebench-pro/pod-logs/. "$log_dir/pod-logs/" 2>/dev/null || true
+fi
 echo "===== $(date -Is) Ray log follower complete for $job_id ====="
 """
 
@@ -641,6 +677,238 @@ def start_ray_log_follower(durable_logs: DurableLogConfig, ray_address: str) -> 
     monitor_log = durable_logs.log_dir / "ray-log-follower.log"
     script = ray_log_follower_script(durable_logs, ray_address)
     with monitor_log.open("a", encoding="utf-8") as monitor:
+        subprocess.Popen(
+            ["bash", "-lc", script],
+            stdout=monitor,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
+def tachometer_collector_script(
+    durable_logs: DurableLogConfig,
+    tachometer: TachometerConfig,
+    ray_address: str,
+    frontend_url: str,
+) -> str:
+    script = r"""
+set -u
+log_dir=@@LOG_DIR@@
+job_id=@@JOB_ID@@
+run_id=@@RUN_ID@@
+address=@@RAY_ADDRESS@@
+frontend_url=@@FRONTEND_URL@@
+tachometer_bin=@@TACHOMETER_BIN@@
+expected_engines=@@EXPECTED_ENGINES@@
+dyn_system_port=@@DYN_SYSTEM_PORT@@
+nixl_port=@@NIXL_PORT@@
+frequency=@@FREQUENCY@@
+rows_per_parquet=@@ROWS_PER_PARQUET@@
+save_interval_secs=@@SAVE_INTERVAL_SECS@@
+sync_interval_secs=@@SYNC_INTERVAL_SECS@@
+discovery_timeout=@@DISCOVERY_TIMEOUT@@
+metrics_dir="$log_dir/metrics"
+config_path="$metrics_dir/tachometer-scraper.toml"
+storage_path="$metrics_dir/tachometer-data"
+local_dir="$metrics_dir/tachometer-local"
+scraper_log="$metrics_dir/tachometer-scraper.log"
+discovery_json="$metrics_dir/dynamo-workers.json"
+mkdir -p "$metrics_dir"
+echo "===== $(date -Is) starting tachometer collector for $job_id =====" >> "$scraper_log"
+
+if ! command -v "$tachometer_bin" >/dev/null 2>&1; then
+  echo "tachometer binary not found in PATH: $tachometer_bin" >> "$scraper_log"
+  exit 0
+fi
+
+rm -rf "$storage_path" "$local_dir"
+
+RUN_ID="$run_id" \
+FRONTEND_URL="$frontend_url" \
+EXPECTED_ENGINES="$expected_engines" \
+DYN_SYSTEM_PORT="$dyn_system_port" \
+NIXL_PORT="$nixl_port" \
+FREQUENCY="$frequency" \
+ROWS_PER_PARQUET="$rows_per_parquet" \
+SAVE_INTERVAL_SECS="$save_interval_secs" \
+DISCOVERY_TIMEOUT="$discovery_timeout" \
+CONFIG_PATH="$config_path" \
+STORAGE_PATH="$storage_path" \
+DISCOVERY_JSON="$discovery_json" \
+python3 - <<'PY' >> "$scraper_log" 2>&1
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+
+
+def quote(value):
+    return json.dumps(str(value))
+
+
+def parse_tcp_host(transport_tcp):
+    return transport_tcp.split("/", 1)[0].rsplit(":", 1)[0]
+
+
+run_id = os.environ["RUN_ID"]
+frontend_url = os.environ["FRONTEND_URL"].rstrip("/")
+expected = int(os.environ["EXPECTED_ENGINES"])
+dyn_system_port = int(os.environ["DYN_SYSTEM_PORT"])
+nixl_port = int(os.environ["NIXL_PORT"])
+frequency = float(os.environ["FREQUENCY"])
+rows_per_parquet = int(os.environ["ROWS_PER_PARQUET"])
+save_interval_secs = int(os.environ["SAVE_INTERVAL_SECS"])
+deadline = time.time() + int(os.environ["DISCOVERY_TIMEOUT"])
+
+workers = {}
+last_current = {}
+last_seen = None
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(f"{frontend_url}/health", timeout=5) as resp:
+            health = json.load(resp)
+    except Exception as exc:
+        print(f"waiting for frontend health: {exc}")
+        time.sleep(2)
+        continue
+
+    current = {}
+    for inst in health.get("instances", []):
+        if inst.get("endpoint") != "generate":
+            continue
+        instance_id = inst.get("instance_id")
+        tcp = (inst.get("transport") or {}).get("tcp")
+        if instance_id is None or not tcp:
+            continue
+        current[str(instance_id)] = parse_tcp_host(tcp)
+    last_current = current
+
+    if len(current) != last_seen:
+        print(f"frontend reports {len(current)} generate workers, want {expected}: {current}")
+        last_seen = len(current)
+    if len(current) >= expected:
+        workers = dict(sorted(current.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]))
+        break
+    time.sleep(2)
+
+if not workers:
+    workers = dict(sorted(last_current.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]))
+    if workers:
+        print(f"warning: only discovered {len(workers)} of {expected} expected Dynamo workers before timeout; collecting partial worker metrics")
+    else:
+        print("warning: no Dynamo workers discovered before timeout; collecting frontend metrics only")
+
+with open(os.environ["DISCOVERY_JSON"], "w") as f:
+    json.dump({"frontend_url": frontend_url, "workers": workers, "dyn_system_port": dyn_system_port, "nixl_port": nixl_port}, f, indent=2)
+
+with open(os.environ["CONFIG_PATH"], "w") as f:
+    f.write(f"storage = {quote(os.environ['STORAGE_PATH'])}\n")
+    f.write(f"rows_per_parquet = {rows_per_parquet}\n")
+    f.write(f"save_interval_secs = {save_interval_secs}\n\n")
+
+    def endpoint(name, url, filter_name, metadata):
+        f.write("[[endpoints]]\n")
+        f.write(f"name = {quote(name)}\n")
+        f.write(f"url = {quote(url)}\n")
+        f.write(f"frequency = {frequency}\n")
+        f.write(f"filter = {quote(filter_name)}\n\n")
+        f.write("[endpoints.node_metadata]\n")
+        for key, value in sorted(metadata.items()):
+            f.write(f"{quote(key)} = {quote(value)}\n")
+        f.write("\n")
+
+    endpoint(
+        "dynamo_frontend",
+        f"{frontend_url}/metrics",
+        "frontend",
+        {"run_id": run_id, "node": "warnold-swepro-frontend", "index": "0", "component": "frontend"},
+    )
+    endpoint(
+        "ray_head",
+        "http://warnold-swepro-trainer:8265/metrics",
+        "backend",
+        {"run_id": run_id, "node": "warnold-swepro-trainer", "endpoint": "trainer_ray", "endpoint_index": "0", "component": "trainer"},
+    )
+    for idx, (instance_id, host) in enumerate(workers.items()):
+        endpoint(
+            f"dynamo_engine_{idx}",
+            f"http://{host}:{dyn_system_port}/metrics",
+            "backend",
+            {"run_id": run_id, "node": host, "endpoint": "dynamo_engine", "endpoint_index": str(idx), "instance_id": instance_id, "component": "inference"},
+        )
+        if nixl_port > 0:
+            endpoint(
+                f"dynamo_engine_{idx}_nixl",
+                f"http://{host}:{nixl_port}/metrics",
+                "backend",
+                {"run_id": run_id, "node": host, "endpoint": "nixl", "endpoint_index": str(idx), "instance_id": instance_id, "component": "inference"},
+            )
+
+print(f"wrote tachometer config to {os.environ['CONFIG_PATH']} with {1 + 1 + len(workers) * (2 if nixl_port > 0 else 1)} endpoints")
+PY
+
+"$tachometer_bin" --config "$config_path" --local-dir "$local_dir" --sync-interval "$sync_interval_secs" >> "$scraper_log" 2>&1 &
+scraper_pid=$!
+echo "$scraper_pid" > "$metrics_dir/tachometer-scraper.pid"
+
+while true; do
+  sleep 15
+  {
+    echo "===== $(date -Is) ====="
+    ray job status --address="$address" --log-style=record --log-color=false "$job_id"
+  } >> "$metrics_dir/ray-status-for-metrics.log" 2>&1 || true
+  if tail -40 "$metrics_dir/ray-status-for-metrics.log" | grep -Eq "SUCCEEDED|FAILED|STOPPED"; then
+    break
+  fi
+  if ! kill -0 "$scraper_pid" >/dev/null 2>&1; then
+    echo "tachometer scraper exited before Ray job reached a terminal state" >> "$scraper_log"
+    exit 0
+  fi
+done
+
+echo "===== $(date -Is) stopping tachometer collector for $job_id =====" >> "$scraper_log"
+kill -TERM "$scraper_pid" >/dev/null 2>&1 || true
+wait "$scraper_pid" || true
+echo "===== $(date -Is) tachometer collector complete for $job_id =====" >> "$scraper_log"
+"""
+    replacements = {
+        "@@LOG_DIR@@": shlex.quote(str(durable_logs.log_dir)),
+        "@@JOB_ID@@": shlex.quote(durable_logs.submission_id),
+        "@@RUN_ID@@": shlex.quote(durable_logs.run_id),
+        "@@RAY_ADDRESS@@": shlex.quote(ray_address),
+        "@@FRONTEND_URL@@": shlex.quote(frontend_url),
+        "@@TACHOMETER_BIN@@": shlex.quote(tachometer.binary),
+        "@@EXPECTED_ENGINES@@": str(tachometer.expected_engines),
+        "@@DYN_SYSTEM_PORT@@": str(tachometer.dyn_system_port),
+        "@@NIXL_PORT@@": str(tachometer.nixl_port),
+        "@@FREQUENCY@@": str(tachometer.frequency),
+        "@@ROWS_PER_PARQUET@@": str(tachometer.rows_per_parquet),
+        "@@SAVE_INTERVAL_SECS@@": str(tachometer.save_interval_secs),
+        "@@SYNC_INTERVAL_SECS@@": str(tachometer.sync_interval_secs),
+        "@@DISCOVERY_TIMEOUT@@": str(tachometer.discovery_timeout),
+    }
+    for needle, value in replacements.items():
+        script = script.replace(needle, value)
+    return script
+
+
+def start_tachometer_collector(
+    durable_logs: DurableLogConfig,
+    tachometer: TachometerConfig,
+    ray_address: str,
+    frontend_url: str,
+) -> None:
+    if not durable_logs.enabled or not tachometer.enabled:
+        return
+
+    durable_logs.log_dir.mkdir(parents=True, exist_ok=True)
+    metrics_dir = durable_logs.log_dir / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    launcher_log = metrics_dir / "tachometer-launcher.log"
+    script = tachometer_collector_script(durable_logs, tachometer, ray_address, frontend_url)
+    with launcher_log.open("a", encoding="utf-8") as monitor:
         subprocess.Popen(
             ["bash", "-lc", script],
             stdout=monitor,
@@ -670,6 +938,7 @@ def main() -> int:
     apply_profile_defaults(env, args.profile, repo_root, write_state=not args.dry_run)
     derived = derive_config(env)
     durable_logs = durable_log_config(env)
+    tachometer = tachometer_config(env)
 
     print(
         "SWEPRO trainer: "
@@ -693,6 +962,14 @@ def main() -> int:
     if durable_logs.enabled:
         print(f"SWEPRO durable logs: {durable_logs.log_dir}")
         print(f"SWEPRO Ray submission_id: {durable_logs.submission_id}")
+        if tachometer.enabled:
+            print(
+                "SWEPRO tachometer: "
+                f"bin={tachometer.binary}, "
+                f"freq={tachometer.frequency}Hz, "
+                f"expected_engines={tachometer.expected_engines}, "
+                f"storage={durable_logs.log_dir / 'metrics' / 'tachometer-data'}"
+            )
 
     command = build_command(
         env,
@@ -740,6 +1017,12 @@ def main() -> int:
         return return_code
     if durable_logs.enabled:
         start_ray_log_follower(durable_logs, args.ray_address)
+        start_tachometer_collector(
+            durable_logs,
+            tachometer,
+            args.ray_address,
+            env_str(env, "DYNAMO_FRONTEND_URL", "http://warnold-swepro-frontend:3000"),
+        )
     return 0
 
 
