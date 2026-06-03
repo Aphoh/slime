@@ -44,6 +44,7 @@ from slime.utils.types import Sample
 __all__ = [
     "AsyncRolloutWorker",
     "generate_rollout_fully_async",
+    "rollout_with_mock_trainer",
 ]
 
 logger = logging.getLogger("slime.rollout.fully_async")
@@ -67,6 +68,89 @@ def _get_positive_int_env(name: str, default: int) -> int:
         logger.warning("ignoring non-positive %s=%r; using %d", name, value, default)
         return default
     return parsed
+
+
+def _get_non_negative_float_arg_or_env(args, attr: str, env_name: str, default: float = 0.0) -> float:
+    value = getattr(args, attr, None)
+    if value is None or value == "":
+        value = os.getenv(env_name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        logger.warning("ignoring invalid %s=%r; using %.3f", env_name, value, default)
+        return default
+    if parsed < 0:
+        logger.warning("ignoring negative %s=%r; using %.3f", env_name, value, default)
+        return default
+    return parsed
+
+
+def _mock_trainer_token_count(data: list[list[Sample]]) -> int:
+    total = 0
+    for group in data:
+        for sample in group:
+            token_count = len(sample.tokens or [])
+            if token_count <= 0:
+                token_count = int(getattr(sample, "response_length", 0) or 0)
+            total += token_count
+    return total
+
+
+def _mock_trainer_timing(args, rollout_id: int, data: list[list[Sample]]) -> tuple[int, float, float]:
+    token_count = _mock_trainer_token_count(data)
+    trainer_tok_s = _get_non_negative_float_arg_or_env(
+        args,
+        "mock_trainer_tokens_per_second",
+        "SWEPRO_MOCK_TRAINER_TOKENS_PER_SECOND",
+    )
+    train_seconds = token_count / trainer_tok_s if trainer_tok_s > 0 and token_count > 0 else 0.0
+
+    weight_update_seconds = _get_non_negative_float_arg_or_env(
+        args,
+        "mock_weight_update_seconds",
+        "SWEPRO_MOCK_WEIGHT_UPDATE_SECONDS",
+    )
+    update_interval = max(1, int(getattr(args, "update_weights_interval", 1) or 1))
+    if (rollout_id + 1) % update_interval != 0:
+        weight_update_seconds = 0.0
+
+    return token_count, train_seconds, weight_update_seconds
+
+
+def _sleep_mock_trainer(args, rollout_id: int, data: list[list[Sample]]) -> None:
+    token_count, train_seconds, weight_update_seconds = _mock_trainer_timing(args, rollout_id, data)
+
+    if train_seconds > 0:
+        logger.info(
+            "mock trainer sleeping for %.2fs on rollout %d (%d tokens)",
+            train_seconds,
+            rollout_id,
+            token_count,
+        )
+        with trace_span(
+            "trainer/mock",
+            "trainer.mock_train",
+            rollout_id=rollout_id,
+            token_count=token_count,
+            seconds=train_seconds,
+        ):
+            time.sleep(train_seconds)
+
+    if weight_update_seconds > 0:
+        logger.info(
+            "mock trainer sleeping for %.2fs for weight update after rollout %d",
+            weight_update_seconds,
+            rollout_id,
+        )
+        with trace_span(
+            "trainer/mock",
+            "weights.mock_update",
+            rollout_id=rollout_id,
+            seconds=weight_update_seconds,
+        ):
+            time.sleep(weight_update_seconds)
 
 
 def _sample_needs_retry(sample: Sample) -> bool:
@@ -410,3 +494,14 @@ def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool
     if evaluation:
         raise ValueError("fully-async rollout doesn't support evaluation mode")
     return run(_generate_rollout_async(args, rollout_id, data_buffer))
+
+
+def rollout_with_mock_trainer(args, rollout_id, data_buffer, evaluation: bool = False):
+    if evaluation:
+        raise ValueError("mock-trainer rollout doesn't support evaluation mode")
+    if not getattr(args, "debug_rollout_only", False):
+        raise ValueError("rollout_with_mock_trainer requires --debug-rollout-only")
+
+    completed_samples = generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation=evaluation)
+    _sleep_mock_trainer(args, rollout_id, completed_samples)
+    return completed_samples
