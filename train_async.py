@@ -12,6 +12,32 @@ from slime.utils.speedscope_trace import trace_span
 logger = logging.getLogger(__name__)
 
 
+def _run_rollout_only_loop(args, rollout_manager, num_rollout_per_epoch):
+    if args.start_rollout_id is None:
+        args.start_rollout_id = 0
+
+    logger.info(
+        "Running rollout-only async loop from rollout_id=%s to %s",
+        args.start_rollout_id,
+        args.num_rollout - 1,
+    )
+
+    with trace_span("driver", "rollout.submit", rollout_id=args.start_rollout_id):
+        rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
+
+    for rollout_id in range(args.start_rollout_id, args.num_rollout):
+        if rollout_data_next_future is not None:
+            with trace_span("driver", "rollout.wait", rollout_id=rollout_id):
+                ray.get(rollout_data_next_future)
+
+        if rollout_id + 1 < args.num_rollout:
+            with trace_span("driver", "rollout.submit", rollout_id=rollout_id + 1):
+                rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+
+        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+            ray.get(rollout_manager.eval.remote(rollout_id))
+
+
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
 def train(args):
     assert not args.colocate, "Colocation is not supported for async training."
@@ -23,6 +49,12 @@ def train(args):
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+
+    if args.debug_rollout_only:
+        _run_rollout_only_loop(args, rollout_manager, num_rollout_per_epoch)
+        ray.get(rollout_manager.dispose.remote())
+        finish_tracking(args)
+        return
 
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
