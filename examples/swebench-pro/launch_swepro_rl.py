@@ -321,7 +321,11 @@ def runtime_env(env: dict[str, str], repo_root: Path, has_nvlink: str) -> dict[s
         "SWEPRO_MAX_TOOL_CALLS": env_str(env, "SWEPRO_MAX_TOOL_CALLS", "0"),
         "SWEPRO_EPISODE_WALL_TIMEOUT": env_str(env, "SWEPRO_EPISODE_WALL_TIMEOUT", "0"),
         "SWEPRO_TURN_MAX_TOKENS": env_str(env, "SWEPRO_TURN_MAX_TOKENS", "0"),
-        "SWEPRO_MODEL": env_str(env, "SWEPRO_MODEL", "/data/glm-4.7-30b-a3b"),
+        "SWEPRO_MODEL": env_str(
+            env,
+            "SWEPRO_MODEL",
+            env_str(env, "SWEPRO_HF_CHECKPOINT", "/data/glm-4.7-30b-a3b"),
+        ),
         "SWEPRO_MODEL_CALL_TIMEOUT": env_str(env, "SWEPRO_MODEL_CALL_TIMEOUT", "600"),
         "SWEPRO_REQUEST_TIMEOUT": env_str(env, "SWEPRO_REQUEST_TIMEOUT", "540"),
         "SWEPRO_REQUEST_RETRIES": env_str(env, "SWEPRO_REQUEST_RETRIES", "2"),
