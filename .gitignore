@@ -192,5 +192,6 @@ local/
 
 glm/
 _examples_synced/
+.context/tachometer-ci/
 .env
 .DS_Store

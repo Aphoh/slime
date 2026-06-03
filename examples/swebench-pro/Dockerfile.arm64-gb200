@@ -5,7 +5,7 @@ ARG DYNAMO_COMMIT="main"
 ARG DYNAMO_EXTRA_FETCH_REF=""
 ARG DYNAMO_CHERRY_PICK=""
 ARG CARGO_BUILD_JOBS="16"
-ARG TACHOMETER_SCRAPER_IMAGE="ghcr.io/nvidia-dev/warnold-tachometer-scraper:latest"
+ARG TACHOMETER_SCRAPER_BINARY=".context/tachometer-ci/scraper-aarch64-unknown-linux-gnu"
 
 FROM ubuntu:24.04 AS builder
 
@@ -49,7 +49,15 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     mkdir -p /build/dist && \
     cp target/wheels/*.whl /build/dist/
 
-FROM ${TACHOMETER_SCRAPER_IMAGE} AS tachometer_scraper
+FROM scratch AS tachometer_scraper
+
+# CI artifact provenance:
+#   repo: NVIDIA-dev/warnold-tachometer
+#   workflow run: 25751892064
+#   artifact: scraper-aarch64-unknown-linux-gnu
+#   artifact digest: sha256:dd711431b95a13a8b566761c3e2b1edc75ff6bf827037f0d6f093969d62fa812
+#   commit: e7823a01e52120cb388b81a871c84932df22ad05
+COPY ${TACHOMETER_SCRAPER_BINARY} /usr/local/bin/tachometer-scraper
 
 FROM ${BASE_IMAGE}
 
@@ -59,6 +67,7 @@ COPY --from=tachometer_scraper /usr/local/bin/tachometer-scraper /usr/local/bin/
 COPY . /code/slime
 
 RUN pip install --no-cache-dir /tmp/*.whl && \
+    chmod 0755 /usr/local/bin/tachometer-scraper && \
     cd /opt/dynamo && \
     pip install --no-cache-dir -e ".[sglang]" --no-deps && \
     pip install --no-cache-dir nats-py nixl "transformers>=5.0" "fla-core==0.4.1" && \
