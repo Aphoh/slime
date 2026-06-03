@@ -1,0 +1,779 @@
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: warnold-swepro-compute-domain
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-trainer
+    owner: warnold
+spec:
+  channel:
+    resourceClaimTemplate:
+      name: warnold-swepro-compute-domain-channel
+  numNodes: 7
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warnold-swepro-frontend
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-frontend
+    owner: warnold
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-nodepool: customer-gpu-o7v
+    nvidia.com/gpu.product: NVIDIA-GB200
+    warnold-swepro-reservation: smoke-20260526
+  tolerations:
+  - key: kubernetes.io/arch
+    operator: Equal
+    value: arm64
+    effect: NoSchedule
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+  - key: warnold-swepro-reservation
+    operator: Equal
+    value: smoke-20260526
+    effect: NoSchedule
+  containers:
+  - name: frontend
+    image: aphoh/slime:swepro-observability-16ffc8f-20260526-043704
+    command:
+    - bash
+    - -c
+    args:
+    - "set -eu\nPOD_LOG_DIR=\"/data/swebench-pro/pod-logs/$(hostname)\"\nmkdir -p\
+      \ \"${POD_LOG_DIR}\"\nexec > >(tee -a \"${POD_LOG_DIR}/frontend.log\") 2>&1\n\
+      rm -rf /tmp/warnold-swepro-etcd\netcd \\\n  --data-dir /tmp/warnold-swepro-etcd\
+      \ \\\n  --listen-client-urls http://0.0.0.0:2379 \\\n  --advertise-client-urls\
+      \ http://warnold-swepro-frontend:2379 \\\n  >\"${POD_LOG_DIR}/etcd.log\" 2>&1\
+      \ &\nsleep 3\nexport DYN_DISCOVERY_BACKEND=etcd\nexport ETCD_ENDPOINTS=http://warnold-swepro-frontend:2379\n\
+      export NATS_SERVER=nats://warnold-swepro-nats:4222\nexport DYN_AGENT_TRACE_SINKS=jsonl_gz\n\
+      export DYN_AGENT_TRACE_OUTPUT_PATH=/data/swebench-pro/traces/dynamo-agent-trace\n\
+      export DYN_AGENT_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT=tcp://0.0.0.0:20390\nexport\
+      \ DYN_AGENT_TRACE_TOOL_EVENTS_ZMQ_TOPIC=agent-tool-events\nmkdir -p /data/swebench-pro/traces\n\
+      export PYTHONHASHSEED=0\nMODEL_PATH=\"${SWEPRO_STACK_MODEL_PATH:-/data/glm-4.7-30b-a3b}\"\
+      \nKV_CACHE_BLOCK_SIZE=\"${SWEPRO_KV_CACHE_BLOCK_SIZE:-16}\"\nexec python3 -m\
+      \ dynamo.frontend \\\n  --http-port 3000 \\\n  --router-mode kv \\\n  --kv-cache-block-size\
+      \ \"${KV_CACHE_BLOCK_SIZE}\" \\\n  --router-kv-events \\\n  --discovery-backend\
+      \ etcd \\\n  --model-path \"${MODEL_PATH}\"\n"
+    env:
+    - name: SWEPRO_STACK_MODEL_PATH
+      value: /shared/Qwen3.5-122B-A10B
+    - name: SWEPRO_KV_CACHE_BLOCK_SIZE
+      value: '64'
+    ports:
+    - containerPort: 3000
+      name: http
+    - containerPort: 20390
+      name: agent-trace
+    - containerPort: 2379
+      name: etcd
+    resources:
+      requests:
+        cpu: '2'
+        memory: 4Gi
+      limits:
+        cpu: '4'
+        memory: 8Gi
+    volumeMounts:
+    - name: code-cache
+      mountPath: /code
+    - name: model-cache
+      mountPath: /data
+    - name: shared-cache
+      mountPath: /shared
+  volumes:
+  - name: code-cache
+    persistentVolumeClaim:
+      claimName: code-cache
+  - name: model-cache
+    persistentVolumeClaim:
+      claimName: model-cache
+  - name: shared-cache
+    persistentVolumeClaim:
+      claimName: shared-model-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: warnold-swepro-frontend
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-frontend
+    owner: warnold
+spec:
+  selector:
+    app: warnold-swepro-frontend
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000
+  - name: agent-trace
+    port: 20390
+    targetPort: 20390
+  - name: etcd
+    port: 2379
+    targetPort: 2379
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warnold-swepro-trainer
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-trainer
+    owner: warnold
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: "[\n  {\"interfaceName\":\"eth0\",\"network\":\"\
+      default\"},\n  {\"interfaceName\":\"rdma0\",\"network\":\"rdma-0\"},\n  {\"\
+      interfaceName\":\"rdma1\",\"network\":\"rdma-1\"},\n  {\"interfaceName\":\"\
+      rdma2\",\"network\":\"rdma-2\"},\n  {\"interfaceName\":\"rdma3\",\"network\"\
+      :\"rdma-3\"}\n]\n"
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  resourceClaims:
+  - name: compute-domain-channel
+    resourceClaimTemplateName: warnold-swepro-compute-domain-channel
+  nodeSelector:
+    cloud.google.com/gke-ephemeral-storage-local-ssd: 'true'
+    cloud.google.com/gke-nodepool: customer-gpu-o7v
+    nvidia.com/gpu.product: NVIDIA-GB200
+    warnold-swepro-reservation: smoke-20260526
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: cloud.google.com/gke-nodepool
+            operator: In
+            values:
+            - customer-gpu-w0e
+  tolerations:
+  - key: kubernetes.io/arch
+    operator: Equal
+    value: arm64
+    effect: NoSchedule
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+  - key: warnold-swepro-reservation
+    operator: Equal
+    value: smoke-20260526
+    effect: NoSchedule
+  containers:
+  - name: trainer
+    image: aphoh/slime:swepro-observability-16ffc8f-20260526-043704
+    securityContext:
+      capabilities:
+        add:
+        - IPC_LOCK
+    command:
+    - bash
+    - -c
+    args:
+    - "set -eu\nPOD_LOG_DIR=\"/data/swebench-pro/pod-logs/$(hostname)\"\nmkdir -p\
+      \ \"${POD_LOG_DIR}\"\nexec > >(tee -a \"${POD_LOG_DIR}/trainer.log\") 2>&1\n\
+      ulimit -l unlimited\nulimit -n 1048576\nmkdir -p /data/swebench-pro/runs\nstart_ray_log_sync()\
+      \ {\n  (\n    while true; do\n      dest=\"${POD_LOG_DIR}/ray-logs\"\n     \
+      \ mkdir -p \"${dest}\"\n      if [ -d /tmp/ray/session_latest/logs ]; then\n\
+      \        find /tmp/ray/session_latest/logs -maxdepth 1 -type f \\\n        \
+      \  \\( -name \"job-driver-*.log\" -o -name \"worker-*.err\" -o -name \"worker-*.out\"\
+      \ -o -name \"raylet.*\" -o -name \"dashboard*.log\" -o -name \"runtime_env*.log\"\
+      \ -o -name \"ray_process_exit.log\" \\) \\\n          -print0 | while IFS= read\
+      \ -r -d '' file; do\n            cp -u \"$file\" \"${dest}/$(basename \"$file\"\
+      )\" 2>/dev/null || true\n          done\n      fi\n      sleep \"${SWEPRO_POD_LOG_SYNC_INTERVAL:-30}\"\
+      \n    done\n  ) &\n}\nstart_ray_log_sync\nMEM_LOG=\"${POD_LOG_DIR}/memory.log\"\
+      \n(\n  while true; do\n    {\n      echo \"===== $(date -Is) =====\"\n     \
+      \ echo \"--- cgroup memory ---\"\n      for f in /sys/fs/cgroup/memory.current\
+      \ /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events\
+      \ /sys/fs/cgroup/memory.stat; do\n        if [ -e \"$f\" ]; then\n         \
+      \ echo \"### $f\"\n          cat \"$f\"\n        fi\n      done\n      echo\
+      \ \"--- host meminfo ---\"\n      grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|Shmem):'\
+      \ /proc/meminfo || true\n      echo \"--- top rss processes ---\"\n      ps\
+      \ -eo pid,ppid,rss,vsz,comm,args --sort=-rss | head -40 || true\n      echo\
+      \ \"--- gpu memory ---\"\n      nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu\
+      \ --format=csv,noheader,nounits || true\n    } >> \"${MEM_LOG}\" 2>&1\n    sleep\
+      \ \"${SWEPRO_TRAINER_MEM_LOG_INTERVAL:-30}\"\n  done\n) &\necho \"trainer memory\
+      \ monitor writing to ${MEM_LOG}\"\nPOD_IP=\"$(hostname -I | awk '{print $1}')\"\
+      \nray start --head --node-ip-address=\"${POD_IP}\" --port=6379 --num-gpus=0\
+      \ --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265\nsleep\
+      \ infinity\n"
+    resources:
+      claims:
+      - name: compute-domain-channel
+      requests:
+        cpu: '48'
+        memory: 768Gi
+        ephemeral-storage: 800Gi
+        nvidia.com/gpu: '1'
+        networking.gke.io.networks/rdma-0: '1'
+        networking.gke.io.networks/rdma-1: '1'
+        networking.gke.io.networks/rdma-2: '1'
+        networking.gke.io.networks/rdma-3: '1'
+      limits:
+        cpu: '64'
+        memory: 832Gi
+        ephemeral-storage: 800Gi
+        nvidia.com/gpu: '1'
+        networking.gke.io.networks/rdma-0: '1'
+        networking.gke.io.networks/rdma-1: '1'
+        networking.gke.io.networks/rdma-2: '1'
+        networking.gke.io.networks/rdma-3: '1'
+    volumeMounts:
+    - name: model-cache
+      mountPath: /data
+    - name: code-cache
+      mountPath: /code
+    - name: shared-cache
+      mountPath: /shared
+    - name: shm
+      mountPath: /dev/shm
+    - name: scratch
+      mountPath: /scratch
+  volumes:
+  - name: model-cache
+    persistentVolumeClaim:
+      claimName: model-cache
+  - name: code-cache
+    persistentVolumeClaim:
+      claimName: code-cache
+  - name: shared-cache
+    persistentVolumeClaim:
+      claimName: shared-model-cache
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
+  - name: scratch
+    emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: warnold-swepro-trainer
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-trainer
+    owner: warnold
+spec:
+  selector:
+    app: warnold-swepro-trainer
+  ports:
+  - name: gcs
+    port: 6379
+    targetPort: 6379
+  - name: dashboard
+    port: 8265
+    targetPort: 8265
+  - name: client
+    port: 10001
+    targetPort: 10001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: warnold-swepro-trainer-worker
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-trainer-worker
+    owner: warnold
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: warnold-swepro-trainer-worker
+  template:
+    metadata:
+      labels:
+        app: warnold-swepro-trainer-worker
+        owner: warnold
+      annotations:
+        networking.gke.io/default-interface: eth0
+        networking.gke.io/interfaces: "[\n  {\"interfaceName\":\"eth0\",\"network\"\
+          :\"default\"},\n  {\"interfaceName\":\"rdma0\",\"network\":\"rdma-0\"},\n\
+          \  {\"interfaceName\":\"rdma1\",\"network\":\"rdma-1\"},\n  {\"interfaceName\"\
+          :\"rdma2\",\"network\":\"rdma-2\"},\n  {\"interfaceName\":\"rdma3\",\"network\"\
+          :\"rdma-3\"}\n]\n"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      resourceClaims:
+      - name: compute-domain-channel
+        resourceClaimTemplateName: warnold-swepro-compute-domain-channel
+      nodeSelector:
+        cloud.google.com/gke-ephemeral-storage-local-ssd: 'true'
+        cloud.google.com/gke-nodepool: customer-gpu-o7v
+        nvidia.com/gpu.product: NVIDIA-GB200
+        warnold-swepro-reservation: smoke-20260526
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - warnold-swepro-trainer
+                - warnold-swepro-trainer-worker
+            topologyKey: kubernetes.io/hostname
+      tolerations:
+      - key: kubernetes.io/arch
+        operator: Equal
+        value: arm64
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      - key: warnold-swepro-reservation
+        operator: Equal
+        value: smoke-20260526
+        effect: NoSchedule
+      containers:
+      - name: trainer-worker
+        image: aphoh/slime:swepro-observability-16ffc8f-20260526-043704
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+        command:
+        - bash
+        - -c
+        args:
+        - "set -eu\nPOD_LOG_DIR=\"/data/swebench-pro/pod-logs/$(hostname)\"\nmkdir\
+          \ -p \"${POD_LOG_DIR}\"\nexec > >(tee -a \"${POD_LOG_DIR}/trainer-worker.log\"\
+          ) 2>&1\nulimit -l unlimited\nulimit -n 1048576\nmkdir -p /data/swebench-pro/runs\n\
+          start_ray_log_sync() {\n  (\n    while true; do\n      dest=\"${POD_LOG_DIR}/ray-logs\"\
+          \n      mkdir -p \"${dest}\"\n      if [ -d /tmp/ray/session_latest/logs\
+          \ ]; then\n        find /tmp/ray/session_latest/logs -maxdepth 1 -type f\
+          \ \\\n          \\( -name \"job-driver-*.log\" -o -name \"worker-*.err\"\
+          \ -o -name \"worker-*.out\" -o -name \"raylet.*\" -o -name \"dashboard*.log\"\
+          \ -o -name \"runtime_env*.log\" -o -name \"ray_process_exit.log\" \\) \\\
+          \n          -print0 | while IFS= read -r -d '' file; do\n            cp\
+          \ -u \"$file\" \"${dest}/$(basename \"$file\")\" 2>/dev/null || true\n \
+          \         done\n      fi\n      sleep \"${SWEPRO_POD_LOG_SYNC_INTERVAL:-30}\"\
+          \n    done\n  ) &\n}\nstart_ray_log_sync\nMEM_LOG=\"${POD_LOG_DIR}/memory.log\"\
+          \n(\n  while true; do\n    {\n      echo \"===== $(date -Is) =====\"\n \
+          \     echo \"--- cgroup memory ---\"\n      for f in /sys/fs/cgroup/memory.current\
+          \ /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events\
+          \ /sys/fs/cgroup/memory.stat; do\n        if [ -e \"$f\" ]; then\n     \
+          \     echo \"### $f\"\n          cat \"$f\"\n        fi\n      done\n  \
+          \    echo \"--- host meminfo ---\"\n      grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|Shmem):'\
+          \ /proc/meminfo || true\n      echo \"--- top rss processes ---\"\n    \
+          \  ps -eo pid,ppid,rss,vsz,comm,args --sort=-rss | head -40 || true\n  \
+          \    echo \"--- gpu memory ---\"\n      nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu\
+          \ --format=csv,noheader,nounits || true\n    } >> \"${MEM_LOG}\" 2>&1\n\
+          \    sleep \"${SWEPRO_TRAINER_MEM_LOG_INTERVAL:-30}\"\n  done\n) &\necho\
+          \ \"trainer worker memory monitor writing to ${MEM_LOG}\"\nPOD_IP=\"$(hostname\
+          \ -I | awk '{print $1}')\"\nfor i in $(seq 1 120); do\n  if (echo > /dev/tcp/warnold-swepro-trainer/6379)\
+          \ >/dev/null 2>&1; then\n    break\n  fi\n  sleep 5\ndone\nray start --address=warnold-swepro-trainer:6379\
+          \ --node-ip-address=\"${POD_IP}\" --num-gpus=4 --disable-usage-stats --block\n"
+        resources:
+          claims:
+          - name: compute-domain-channel
+          requests:
+            cpu: '48'
+            memory: 768Gi
+            ephemeral-storage: 800Gi
+            nvidia.com/gpu: '4'
+            networking.gke.io.networks/rdma-0: '1'
+            networking.gke.io.networks/rdma-1: '1'
+            networking.gke.io.networks/rdma-2: '1'
+            networking.gke.io.networks/rdma-3: '1'
+          limits:
+            cpu: '64'
+            memory: 832Gi
+            ephemeral-storage: 800Gi
+            nvidia.com/gpu: '4'
+            networking.gke.io.networks/rdma-0: '1'
+            networking.gke.io.networks/rdma-1: '1'
+            networking.gke.io.networks/rdma-2: '1'
+            networking.gke.io.networks/rdma-3: '1'
+        volumeMounts:
+        - name: model-cache
+          mountPath: /data
+        - name: code-cache
+          mountPath: /code
+        - name: shared-cache
+          mountPath: /shared
+        - name: shm
+          mountPath: /dev/shm
+        - name: scratch
+          mountPath: /scratch
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: model-cache
+      - name: code-cache
+        persistentVolumeClaim:
+          claimName: code-cache
+      - name: shared-cache
+        persistentVolumeClaim:
+          claimName: shared-model-cache
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: scratch
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warnold-swepro-engine-0
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-engine
+    owner: warnold
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: "[\n  {\"interfaceName\":\"eth0\",\"network\":\"\
+      default\"},\n  {\"interfaceName\":\"rdma0\",\"network\":\"rdma-0\"},\n  {\"\
+      interfaceName\":\"rdma1\",\"network\":\"rdma-1\"},\n  {\"interfaceName\":\"\
+      rdma2\",\"network\":\"rdma-2\"},\n  {\"interfaceName\":\"rdma3\",\"network\"\
+      :\"rdma-3\"}\n]\n"
+spec:
+  restartPolicy: Never
+  resourceClaims:
+  - name: compute-domain-channel
+    resourceClaimTemplateName: warnold-swepro-compute-domain-channel
+  nodeSelector:
+    cloud.google.com/gke-ephemeral-storage-local-ssd: 'true'
+    cloud.google.com/gke-nodepool: customer-gpu-o7v
+    nvidia.com/gpu.product: NVIDIA-GB200
+    warnold-swepro-reservation: smoke-20260526
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: app
+            operator: In
+            values:
+            - warnold-swepro-trainer
+            - warnold-swepro-trainer-worker
+            - warnold-swepro-engine
+        topologyKey: kubernetes.io/hostname
+  tolerations:
+  - key: kubernetes.io/arch
+    operator: Equal
+    value: arm64
+    effect: NoSchedule
+  - key: networking.gke.io.networks/rdma-0
+    operator: Exists
+    effect: NoSchedule
+  - key: networking.gke.io.networks/rdma-1
+    operator: Exists
+    effect: NoSchedule
+  - key: networking.gke.io.networks/rdma-2
+    operator: Exists
+    effect: NoSchedule
+  - key: networking.gke.io.networks/rdma-3
+    operator: Exists
+    effect: NoSchedule
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+  - key: warnold-swepro-reservation
+    operator: Equal
+    value: smoke-20260526
+    effect: NoSchedule
+  containers:
+  - name: engine
+    image: aphoh/slime:swepro-observability-16ffc8f-20260526-043704
+    securityContext:
+      capabilities:
+        add:
+        - IPC_LOCK
+    command:
+    - bash
+    - -c
+    args:
+    - "set -eu\nPOD_LOG_DIR=\"/data/swebench-pro/pod-logs/$(hostname)\"\nmkdir -p\
+      \ \"${POD_LOG_DIR}\"\nexec > >(tee -a \"${POD_LOG_DIR}/engine.log\") 2>&1\n\
+      ulimit -l unlimited\nulimit -n 1048576\nexport DYN_DISCOVERY_BACKEND=etcd\n\
+      export ETCD_ENDPOINTS=http://warnold-swepro-frontend:2379\nexport NATS_SERVER=nats://warnold-swepro-nats:4222\n\
+      export DYN_SYSTEM_PORT=30001\nexport PYTHONHASHSEED=0\nexport DYN_SGL_FORCE_NONSTREAM=1\n\
+      export UCX_TLS=cuda_ipc,cuda_copy,rc\nexport UCX_IB_GID_INDEX=3\nexport UCX_RC_TIMEOUT=600s\n\
+      export UCX_KEEPALIVE_INTERVAL=300s\nexport NCCL_CUMEM_ENABLE=1\nexport NCCL_CUMEM_HOST_ENABLE=1\n\
+      export NCCL_MNNVL_ENABLE=0\nexport NCCL_NVLS_ENABLE=1\nexport NCCL_STORE_TIMEOUT=7200\n\
+      export NCCL_IB_GID_INDEX=3\nexport NCCL_IB_HCA=mlx5_0\nexport NCCL_IB_MERGE_NICS=0\n\
+      export NCCL_CROSS_NIC=0\nexport NCCL_P2P_PXN_LEVEL=1\nexport NCCL_GRAPH_MIXING_SUPPORT=0\n\
+      export NCCL_DEBUG=\"${NCCL_DEBUG:-INFO}\"\nexport NCCL_DEBUG_SUBSYS=\"${NCCL_DEBUG_SUBSYS:-INIT,ENV,NET}\"\
+      \nexport NCCL_SOCKET_IFNAME=eth0\nexport GLOO_SOCKET_IFNAME=eth0\nexport NVIDIA_GDRCOPY=1\n\
+      export NIXL_LOG_LEVEL=INFO\nexport NIXL_TELEMETRY_ENABLE=y\nexport NIXL_TELEMETRY_EXPORTER=prometheus\n\
+      export NIXL_TELEMETRY_PROMETHEUS_PORT=19090\nMODEL_PATH=\"${SWEPRO_STACK_MODEL_PATH:-/data/glm-4.7-30b-a3b}\"\
+      \nENGINE_PROFILE=\"${SWEPRO_ENGINE_PROFILE:-glm47}\"\nif [ \"${ENGINE_PROFILE}\"\
+      \ = \"qwen35\" ]; then\n  engine_args=(\n    --page-size \"${SGLANG_QWEN35_PAGE_SIZE:-64}\"\
+      \n    --attention-backend \"${SGLANG_QWEN35_ATTENTION_BACKEND:-trtllm_mha}\"\
+      \n    --moe-runner-backend \"${SGLANG_QWEN35_MOE_RUNNER_BACKEND:-triton}\"\n\
+      \    --mamba-ssm-dtype bfloat16\n    --mamba-scheduler-strategy \"${SGLANG_QWEN35_MAMBA_SCHEDULER_STRATEGY:-extra_buffer}\"\
+      \n    --mamba-track-interval \"${SGLANG_QWEN35_MAMBA_TRACK_INTERVAL:-256}\"\n\
+      \    --cuda-graph-max-bs \"${SGLANG_CUDA_GRAPH_MAX_BS:-16}\"\n    --max-running-requests\
+      \ \"${SGLANG_MAX_RUNNING_REQUESTS:-8}\"\n    --context-length \"${SGLANG_CONTEXT_LENGTH:-65536}\"\
+      \n    --max-prefill-tokens \"${SGLANG_MAX_PREFILL_TOKENS:-16384}\"\n    --chunked-prefill-size\
+      \ \"${SGLANG_CHUNKED_PREFILL_SIZE:-16384}\"\n    --stream-interval 50\n    --scheduler-recv-interval\
+      \ 30\n    --tokenizer-worker-num \"${SGLANG_TOKENIZER_WORKER_NUM:-1}\"\n   \
+      \ --skip-server-warmup\n  )\n  if [ \"${SGLANG_QWEN35_QUANTIZATION:-fp8}\" =\
+      \ \"fp8\" ]; then\n    engine_args+=(\n      --fp8-gemm-backend flashinfer_trtllm\n\
+      \      --quantization fp8\n      --kv-cache-dtype fp8_e4m3\n    )\n  fi\nelse\n\
+      \  engine_args=(\n    --page-size 16\n    --attention-backend triton\n    --sampling-backend\
+      \ pytorch\n    --disable-flashinfer-autotune\n    --cuda-graph-max-bs \"${SGLANG_CUDA_GRAPH_MAX_BS:-64}\"\
+      \n  )\nfi\nexec python3 -m dynamo.sglang \\\n  --model-path \"${MODEL_PATH}\"\
+      \ \\\n  --tp 2 \\\n  --port 30001 \\\n  --host 0.0.0.0 \\\n  --trust-remote-code\
+      \ \\\n  --enable-rl \\\n  --enable-metrics \\\n  --kv-events-config '{\"publisher\"\
+      :\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:5557\",\"enable_kv_cache_events\"\
+      :true}' \\\n  \"${engine_args[@]}\" \\\n  --mem-fraction-static 0.75\n"
+    env:
+    - name: SWEPRO_STACK_MODEL_PATH
+      value: /shared/Qwen3.5-122B-A10B
+    - name: SWEPRO_ENGINE_PROFILE
+      value: qwen35
+    - name: SGLANG_QWEN35_ATTENTION_BACKEND
+      value: triton
+    - name: SGLANG_QWEN35_QUANTIZATION
+      value: bf16
+    - name: SGLANG_CUDA_GRAPH_MAX_BS
+      value: '32'
+    - name: SGLANG_MAX_RUNNING_REQUESTS
+      value: '32'
+    - name: SGLANG_CONTEXT_LENGTH
+      value: '131072'
+    - name: SGLANG_MAX_PREFILL_TOKENS
+      value: '16384'
+    - name: SGLANG_CHUNKED_PREFILL_SIZE
+      value: '16384'
+    resources:
+      claims:
+      - name: compute-domain-channel
+      requests:
+        cpu: '32'
+        memory: 128Gi
+        ephemeral-storage: 800Gi
+        nvidia.com/gpu: '2'
+        networking.gke.io.networks/rdma-0: '1'
+        networking.gke.io.networks/rdma-1: '1'
+        networking.gke.io.networks/rdma-2: '1'
+        networking.gke.io.networks/rdma-3: '1'
+      limits:
+        cpu: '48'
+        memory: 192Gi
+        ephemeral-storage: 800Gi
+        nvidia.com/gpu: '2'
+        networking.gke.io.networks/rdma-0: '1'
+        networking.gke.io.networks/rdma-1: '1'
+        networking.gke.io.networks/rdma-2: '1'
+        networking.gke.io.networks/rdma-3: '1'
+    volumeMounts:
+    - name: model-cache
+      mountPath: /data
+    - name: code-cache
+      mountPath: /code
+    - name: shared-cache
+      mountPath: /shared
+    - name: shm
+      mountPath: /dev/shm
+    - name: scratch
+      mountPath: /scratch
+  volumes:
+  - name: model-cache
+    persistentVolumeClaim:
+      claimName: model-cache
+  - name: code-cache
+    persistentVolumeClaim:
+      claimName: code-cache
+  - name: shared-cache
+    persistentVolumeClaim:
+      claimName: shared-model-cache
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
+  - name: scratch
+    emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: warnold-swepro-engine-1
+  namespace: warnold-dynamo
+  labels:
+    app: warnold-swepro-engine
+    owner: warnold
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: "[\n  {\"interfaceName\":\"eth0\",\"network\":\"\
+      default\"},\n  {\"interfaceName\":\"rdma0\",\"network\":\"rdma-0\"},\n  {\"\
+      interfaceName\":\"rdma1\",\"network\":\"rdma-1\"},\n  {\"interfaceName\":\"\
+      rdma2\",\"network\":\"rdma-2\"},\n  {\"interfaceName\":\"rdma3\",\"network\"\
+      :\"rdma-3\"}\n]\n"
+spec:
+  restartPolicy: Never
+  resourceClaims:
+  - name: compute-domain-channel
+    resourceClaimTemplateName: warnold-swepro-compute-domain-channel
+  nodeSelector:
+    cloud.google.com/gke-ephemeral-storage-local-ssd: 'true'
+    cloud.google.com/gke-nodepool: customer-gpu-o7v
+    nvidia.com/gpu.product: NVIDIA-GB200
+    warnold-swepro-reservation: smoke-20260526
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: app
+            operator: In
+            values:
+            - warnold-swepro-trainer
+            - warnold-swepro-trainer-worker
+            - warnold-swepro-engine
+        topologyKey: kubernetes.io/hostname
+  tolerations:
+  - key: kubernetes.io/arch
+    operator: Equal
+    value: arm64
+    effect: NoSchedule
+  - key: networking.gke.io.networks/rdma-0
+    operator: Exists
+    effect: NoSchedule
+  - key: networking.gke.io.networks/rdma-1
+    operator: Exists
+    effect: NoSchedule
+  - key: networking.gke.io.networks/rdma-2
+    operator: Exists
+    effect: NoSchedule
+  - key: networking.gke.io.networks/rdma-3
+    operator: Exists
+    effect: NoSchedule
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+  - key: warnold-swepro-reservation
+    operator: Equal
+    value: smoke-20260526
+    effect: NoSchedule
+  containers:
+  - name: engine
+    image: aphoh/slime:swepro-observability-16ffc8f-20260526-043704
+    securityContext:
+      capabilities:
+        add:
+        - IPC_LOCK
+    command:
+    - bash
+    - -c
+    args:
+    - "set -eu\nPOD_LOG_DIR=\"/data/swebench-pro/pod-logs/$(hostname)\"\nmkdir -p\
+      \ \"${POD_LOG_DIR}\"\nexec > >(tee -a \"${POD_LOG_DIR}/engine.log\") 2>&1\n\
+      ulimit -l unlimited\nulimit -n 1048576\nexport DYN_DISCOVERY_BACKEND=etcd\n\
+      export ETCD_ENDPOINTS=http://warnold-swepro-frontend:2379\nexport NATS_SERVER=nats://warnold-swepro-nats:4222\n\
+      export DYN_SYSTEM_PORT=30001\nexport PYTHONHASHSEED=0\nexport DYN_SGL_FORCE_NONSTREAM=1\n\
+      export UCX_TLS=cuda_ipc,cuda_copy,rc\nexport UCX_IB_GID_INDEX=3\nexport UCX_RC_TIMEOUT=600s\n\
+      export UCX_KEEPALIVE_INTERVAL=300s\nexport NCCL_CUMEM_ENABLE=1\nexport NCCL_CUMEM_HOST_ENABLE=1\n\
+      export NCCL_MNNVL_ENABLE=0\nexport NCCL_NVLS_ENABLE=1\nexport NCCL_STORE_TIMEOUT=7200\n\
+      export NCCL_IB_GID_INDEX=3\nexport NCCL_IB_HCA=mlx5_0\nexport NCCL_IB_MERGE_NICS=0\n\
+      export NCCL_CROSS_NIC=0\nexport NCCL_P2P_PXN_LEVEL=1\nexport NCCL_GRAPH_MIXING_SUPPORT=0\n\
+      export NCCL_DEBUG=\"${NCCL_DEBUG:-INFO}\"\nexport NCCL_DEBUG_SUBSYS=\"${NCCL_DEBUG_SUBSYS:-INIT,ENV,NET}\"\
+      \nexport NCCL_SOCKET_IFNAME=eth0\nexport GLOO_SOCKET_IFNAME=eth0\nexport NVIDIA_GDRCOPY=1\n\
+      export NIXL_LOG_LEVEL=INFO\nexport NIXL_TELEMETRY_ENABLE=y\nexport NIXL_TELEMETRY_EXPORTER=prometheus\n\
+      export NIXL_TELEMETRY_PROMETHEUS_PORT=19090\nMODEL_PATH=\"${SWEPRO_STACK_MODEL_PATH:-/data/glm-4.7-30b-a3b}\"\
+      \nENGINE_PROFILE=\"${SWEPRO_ENGINE_PROFILE:-glm47}\"\nif [ \"${ENGINE_PROFILE}\"\
+      \ = \"qwen35\" ]; then\n  engine_args=(\n    --page-size \"${SGLANG_QWEN35_PAGE_SIZE:-64}\"\
+      \n    --attention-backend \"${SGLANG_QWEN35_ATTENTION_BACKEND:-trtllm_mha}\"\
+      \n    --moe-runner-backend \"${SGLANG_QWEN35_MOE_RUNNER_BACKEND:-triton}\"\n\
+      \    --mamba-ssm-dtype bfloat16\n    --mamba-scheduler-strategy \"${SGLANG_QWEN35_MAMBA_SCHEDULER_STRATEGY:-extra_buffer}\"\
+      \n    --mamba-track-interval \"${SGLANG_QWEN35_MAMBA_TRACK_INTERVAL:-256}\"\n\
+      \    --cuda-graph-max-bs \"${SGLANG_CUDA_GRAPH_MAX_BS:-16}\"\n    --max-running-requests\
+      \ \"${SGLANG_MAX_RUNNING_REQUESTS:-8}\"\n    --context-length \"${SGLANG_CONTEXT_LENGTH:-65536}\"\
+      \n    --max-prefill-tokens \"${SGLANG_MAX_PREFILL_TOKENS:-16384}\"\n    --chunked-prefill-size\
+      \ \"${SGLANG_CHUNKED_PREFILL_SIZE:-16384}\"\n    --stream-interval 50\n    --scheduler-recv-interval\
+      \ 30\n    --tokenizer-worker-num \"${SGLANG_TOKENIZER_WORKER_NUM:-1}\"\n   \
+      \ --skip-server-warmup\n  )\n  if [ \"${SGLANG_QWEN35_QUANTIZATION:-fp8}\" =\
+      \ \"fp8\" ]; then\n    engine_args+=(\n      --fp8-gemm-backend flashinfer_trtllm\n\
+      \      --quantization fp8\n      --kv-cache-dtype fp8_e4m3\n    )\n  fi\nelse\n\
+      \  engine_args=(\n    --page-size 16\n    --attention-backend triton\n    --sampling-backend\
+      \ pytorch\n    --disable-flashinfer-autotune\n    --cuda-graph-max-bs \"${SGLANG_CUDA_GRAPH_MAX_BS:-64}\"\
+      \n  )\nfi\nexec python3 -m dynamo.sglang \\\n  --model-path \"${MODEL_PATH}\"\
+      \ \\\n  --tp 2 \\\n  --port 30001 \\\n  --host 0.0.0.0 \\\n  --trust-remote-code\
+      \ \\\n  --enable-rl \\\n  --enable-metrics \\\n  --kv-events-config '{\"publisher\"\
+      :\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:5557\",\"enable_kv_cache_events\"\
+      :true}' \\\n  \"${engine_args[@]}\" \\\n  --mem-fraction-static 0.75\n"
+    env:
+    - name: SWEPRO_STACK_MODEL_PATH
+      value: /shared/Qwen3.5-122B-A10B
+    - name: SWEPRO_ENGINE_PROFILE
+      value: qwen35
+    - name: SGLANG_QWEN35_ATTENTION_BACKEND
+      value: triton
+    - name: SGLANG_QWEN35_QUANTIZATION
+      value: bf16
+    - name: SGLANG_CUDA_GRAPH_MAX_BS
+      value: '32'
+    - name: SGLANG_MAX_RUNNING_REQUESTS
+      value: '32'
+    - name: SGLANG_CONTEXT_LENGTH
+      value: '131072'
+    - name: SGLANG_MAX_PREFILL_TOKENS
+      value: '16384'
+    - name: SGLANG_CHUNKED_PREFILL_SIZE
+      value: '16384'
+    resources:
+      claims:
+      - name: compute-domain-channel
+      requests:
+        cpu: '32'
+        memory: 128Gi
+        ephemeral-storage: 800Gi
+        nvidia.com/gpu: '2'
+        networking.gke.io.networks/rdma-0: '1'
+        networking.gke.io.networks/rdma-1: '1'
+        networking.gke.io.networks/rdma-2: '1'
+        networking.gke.io.networks/rdma-3: '1'
+      limits:
+        cpu: '48'
+        memory: 192Gi
+        ephemeral-storage: 800Gi
+        nvidia.com/gpu: '2'
+        networking.gke.io.networks/rdma-0: '1'
+        networking.gke.io.networks/rdma-1: '1'
+        networking.gke.io.networks/rdma-2: '1'
+        networking.gke.io.networks/rdma-3: '1'
+    volumeMounts:
+    - name: model-cache
+      mountPath: /data
+    - name: code-cache
+      mountPath: /code
+    - name: shared-cache
+      mountPath: /shared
+    - name: shm
+      mountPath: /dev/shm
+    - name: scratch
+      mountPath: /scratch
+  volumes:
+  - name: model-cache
+    persistentVolumeClaim:
+      claimName: model-cache
+  - name: code-cache
+    persistentVolumeClaim:
+      claimName: code-cache
+  - name: shared-cache
+    persistentVolumeClaim:
+      claimName: shared-model-cache
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
+  - name: scratch
+    emptyDir: {}

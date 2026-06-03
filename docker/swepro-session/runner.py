@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,8 @@ from dynamo_agent_trace import DynamoToolEventPublisher, build_tool_trace_record
 
 CONTROL_PLANE_METHODS = {"close", "health"}
 SESSION_TRACE_LOG_PREFIX = "SWEPRO_SESSION_TRACE"
+SUBMISSION_MARKER = "<<SWE_AGENT_SUBMISSION>>"
+PATCH_FILE_PREVIEW_LIMIT = 20
 
 
 def _json_default(value: Any) -> str:
@@ -78,11 +81,28 @@ def _safe_worker_id(value: str) -> str:
 
 
 def _extract_submission(observation: str) -> str | None:
-    marker = "<<SWE_AGENT_SUBMISSION>>"
-    parts = observation.split(marker)
+    parts = observation.split(SUBMISSION_MARKER)
     if len(parts) >= 3:
         return parts[1].strip() + ("\n" if parts[1].strip() else "")
     return None
+
+
+def _patch_diagnostics(submission: str, *, observation: str | None = None) -> dict[str, Any]:
+    patch_bytes = submission.encode("utf-8", errors="backslashreplace")
+    files = [
+        match.group(2)
+        for match in re.finditer(r"^diff --git a/(.*?) b/(.*?)$", submission, flags=re.MULTILINE)
+    ]
+    diagnostics: dict[str, Any] = {
+        "patch_chars": len(submission),
+        "patch_sha256": hashlib.sha256(patch_bytes).hexdigest()[:16] if submission else "",
+        "patch_starts_with_diff": submission.lstrip().startswith("diff --git"),
+        "patch_file_count": len(files),
+        "patch_files_preview": files[:PATCH_FILE_PREVIEW_LIMIT],
+    }
+    if observation is not None:
+        diagnostics["submission_marker_count"] = observation.count(SUBMISSION_MARKER)
+    return diagnostics
 
 
 def _tool_error_observation(exc: Exception) -> str:
@@ -831,6 +851,7 @@ class SessionManager:
                 output_bytes=output_bytes,
             )
         submission = _extract_submission(observation)
+        patch_diagnostics = _patch_diagnostics(submission or "", observation=observation)
         submitted = submission is not None or session.tools.check_for_submission_cmd(observation)
         _trace_log(
             "tool_step_response",
@@ -842,6 +863,7 @@ class SessionManager:
             output_bytes=output_bytes,
             duration_ms=duration_ms,
             submitted=submitted,
+            **patch_diagnostics,
             session_dropped=session_dropped,
             state_error=state_error,
             docker_oom=docker_oom,
@@ -860,6 +882,7 @@ class SessionManager:
             "submitted": submitted,
             "done": submitted,
             "submission": submission,
+            "patch_diagnostics": patch_diagnostics,
             "tool_error": tool_error,
             "session_dropped": session_dropped,
             "state_error": state_error,
@@ -938,13 +961,14 @@ class SessionManager:
             output_bytes=output_bytes,
         )
         submission = _extract_submission(observation) or ""
+        patch_diagnostics = _patch_diagnostics(submission, observation=observation)
         _trace_log(
             "submit_response",
             **base_fields,
             status="succeeded",
             duration_ms=duration_ms,
             output_bytes=output_bytes,
-            patch_chars=len(submission),
+            **patch_diagnostics,
             trace_published=trace_end_published,
         )
         return {
@@ -952,6 +976,7 @@ class SessionManager:
             "worker_id": self.worker_id,
             "observation": observation,
             "submission": submission,
+            "patch_diagnostics": patch_diagnostics,
             "state": state,
             "error": None,
         }
