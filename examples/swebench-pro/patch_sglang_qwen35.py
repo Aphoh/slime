@@ -193,7 +193,6 @@ def verify() -> None:
     assert set_global_trace_level() is None
 
     if os.environ.get("SGLANG_QWEN35_IMPORT_VERIFY") == "1":
-        import dynamo.sglang.main  # noqa: F401
         import dynamo.sglang.publisher  # noqa: F401
         import dynamo.sglang.register  # noqa: F401
         import sglang.srt.layers.attention.vision  # noqa: F401
