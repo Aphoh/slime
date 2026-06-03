@@ -266,5 +266,10 @@ def test_k8s_stack_exposes_dynamo_agent_trace_port_and_session_dependencies():
         REPO_ROOT / "docker" / "swepro-session" / "Dockerfile"
     ).read_text()
     assert "COPY --from=tachometer_scraper /usr/local/bin/tachometer-scraper" in dockerfile
+    assert "artifact: scraper-aarch64-unknown-linux-gnu" in dockerfile
     assert "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT" in text
+    assert "SWEPRO_DYNAMO_ROUTER_KV_EVENTS" in text
+    assert "--no-router-kv-events" in text
+    assert "--router-predicted-ttl-secs" in text
+    assert "KV_EVENTS_ARGS" in text
     assert "SWEPRO_SPEEDSCOPE_TRACE_PATH" not in text

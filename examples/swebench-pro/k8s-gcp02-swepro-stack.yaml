@@ -127,11 +127,20 @@ spec:
           export PYTHONHASHSEED=0
           MODEL_PATH="${SWEPRO_STACK_MODEL_PATH:-/data/glm-4.7-30b-a3b}"
           KV_CACHE_BLOCK_SIZE="${SWEPRO_KV_CACHE_BLOCK_SIZE:-16}"
+          ROUTER_EVENT_ARGS=()
+          if [ "${SWEPRO_DYNAMO_ROUTER_KV_EVENTS:-1}" = "0" ]; then
+            ROUTER_EVENT_ARGS+=(--no-router-kv-events)
+          else
+            ROUTER_EVENT_ARGS+=(--router-kv-events)
+            if [ -n "${SWEPRO_DYNAMO_ROUTER_PREDICTED_TTL_SECS:-5.0}" ]; then
+              ROUTER_EVENT_ARGS+=(--router-predicted-ttl-secs "${SWEPRO_DYNAMO_ROUTER_PREDICTED_TTL_SECS:-5.0}")
+            fi
+          fi
           exec python3 -m dynamo.frontend \
             --http-port 3000 \
             --router-mode kv \
             --kv-cache-block-size "${KV_CACHE_BLOCK_SIZE}" \
-            --router-kv-events \
+            "${ROUTER_EVENT_ARGS[@]}" \
             --discovery-backend etcd \
             --model-path "${MODEL_PATH}"
       env:
@@ -139,6 +148,10 @@ spec:
           value: /shared/Qwen3.5-122B-A10B
         - name: SWEPRO_KV_CACHE_BLOCK_SIZE
           value: "64"
+        - name: SWEPRO_DYNAMO_ROUTER_KV_EVENTS
+          value: "1"
+        - name: SWEPRO_DYNAMO_ROUTER_PREDICTED_TTL_SECS
+          value: "5.0"
       ports:
         - containerPort: 3000
           name: http
@@ -849,6 +862,10 @@ spec:
               --cuda-graph-max-bs "${SGLANG_CUDA_GRAPH_MAX_BS:-64}"
             )
           fi
+          KV_EVENTS_ARGS=()
+          if [ "${SWEPRO_DYNAMO_ROUTER_KV_EVENTS:-1}" != "0" ]; then
+            KV_EVENTS_ARGS+=(--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}')
+          fi
           exec python3 -m dynamo.sglang \
             --model-path "${MODEL_PATH}" \
             --tp ENGINE_TP_PLACEHOLDER \
@@ -857,12 +874,14 @@ spec:
             --trust-remote-code \
             --enable-rl \
             --enable-metrics \
-            --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557","enable_kv_cache_events":true}' \
+            "${KV_EVENTS_ARGS[@]}" \
             "${engine_args[@]}" \
             --mem-fraction-static ENGINE_MEM_FRACTION_STATIC_PLACEHOLDER
       env:
         - name: SWEPRO_STACK_MODEL_PATH
           value: /shared/Qwen3.5-122B-A10B
+        - name: SWEPRO_DYNAMO_ROUTER_KV_EVENTS
+          value: "1"
         - name: SWEPRO_ENGINE_PROFILE
           value: qwen35
         - name: SGLANG_QWEN35_ATTENTION_BACKEND
