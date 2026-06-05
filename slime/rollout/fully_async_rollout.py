@@ -29,6 +29,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import copy
+import json
 import logging
 import os
 import queue
@@ -43,8 +44,10 @@ from slime.utils.types import Sample
 
 __all__ = [
     "AsyncRolloutWorker",
+    "cleanup_rollout",
     "generate_rollout_fully_async",
     "rollout_with_mock_trainer",
+    "stop_global_worker",
 ]
 
 logger = logging.getLogger("slime.rollout.fully_async")
@@ -68,6 +71,47 @@ def _get_positive_int_env(name: str, default: int) -> int:
         logger.warning("ignoring non-positive %s=%r; using %d", name, value, default)
         return default
     return parsed
+
+
+def _get_non_negative_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r; using %d", name, value, default)
+        return default
+    if parsed < 0:
+        logger.warning("ignoring negative %s=%r; using %d", name, value, default)
+        return default
+    return parsed
+
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _get_non_negative_float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r; using %.3f", name, value, default)
+        return default
+    if parsed < 0:
+        logger.warning("ignoring negative %s=%r; using %.3f", name, value, default)
+        return default
+    return parsed
+
+
+def _print_json_event(prefix: str, **fields) -> None:
+    print(f"{prefix} {json.dumps(fields, sort_keys=True)}", flush=True)
 
 
 def _get_non_negative_float_arg_or_env(args, attr: str, env_name: str, default: float = 0.0) -> float:
@@ -200,15 +244,16 @@ def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
         return _global_worker
 
 
-def _stop_global_worker() -> None:
+def stop_global_worker() -> None:
     global _global_worker
     with _worker_lock:
         if _global_worker is not None:
-            _global_worker.stop()
-            _global_worker = None
+            stopped = _global_worker.stop()
+            if stopped:
+                _global_worker = None
 
 
-atexit.register(_stop_global_worker)
+atexit.register(stop_global_worker)
 
 
 class AsyncRolloutWorker:
@@ -219,6 +264,7 @@ class AsyncRolloutWorker:
         self.args = args
         self.data_buffer = data_buffer
         self.concurrency = _get_positive_int_env("SWEPRO_ASYNC_MAX_INFLIGHT", concurrency)
+        self.max_started_groups = _get_non_negative_int_env("SWEPRO_ASYNC_MAX_STARTED_GROUPS", 0)
         self.max_thread_workers = _get_positive_int_env(
             "SWEPRO_ASYNC_THREADPOOL_WORKERS",
             max(
@@ -231,6 +277,8 @@ class AsyncRolloutWorker:
         self.worker_thread: threading.Thread | None = None
         self.state = GenerateState(args)
         self.max_group_attempts = _get_positive_int_env("SWEPRO_ASYNC_GROUP_MAX_ATTEMPTS", 1)
+        self.shutdown_drain = _get_bool_env("SWEPRO_ASYNC_SHUTDOWN_DRAIN", True)
+        self.shutdown_timeout_s = _get_non_negative_float_env("SWEPRO_ASYNC_SHUTDOWN_TIMEOUT", 300.0)
         self.active_count = 0
         self.started_count = 0
         self.completed_count = 0
@@ -239,6 +287,40 @@ class AsyncRolloutWorker:
         self.sample_retry_count = 0
         self.sample_retry_success_count = 0
         self.exhausted_group_retry_count = 0
+        self.accepted_group_count = 0
+        self.returned_group_count = 0
+        self.cancelled_count = 0
+        self.shutdown_drained_count = 0
+        self.shutdown_cancelled_count = 0
+
+    def snapshot(self) -> dict[str, int | float | bool]:
+        inflight_by_count = max(0, self.started_count - self.completed_count - self.failed_count - self.cancelled_count)
+        return {
+            "active": int(inflight_by_count),
+            "queue_size": int(self.queue_size()),
+            "started": int(self.started_count),
+            "completed": int(self.completed_count),
+            "failed": int(self.failed_count),
+            "cancelled": int(self.cancelled_count),
+            "accepted": int(self.accepted_group_count),
+            "returned_to_buffer": int(self.returned_group_count),
+            "aborted_groups": int(self.aborted_group_count),
+            "sample_retries": int(self.sample_retry_count),
+            "sample_retry_successes": int(self.sample_retry_success_count),
+            "exhausted_group_retries": int(self.exhausted_group_retry_count),
+            "max_inflight": int(self.concurrency),
+            "threadpool_workers": int(self.max_thread_workers),
+            "group_max_attempts": int(self.max_group_attempts),
+            "shutdown_drain": bool(self.shutdown_drain),
+            "shutdown_timeout_s": float(self.shutdown_timeout_s),
+            "shutdown_drained": int(self.shutdown_drained_count),
+            "shutdown_cancelled": int(self.shutdown_cancelled_count),
+            "max_started_groups": int(self.max_started_groups),
+            "inflight_by_count": int(inflight_by_count),
+        }
+
+    def log_summary(self, event: str, **extra) -> None:
+        _print_json_event("SWEPRO_ASYNC_WORKER_SUMMARY", event=event, **self.snapshot(), **extra)
 
     # -- public --------------------------------------------------------------
 
@@ -246,11 +328,22 @@ class AsyncRolloutWorker:
         if self.worker_thread is None or not self.worker_thread.is_alive():
             self.worker_thread = threading.Thread(target=self._thread_main, name="fully-async-rollout", daemon=True)
             self.worker_thread.start()
+            self.log_summary("worker_started", return_batch_size=int(self.args.rollout_batch_size))
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self.running = False
         if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=5)
+            join_timeout = (self.shutdown_timeout_s + 5) if self.shutdown_drain else 5
+            self.worker_thread.join(timeout=join_timeout)
+            if self.worker_thread.is_alive():
+                logger.warning(
+                    "fully-async worker still alive after %.1fs; in-flight requests may finish in the background",
+                    join_timeout,
+                )
+                self.log_summary("worker_stop_timeout", join_timeout_s=join_timeout)
+                return False
+        self.log_summary("stop_called")
+        return True
 
     def get_completed_groups(self) -> list[tuple[int, list[Sample]]]:
         completed: list[tuple[int, list[Sample]]] = []
@@ -277,7 +370,7 @@ class AsyncRolloutWorker:
             asyncio.set_event_loop(loop)
             loop.run_until_complete(self._loop())
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=self.shutdown_drain, cancel_futures=True)
             loop.close()
 
     async def _generate_group_with_retries(self, gid: int, sample_group: list[Sample]) -> list[Sample]:
@@ -365,6 +458,8 @@ class AsyncRolloutWorker:
 
                 # Top up.
                 while len(active_tasks) < max_concurrent and self.running:
+                    if self.max_started_groups and self.started_count >= self.max_started_groups:
+                        break
                     groups = self.data_buffer.get_samples(1)
                     if not groups:
                         break
@@ -384,18 +479,41 @@ class AsyncRolloutWorker:
 
         if active_tasks:
             logger.info(
-                "fully-async: waiting for %d in-flight tasks to drain",
+                "fully-async: stopping with %d in-flight tasks (drain=%s, timeout=%.1fs)",
                 len(active_tasks),
+                self.shutdown_drain,
+                self.shutdown_timeout_s,
             )
-            try:
-                await asyncio.wait(active_tasks, timeout=30)
-            except Exception:  # noqa: BLE001
-                pass
+            if self.shutdown_drain:
+                timeout = self.shutdown_timeout_s if self.shutdown_timeout_s > 0 else None
+                done_tasks, pending_tasks = await asyncio.wait(active_tasks, timeout=timeout)
+                self.shutdown_drained_count += len(done_tasks)
+                for task in done_tasks:
+                    try:
+                        task.result()
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+                if pending_tasks:
+                    self.shutdown_cancelled_count += len(pending_tasks)
+                    for task in pending_tasks:
+                        task.cancel()
+                    await asyncio.gather(*pending_tasks, return_exceptions=True)
+            else:
+                self.shutdown_cancelled_count += len(active_tasks)
+                for task in active_tasks:
+                    task.cancel()
+                await asyncio.gather(*active_tasks, return_exceptions=True)
+
+        self.active_count = 0
+        self.log_summary("worker_stopped")
 
     def _make_done_cb(self, gid: int):
         def _cb(done_task: asyncio.Task) -> None:
             try:
                 result = done_task.result()
+            except asyncio.CancelledError:
+                self.cancelled_count += 1
+                return
             except Exception:  # noqa: BLE001
                 self.failed_count += 1
                 logger.exception("fully-async: process task raised")
@@ -412,6 +530,7 @@ class AsyncRolloutWorker:
                 self.aborted_group_count += 1
                 try:
                     self.data_buffer.add_samples([result])
+                    self.returned_group_count += 1
                 except Exception:  # noqa: BLE001
                     logger.exception("fully-async: failed to requeue aborted group")
                 return
@@ -443,6 +562,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
             drained = 0
             for gid, group in worker.get_completed_groups():
                 collected[gid] = group
+                worker.accepted_group_count += 1
                 drained += 1
 
             if not drained:
@@ -470,6 +590,24 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
                 )
                 last_log = now
 
+            if (
+                worker.max_started_groups
+                and worker.started_count >= worker.max_started_groups
+                and worker.snapshot()["inflight_by_count"] == 0
+                and worker.queue_size() == 0
+                and len(collected) < target
+            ):
+                worker.log_summary(
+                    "max_started_exhausted",
+                    rollout_id=int(rollout_id),
+                    target_groups=int(target),
+                    returned_groups=len(collected),
+                )
+                raise RuntimeError(
+                    "SWEPRO_ASYNC_MAX_STARTED_GROUPS was exhausted before the rollout batch filled: "
+                    f"started={worker.started_count}, returned={len(collected)}, target={target}"
+                )
+
     # Order by sample.index for determinism (slime convention).
     def _key(group: list[Sample]) -> int:
         for s in group:
@@ -484,6 +622,13 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         rollout_id,
         time.time() - started,
         worker.queue_size(),
+    )
+    worker.log_summary(
+        "batch_returned",
+        rollout_id=int(rollout_id),
+        target_groups=int(target),
+        returned_groups=len(out),
+        duration_s=round(time.time() - started, 3),
     )
     return out
 
@@ -505,3 +650,8 @@ def rollout_with_mock_trainer(args, rollout_id, data_buffer, evaluation: bool = 
     completed_samples = generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation=evaluation)
     _sleep_mock_trainer(args, rollout_id, completed_samples)
     return completed_samples
+
+
+def cleanup_rollout(args) -> None:
+    """Stop the continuous worker when RolloutManager is disposed."""
+    stop_global_worker()

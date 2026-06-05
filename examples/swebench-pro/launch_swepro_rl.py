@@ -10,9 +10,132 @@ import re
 import shlex
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+RUN_CONFIG_ENV_MAP: dict[tuple[str, ...], tuple[str, ...]] = {
+    ("model", "args_script"): ("SWEPRO_MODEL_ARGS_SCRIPT",),
+    ("model", "model"): ("SWEPRO_MODEL",),
+    ("model", "hf_checkpoint"): ("SWEPRO_HF_CHECKPOINT",),
+    ("model", "ref_load"): ("SWEPRO_REF_LOAD",),
+    ("model", "prompt_data"): ("SWEPRO_PROMPT_DATA",),
+    ("model", "input_key"): ("SWEPRO_INPUT_KEY",),
+    ("model", "label_key"): ("SWEPRO_LABEL_KEY",),
+    ("rollout", "function_path"): ("SWEPRO_ROLLOUT_FUNCTION_PATH",),
+    ("rollout", "num_rollout"): ("SWEPRO_NUM_ROLLOUT",),
+    ("rollout", "batch_size"): ("SWEPRO_ROLLOUT_BATCH_SIZE",),
+    ("rollout", "over_sampling_batch_size"): ("SWEPRO_OVER_SAMPLING_BATCH_SIZE",),
+    ("rollout", "n_samples_per_prompt"): ("SWEPRO_N_SAMPLES_PER_PROMPT",),
+    ("rollout", "global_batch_size"): ("SWEPRO_GLOBAL_BATCH_SIZE",),
+    ("rollout", "temperature"): ("SWEPRO_TEMPERATURE",),
+    ("agent", "mode"): ("SWEPRO_AGENT_MODE",),
+    ("agent", "max_tool_calls"): ("SWEPRO_MAX_TOOL_CALLS",),
+    ("agent", "episode_wall_timeout"): ("SWEPRO_EPISODE_WALL_TIMEOUT",),
+    ("agent", "turn_max_tokens"): ("SWEPRO_TURN_MAX_TOKENS",),
+    ("request_timeouts", "model_call_timeout"): ("SWEPRO_MODEL_CALL_TIMEOUT",),
+    ("request_timeouts", "request_timeout"): ("SWEPRO_REQUEST_TIMEOUT",),
+    ("request_timeouts", "request_retries"): ("SWEPRO_REQUEST_RETRIES",),
+    ("request_timeouts", "session_start_timeout"): ("SWEPRO_SESSION_START_TIMEOUT",),
+    ("request_timeouts", "session_start_call_timeout"): ("SWEPRO_SESSION_START_CALL_TIMEOUT",),
+    ("request_timeouts", "session_step_request_timeout"): ("SWEPRO_SESSION_STEP_REQUEST_TIMEOUT",),
+    ("request_timeouts", "session_step_call_timeout"): ("SWEPRO_SESSION_STEP_CALL_TIMEOUT",),
+    ("request_timeouts", "session_submit_request_timeout"): ("SWEPRO_SESSION_SUBMIT_REQUEST_TIMEOUT",),
+    ("request_timeouts", "session_submit_call_timeout"): ("SWEPRO_SESSION_SUBMIT_CALL_TIMEOUT",),
+    ("request_timeouts", "session_close_timeout"): ("SWEPRO_SESSION_CLOSE_TIMEOUT",),
+    ("request_timeouts", "session_close_call_timeout"): ("SWEPRO_SESSION_CLOSE_CALL_TIMEOUT",),
+    ("request_timeouts", "session_health_timeout"): ("SWEPRO_SESSION_HEALTH_TIMEOUT",),
+    ("request_timeouts", "session_health_call_timeout"): ("SWEPRO_SESSION_HEALTH_CALL_TIMEOUT",),
+    ("request_timeouts", "session_capacity_retry_delay"): ("SWEPRO_SESSION_CAPACITY_RETRY_DELAY",),
+    ("request_timeouts", "session_rollout_retries"): ("SWEPRO_SESSION_ROLLOUT_RETRIES",),
+    ("mock_trainer", "enabled"): ("SWEPRO_ROLLOUT_WITH_MOCK_TRAINER",),
+    ("mock_trainer", "tokens_per_second"): ("SWEPRO_MOCK_TRAINER_TOKENS_PER_SECOND",),
+    ("mock_trainer", "weight_update_seconds"): ("SWEPRO_MOCK_WEIGHT_UPDATE_SECONDS",),
+    ("trace_replay", "path"): ("SWEPRO_TRACE_REPLAY_PATH",),
+    ("trace_replay", "mock_env_trace_path"): ("SWEPRO_MOCK_ENV_TRACE_PATH",),
+    ("trace_replay", "trace_replay_path"): ("SWEPRO_TRACE_REPLAY_PATH",),
+    ("trace_replay", "scale"): ("SWEPRO_MOCK_ENV_SCALE",),
+    ("trace_replay", "force_fixed_decode"): ("SWEPRO_TRACE_REPLAY_FORCE_FIXED_DECODE",),
+    ("trace_replay", "mock_reward"): ("SWEPRO_MOCK_REWARD",),
+    ("trace_replay", "reward"): ("SWEPRO_MOCK_ENV_REWARD",),
+    ("trace_replay", "completions_debug"): ("SWEPRO_COMPLETIONS_DEBUG",),
+    ("async_worker", "max_inflight"): ("SWEPRO_ASYNC_MAX_INFLIGHT",),
+    ("async_worker", "max_started_groups"): ("SWEPRO_ASYNC_MAX_STARTED_GROUPS",),
+    ("async_worker", "threadpool_workers"): ("SWEPRO_ASYNC_THREADPOOL_WORKERS",),
+    ("async_worker", "group_max_attempts"): ("SWEPRO_ASYNC_GROUP_MAX_ATTEMPTS",),
+    ("async_worker", "shutdown_drain"): ("SWEPRO_ASYNC_SHUTDOWN_DRAIN",),
+    ("async_worker", "shutdown_timeout"): ("SWEPRO_ASYNC_SHUTDOWN_TIMEOUT",),
+    ("routing", "frontend_url"): ("DYNAMO_FRONTEND_URL",),
+    ("routing", "dynamo_frontend_url"): ("DYNAMO_FRONTEND_URL",),
+    ("routing", "swepro_dynamo_frontend_url"): ("SWEPRO_DYNAMO_FRONTEND_URL",),
+    ("routing", "tool_events_zmq_endpoint"): ("SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT",),
+    ("routing", "tool_events_zmq_port"): ("SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_PORT",),
+    ("routing", "nats_url"): ("SWEPRO_NATS_URL",),
+    ("routing", "request_plane"): ("DYN_REQUEST_PLANE",),
+    ("routing", "tcp_request_timeout"): ("DYN_TCP_REQUEST_TIMEOUT",),
+    ("routing", "http_backend_stream_timeout_secs"): ("DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS",),
+    ("routing", "sglang_server_concurrency"): ("SWEPRO_SGLANG_SERVER_CONCURRENCY",),
+    ("routing", "router_variant"): ("SWEPRO_ROUTER_VARIANT",),
+    ("routing", "router_kv_events"): ("SWEPRO_DYNAMO_ROUTER_KV_EVENTS",),
+    ("routing", "router_predicted_ttl_secs"): ("SWEPRO_DYNAMO_ROUTER_PREDICTED_TTL_SECS",),
+    ("routing", "engine_route_logging"): ("SLIME_DYNAMO_ENGINE_ROUTE_LOGGING",),
+    ("trainer", "actor_num_nodes"): ("SWEPRO_ACTOR_NUM_NODES",),
+    ("trainer", "actor_num_gpus_per_node"): ("SWEPRO_ACTOR_NUM_GPUS_PER_NODE",),
+    ("trainer", "tp"): ("SWEPRO_TP",),
+    ("trainer", "pp"): ("SWEPRO_PP",),
+    ("trainer", "cp"): ("SWEPRO_CP",),
+    ("trainer", "ep"): ("SWEPRO_EP",),
+    ("trainer", "etp"): ("SWEPRO_ETP",),
+    ("trainer", "qkv_format"): ("SWEPRO_QKV_FORMAT",),
+    ("trainer", "sequence_parallel"): ("SWEPRO_SEQUENCE_PARALLEL",),
+    ("trainer", "use_dynamic_batch_size"): ("SWEPRO_USE_DYNAMIC_BATCH_SIZE",),
+    ("trainer", "micro_batch_size"): ("SWEPRO_MICRO_BATCH_SIZE",),
+    ("trainer", "moe_token_dispatcher_type"): ("SWEPRO_MOE_TOKEN_DISPATCHER_TYPE",),
+    ("trainer", "seq_length"): ("SWEPRO_SEQ_LENGTH",),
+    ("trainer", "max_context_len"): ("SWEPRO_MAX_CONTEXT_LEN",),
+    ("trainer", "max_response_len"): ("SWEPRO_MAX_RESPONSE_LEN",),
+    ("trainer", "rollout_num_gpus"): ("SWEPRO_ROLLOUT_NUM_GPUS",),
+    ("trainer", "rollout_num_gpus_per_engine"): ("SWEPRO_ROLLOUT_NUM_GPUS_PER_ENGINE",),
+    ("trainer", "max_tokens_per_gpu"): ("SWEPRO_MAX_TOKENS_PER_GPU",),
+    ("trainer", "log_probs_chunk_size"): ("SWEPRO_LOG_PROBS_CHUNK_SIZE",),
+    ("trainer", "defer_fp32_logits"): ("SWEPRO_DEFER_FP32_LOGITS",),
+    ("trainer", "disable_save"): ("SWEPRO_DISABLE_SAVE",),
+    ("trainer", "disable_weights_backuper"): ("SWEPRO_DISABLE_WEIGHTS_BACKUPER",),
+    ("trainer", "update_weights_interval"): ("SWEPRO_UPDATE_WEIGHTS_INTERVAL",),
+    ("trainer", "update_weight_buffer_size"): ("SWEPRO_UPDATE_WEIGHT_BUFFER_SIZE",),
+    ("trainer", "distributed_timeout_minutes"): ("SWEPRO_DISTRIBUTED_TIMEOUT_MINUTES",),
+    ("trainer", "optimizer_cpu_offload"): ("SWEPRO_OPTIMIZER_CPU_OFFLOAD",),
+    ("trainer", "use_precision_aware_optimizer"): ("SWEPRO_USE_PRECISION_AWARE_OPTIMIZER",),
+    ("trainer", "overlap_cpu_optimizer_d2h_h2d"): ("SWEPRO_OVERLAP_CPU_OPTIMIZER_D2H_H2D",),
+    ("tachometer", "enabled"): ("SWEPRO_TACHOMETER_ENABLED",),
+    ("tachometer", "binary"): ("SWEPRO_TACHOMETER_BIN",),
+    ("tachometer", "frequency"): ("SWEPRO_TACHOMETER_FREQ",),
+    ("tachometer", "rows_per_parquet"): ("SWEPRO_TACHOMETER_ROWS_PER_PARQUET",),
+    ("tachometer", "save_interval_secs"): ("SWEPRO_TACHOMETER_SAVE_INTERVAL_SECS",),
+    ("tachometer", "sync_interval_secs"): ("SWEPRO_TACHOMETER_SYNC_INTERVAL_SECS",),
+    ("tachometer", "discovery_timeout"): ("SWEPRO_TACHOMETER_DISCOVERY_TIMEOUT",),
+    ("tachometer", "dyn_system_port"): ("SWEPRO_DYNAMO_WORKER_SYSTEM_PORT",),
+    ("tachometer", "nixl_port"): ("SWEPRO_TACHOMETER_NIXL_PORT",),
+    ("engine_warmup", "enabled"): ("SWEPRO_ENGINE_WARMUP_ENABLED",),
+    ("engine_warmup", "required"): ("SWEPRO_ENGINE_WARMUP_REQUIRED",),
+    ("engine_warmup", "expected_engines"): ("SWEPRO_ENGINE_WARMUP_EXPECTED_ENGINES",),
+    ("engine_warmup", "isl"): ("SWEPRO_ENGINE_WARMUP_ISL",),
+    ("engine_warmup", "osl"): ("SWEPRO_ENGINE_WARMUP_OSL",),
+    ("engine_warmup", "token_id"): ("SWEPRO_ENGINE_WARMUP_TOKEN_ID",),
+    ("engine_warmup", "timeout"): ("SWEPRO_ENGINE_WARMUP_TIMEOUT",),
+    ("engine_warmup", "discovery_timeout"): ("SWEPRO_ENGINE_WARMUP_DISCOVERY_TIMEOUT",),
+    ("engine_warmup", "model"): ("SWEPRO_ENGINE_WARMUP_MODEL",),
+}
+RUN_CONFIG_IGNORED_TOP_LEVEL = {"version", "description", "notes"}
+RUN_CONFIG_RUNTIME_EXCLUDED_KEYS = {
+    "SLIME_SPEEDSCOPE_TRACE_PATH",
+    "SWEPRO_MODEL_TRACE_PATH",
+    "SWEPRO_SPEEDSCOPE_TRACE_PATH",
+}
 
 
 def env_flag(env: dict[str, str], name: str, default: bool) -> bool:
@@ -32,6 +155,129 @@ def env_int(env: dict[str, str], name: str, default: int) -> int:
 def env_str(env: dict[str, str], name: str, default: str) -> str:
     value = env.get(name)
     return default if value is None or value == "" else value
+
+
+def _resolve_config_path(path: str, repo_root: Path) -> Path:
+    config_path = Path(path).expanduser()
+    if config_path.is_absolute():
+        return config_path
+    repo_relative = repo_root / config_path
+    if repo_relative.exists():
+        return repo_relative
+    return Path.cwd() / config_path
+
+
+def _config_env_value(value) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (list, tuple, dict)):
+        return json.dumps(value, separators=(",", ":"))
+    return str(value)
+
+
+def _lookup_config_value(config: dict, path: tuple[str, ...]):
+    current = config
+    for part in path:
+        if not isinstance(current, dict) or part not in current:
+            return None, False
+        current = current[part]
+    return current, True
+
+
+def _validate_run_config_keys(config: dict) -> None:
+    allowed_paths = set(RUN_CONFIG_ENV_MAP)
+
+    def is_known_prefix(path: tuple[str, ...]) -> bool:
+        return any(allowed[: len(path)] == path for allowed in allowed_paths)
+
+    unknown: list[str] = []
+
+    def visit(path: tuple[str, ...], value) -> None:
+        if not path:
+            if not isinstance(value, dict):
+                return
+            for key, child in value.items():
+                visit((str(key),), child)
+            return
+        if path[0] == "env" or path[0] in RUN_CONFIG_IGNORED_TOP_LEVEL:
+            return
+        if not is_known_prefix(path):
+            unknown.append(".".join(path))
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit((*path, str(key)), child)
+        elif path not in allowed_paths:
+            unknown.append(".".join(path))
+
+    visit((), config)
+    if unknown:
+        formatted = ", ".join(sorted(unknown))
+        raise ValueError(f"unknown SWE-Pro run config key(s): {formatted}; use env: for raw environment variables")
+
+
+def load_run_config_env(config_path: str, repo_root: Path) -> tuple[Path, dict[str, str]]:
+    resolved = _resolve_config_path(config_path, repo_root)
+    if not resolved.exists():
+        raise FileNotFoundError(f"SWE-Pro run config not found: {resolved}")
+
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required when using --run-config or SWEPRO_RUN_CONFIG") from exc
+
+    loaded = yaml.safe_load(resolved.read_text(encoding="utf-8"))
+    if loaded is None:
+        loaded = {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"SWE-Pro run config must be a YAML mapping: {resolved}")
+
+    _validate_run_config_keys(loaded)
+    config_env: dict[str, str] = {}
+
+    raw_env = loaded.get("env", {})
+    if raw_env is None:
+        raw_env = {}
+    if not isinstance(raw_env, dict):
+        raise ValueError("SWE-Pro run config env: section must be a mapping")
+    for key, value in raw_env.items():
+        if value is None:
+            continue
+        config_env[str(key)] = _config_env_value(value)
+
+    for path, env_names in RUN_CONFIG_ENV_MAP.items():
+        value, found = _lookup_config_value(loaded, path)
+        if not found or value is None:
+            continue
+        for env_name in env_names:
+            config_env[env_name] = _config_env_value(value)
+
+    return resolved, config_env
+
+
+def apply_run_config_env(
+    env: dict[str, str],
+    config_env: dict[str, str],
+    *,
+    override_existing: bool = False,
+) -> tuple[dict[str, str], dict[str, str]]:
+    applied: dict[str, str] = {}
+    skipped: dict[str, str] = {}
+    for key, value in config_env.items():
+        if override_existing or env.get(key) in {None, ""}:
+            env[key] = value
+            applied[key] = value
+        else:
+            skipped[key] = env[key]
+    return applied, skipped
+
+
+def resolve_run_config_derived_values(env: dict[str, str]) -> None:
+    max_started = env.get("SWEPRO_ASYNC_MAX_STARTED_GROUPS")
+    if max_started and max_started.strip().lower() == "auto":
+        env["SWEPRO_ASYNC_MAX_STARTED_GROUPS"] = str(
+            env_int(env, "SWEPRO_NUM_ROLLOUT", 1) * env_int(env, "SWEPRO_ROLLOUT_BATCH_SIZE", 4)
+        )
 
 
 def default_run_id() -> str:
@@ -165,6 +411,20 @@ class TachometerConfig:
     expected_engines: int
 
 
+@dataclass(frozen=True)
+class EngineWarmupConfig:
+    enabled: bool
+    frontend_url: str
+    expected_engines: int
+    isl: int
+    osl: int
+    token_id: int
+    timeout: float
+    discovery_timeout: int
+    model: str
+    required: bool
+
+
 def derive_config(env: dict[str, str]) -> DerivedConfig:
     actor_num_nodes = env_int(env, "SWEPRO_ACTOR_NUM_NODES", 1)
     actor_num_gpus_per_node = env_int(env, "SWEPRO_ACTOR_NUM_GPUS_PER_NODE", 4)
@@ -228,6 +488,33 @@ def tachometer_config(env: dict[str, str]) -> TachometerConfig:
         dyn_system_port=env_int(env, "SWEPRO_DYNAMO_WORKER_SYSTEM_PORT", 30001),
         nixl_port=env_int(env, "SWEPRO_TACHOMETER_NIXL_PORT", 19090),
         expected_engines=expected_engines,
+    )
+
+
+def engine_warmup_config(env: dict[str, str], tachometer: TachometerConfig) -> EngineWarmupConfig:
+    return EngineWarmupConfig(
+        enabled=env_flag(env, "SWEPRO_ENGINE_WARMUP_ENABLED", False),
+        frontend_url=env_str(env, "DYNAMO_FRONTEND_URL", "http://warnold-swepro-frontend:3000").rstrip("/"),
+        expected_engines=env_int(env, "SWEPRO_ENGINE_WARMUP_EXPECTED_ENGINES", tachometer.expected_engines),
+        isl=env_int(
+            env,
+            "SWEPRO_ENGINE_WARMUP_ISL",
+            env_int(
+                env,
+                "SGLANG_CHUNKED_PREFILL_SIZE",
+                env_int(
+                    env,
+                    "SGLANG_MAX_PREFILL_TOKENS",
+                    env_int(env, "SWEPRO_PREFILL_CHUNK_SIZE", env_int(env, "SWEPRO_MAX_TOKENS_PER_GPU", 16384)),
+                ),
+            ),
+        ),
+        osl=env_int(env, "SWEPRO_ENGINE_WARMUP_OSL", 1),
+        token_id=env_int(env, "SWEPRO_ENGINE_WARMUP_TOKEN_ID", 100),
+        timeout=float(env_str(env, "SWEPRO_ENGINE_WARMUP_TIMEOUT", "900")),
+        discovery_timeout=env_int(env, "SWEPRO_ENGINE_WARMUP_DISCOVERY_TIMEOUT", 600),
+        model=env_str(env, "SWEPRO_ENGINE_WARMUP_MODEL", ""),
+        required=env_flag(env, "SWEPRO_ENGINE_WARMUP_REQUIRED", True),
     )
 
 
@@ -318,6 +605,7 @@ def runtime_env(env: dict[str, str], repo_root: Path, has_nvlink: str) -> dict[s
         "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_PORT": env_str(env, "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_PORT", "20390"),
         "SWEPRO_NATS_URL": env_str(env, "SWEPRO_NATS_URL", "nats://warnold-swepro-nats:4222"),
         "SWEPRO_AGENT_MODE": env_str(env, "SWEPRO_AGENT_MODE", "sweagent_session"),
+        "SWEPRO_COMPLETIONS_DEBUG": env.get("SWEPRO_COMPLETIONS_DEBUG", ""),
         "SWEPRO_MAX_TOOL_CALLS": env_str(env, "SWEPRO_MAX_TOOL_CALLS", "0"),
         "SWEPRO_EPISODE_WALL_TIMEOUT": env_str(env, "SWEPRO_EPISODE_WALL_TIMEOUT", "0"),
         "SWEPRO_TURN_MAX_TOKENS": env_str(env, "SWEPRO_TURN_MAX_TOKENS", "0"),
@@ -362,14 +650,180 @@ def runtime_env(env: dict[str, str], repo_root: Path, has_nvlink: str) -> dict[s
         "SWEPRO_SESSION_CAPACITY_RETRY_DELAY": env_str(env, "SWEPRO_SESSION_CAPACITY_RETRY_DELAY", "10"),
         "SWEPRO_SESSION_ROLLOUT_RETRIES": env_str(env, "SWEPRO_SESSION_ROLLOUT_RETRIES", "0"),
         "SWEPRO_ASYNC_MAX_INFLIGHT": env.get("SWEPRO_ASYNC_MAX_INFLIGHT", ""),
+        "SWEPRO_ASYNC_MAX_STARTED_GROUPS": env.get("SWEPRO_ASYNC_MAX_STARTED_GROUPS", ""),
         "SWEPRO_ASYNC_GROUP_MAX_ATTEMPTS": env_str(env, "SWEPRO_ASYNC_GROUP_MAX_ATTEMPTS", "1"),
+        "SWEPRO_ASYNC_SHUTDOWN_DRAIN": env_str(env, "SWEPRO_ASYNC_SHUTDOWN_DRAIN", "1"),
+        "SWEPRO_ASYNC_SHUTDOWN_TIMEOUT": env_str(env, "SWEPRO_ASYNC_SHUTDOWN_TIMEOUT", "300"),
         "SWEPRO_ROLLOUT_WITH_MOCK_TRAINER": env.get("SWEPRO_ROLLOUT_WITH_MOCK_TRAINER", ""),
         "SWEPRO_MOCK_TRAINER_TOKENS_PER_SECOND": env.get("SWEPRO_MOCK_TRAINER_TOKENS_PER_SECOND", ""),
         "SWEPRO_MOCK_WEIGHT_UPDATE_SECONDS": env.get("SWEPRO_MOCK_WEIGHT_UPDATE_SECONDS", ""),
+        "SWEPRO_MOCK_ENV_TRACE_PATH": env.get("SWEPRO_MOCK_ENV_TRACE_PATH", ""),
+        "SWEPRO_TRACE_REPLAY_PATH": env.get("SWEPRO_TRACE_REPLAY_PATH", ""),
+        "SWEPRO_MOCK_ENV_SCALE": env.get("SWEPRO_MOCK_ENV_SCALE", ""),
+        "SWEPRO_TRACE_REPLAY_FORCE_FIXED_DECODE": env.get("SWEPRO_TRACE_REPLAY_FORCE_FIXED_DECODE", ""),
+        "SWEPRO_MOCK_REWARD": env.get("SWEPRO_MOCK_REWARD", ""),
+        "SWEPRO_MOCK_ENV_REWARD": env.get("SWEPRO_MOCK_ENV_REWARD", ""),
     }
+    for key in sorted(env):
+        if key in env_vars or key in RUN_CONFIG_RUNTIME_EXCLUDED_KEYS:
+            continue
+        if key.startswith(("DYN_", "SGLANG_", "SLIME_", "SWEPRO_")):
+            env_vars[key] = env.get(key, "")
     return {
         "env_vars": {key: value for key, value in env_vars.items() if value != ""}
     }
+
+
+def _http_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = 30.0,
+) -> dict:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8")
+    return json.loads(raw) if raw else {}
+
+
+def _parse_transport_host(transport_tcp: str) -> str:
+    return transport_tcp.split("/", 1)[0].rsplit(":", 1)[0]
+
+
+def _discover_dynamo_generate_workers(config: EngineWarmupConfig) -> dict[str, str]:
+    deadline = time.time() + config.discovery_timeout
+    last_workers: dict[str, str] = {}
+    while time.time() < deadline:
+        try:
+            health = _http_json(f"{config.frontend_url}/health", timeout=5)
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            time.sleep(2)
+            continue
+        workers: dict[str, str] = {}
+        for inst in health.get("instances", []):
+            if inst.get("endpoint") != "generate":
+                continue
+            instance_id = inst.get("instance_id")
+            transport = inst.get("transport") or {}
+            tcp = transport.get("tcp")
+            nats_tcp = transport.get("nats_tcp")
+            if instance_id is None or not (tcp or nats_tcp):
+                continue
+            workers[str(instance_id)] = _parse_transport_host(str(tcp)) if tcp else str(nats_tcp)
+        if workers:
+            last_workers = dict(sorted(workers.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]))
+        if len(last_workers) >= config.expected_engines:
+            return last_workers
+        time.sleep(2)
+    return last_workers
+
+
+def _warmup_model_name(config: EngineWarmupConfig) -> str:
+    if config.model:
+        return config.model
+    try:
+        models = _http_json(f"{config.frontend_url}/v1/models", timeout=10)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return "default"
+    data = models.get("data") or []
+    if data and isinstance(data[0], dict) and data[0].get("id"):
+        return str(data[0]["id"])
+    return "default"
+
+
+def warmup_dynamo_workers(
+    config: EngineWarmupConfig,
+    durable_logs: DurableLogConfig,
+    *,
+    run_id: str,
+) -> list[dict[str, object]]:
+    if not config.enabled:
+        return []
+
+    workers = _discover_dynamo_generate_workers(config)
+    if len(workers) < config.expected_engines:
+        message = f"discovered {len(workers)} Dynamo generate workers, expected {config.expected_engines}"
+        if config.required:
+            raise RuntimeError(message)
+        print(f"warning: {message}; warming discovered workers only")
+
+    model = _warmup_model_name(config)
+    prompt = [config.token_id] * max(1, config.isl)
+    results: list[dict[str, object]] = []
+    print(
+        "SWEPRO engine warmup: "
+        f"workers={len(workers)}, isl={len(prompt)}, osl={config.osl}, model={model}"
+    )
+    for idx, worker_id in enumerate(workers):
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": config.osl,
+            "min_tokens": config.osl,
+            "ignore_eos": True,
+            "temperature": 0,
+            "stream": False,
+            "nvext": {"agent_hints": {"osl": config.osl}},
+        }
+        headers = {
+            "x-worker-instance-id": worker_id,
+            "x-request-id": f"{run_id}:warmup:{idx}:{worker_id}",
+        }
+        started = time.time()
+        result: dict[str, object] = {
+            "worker_id": worker_id,
+            "worker_host": workers[worker_id],
+            "request_id": headers["x-request-id"],
+            "isl": len(prompt),
+            "osl": config.osl,
+        }
+        try:
+            response = _http_json(
+                f"{config.frontend_url}/v1/completions",
+                method="POST",
+                payload=payload,
+                headers=headers,
+                timeout=config.timeout,
+            )
+            elapsed = time.time() - started
+            choice = (response.get("choices") or [{}])[0]
+            usage = response.get("usage") or {}
+            result.update(
+                {
+                    "ok": True,
+                    "elapsed_s": elapsed,
+                    "finish_reason": choice.get("finish_reason"),
+                    "usage": usage,
+                }
+            )
+            print(
+                "SWEPRO engine warmup: "
+                f"worker={worker_id} elapsed={elapsed:.3f}s finish={choice.get('finish_reason')} "
+                f"usage={usage}"
+            )
+        except Exception as exc:
+            result.update({"ok": False, "elapsed_s": time.time() - started, "error": repr(exc)})
+            print(f"SWEPRO engine warmup failed: worker={worker_id} error={exc!r}")
+            if config.required:
+                results.append(result)
+                if durable_logs.enabled:
+                    durable_logs.log_dir.mkdir(parents=True, exist_ok=True)
+                    (durable_logs.log_dir / "warmup.json").write_text(
+                        json.dumps(results, indent=2) + "\n", encoding="utf-8"
+                    )
+                raise
+        results.append(result)
+
+    if durable_logs.enabled:
+        durable_logs.log_dir.mkdir(parents=True, exist_ok=True)
+        (durable_logs.log_dir / "warmup.json").write_text(json.dumps(results, indent=2) + "\n")
+    return results
 
 
 def build_command(
@@ -519,7 +973,7 @@ def build_command(
         "--dynamo-frontend-url",
         env_str(env, "DYNAMO_FRONTEND_URL", "http://warnold-swepro-frontend:3000"),
         "--dynamo-worker-system-port",
-        "30001",
+        env_str(env, "SWEPRO_DYNAMO_WORKER_SYSTEM_PORT", "30001"),
         "--dynamo-frontend-wait-timeout",
         "300",
         "--rollout-num-gpus",
@@ -946,6 +1400,11 @@ def start_tachometer_collector(
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=["env", "speedscope-current"], default="env")
+    parser.add_argument(
+        "--run-config",
+        default=None,
+        help="YAML run config. Defaults to SWEPRO_RUN_CONFIG when set; explicit environment variables override YAML values.",
+    )
     parser.add_argument("--repo-root", default=None)
     parser.add_argument("--ray-address", default="http://127.0.0.1:8265")
     parser.add_argument("--dry-run", action="store_true")
@@ -960,10 +1419,22 @@ def main() -> int:
     args, extra_train_args = parse_args()
     repo_root = Path(args.repo_root or os.getcwd()).resolve()
     env = dict(os.environ)
+    run_config_path = args.run_config or env.get("SWEPRO_RUN_CONFIG")
+    if run_config_path:
+        resolved_config_path, config_env = load_run_config_env(run_config_path, repo_root)
+        env["SWEPRO_RUN_CONFIG"] = str(resolved_config_path)
+        applied_config, skipped_config = apply_run_config_env(env, config_env)
+        print(
+            "SWEPRO run config: "
+            f"{resolved_config_path} "
+            f"(applied={len(applied_config)}, env_overrides={len(skipped_config)})"
+        )
     apply_profile_defaults(env, args.profile, repo_root, write_state=not args.dry_run)
+    resolve_run_config_derived_values(env)
     derived = derive_config(env)
     durable_logs = durable_log_config(env)
     tachometer = tachometer_config(env)
+    warmup = engine_warmup_config(env, tachometer)
 
     print(
         "SWEPRO trainer: "
@@ -995,6 +1466,13 @@ def main() -> int:
                 f"expected_engines={tachometer.expected_engines}, "
                 f"storage={durable_logs.log_dir / 'metrics' / 'tachometer-data'}"
             )
+        if warmup.enabled:
+            print(
+                "SWEPRO engine warmup: "
+                f"expected_engines={warmup.expected_engines}, "
+                f"isl={warmup.isl}, osl={warmup.osl}, "
+                f"frontend={warmup.frontend_url}"
+            )
 
     command = build_command(
         env,
@@ -1006,7 +1484,12 @@ def main() -> int:
         create_dirs=not args.dry_run,
     )
     if args.print_env:
-        print(json.dumps({k: env[k] for k in sorted(env) if k.startswith(("DYNAMO_", "SWEPRO_", "SLIME_"))}, indent=2))
+        print(
+            json.dumps(
+                {k: env[k] for k in sorted(env) if k.startswith(("DYN_", "DYNAMO_", "SGLANG_", "SLIME_", "SWEPRO_"))},
+                indent=2,
+            )
+        )
     if args.dry_run:
         print(shlex.join(command))
         return 0
@@ -1021,10 +1504,12 @@ def main() -> int:
             if key.startswith(
                 (
                     "DYNAMO_",
+                    "DYN_",
                     "NCCL_",
                     "NIXL_",
                     "NVIDIA_",
                     "RAY_",
+                    "SGLANG_",
                     "SLIME_",
                     "SWEPRO_",
                     "TORCH_",
@@ -1033,6 +1518,8 @@ def main() -> int:
             )
         }
         (durable_logs.log_dir / "env.json").write_text(json.dumps(debug_env, indent=2) + "\n", encoding="utf-8")
+
+    warmup_dynamo_workers(warmup, durable_logs, run_id=durable_logs.run_id)
 
     if durable_logs.enabled:
         return_code = tee_command(command, durable_logs.log_dir / "ray-submit.log", env=env, cwd=repo_root)

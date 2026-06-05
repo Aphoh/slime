@@ -1,4 +1,5 @@
 import dataclasses
+import importlib
 import itertools
 import logging
 import multiprocessing
@@ -516,6 +517,14 @@ class RolloutManager:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
+        try:
+            module = importlib.import_module(self.generate_rollout.__module__)
+            cleanup = getattr(module, "cleanup_rollout", None)
+            if callable(cleanup):
+                logger.info("Calling cleanup_rollout for %s", self.generate_rollout.__module__)
+                cleanup(self.args)
+        except Exception:
+            logger.exception("Failed to cleanup rollout function %s", self.generate_rollout)
         for monitor in self._health_monitors:
             monitor.stop()
         logging_utils.finish_tracking(self.args)
