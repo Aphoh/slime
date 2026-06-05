@@ -1,3 +1,5 @@
+import json
+import logging
 import sys
 import types
 from pathlib import Path
@@ -34,6 +36,16 @@ def test_direct_completions_payload_maps_glm_stop_token_ids_to_stop_strings():
     assert payload["stop"] == ["</tool_call>"]
     assert "stop_token_ids" not in payload
     assert payload["nvext"] == {"extra_fields": ["stop_reason"]}
+
+
+def test_direct_completions_payload_can_ignore_eos_for_trace_replay():
+    model = DirectCompletionsModel.__new__(DirectCompletionsModel)
+    model.config = DirectCompletionsConfig(base_url="http://dynamo", tokenizer_path="unused")
+
+    payload = model._build_payload_from_ids([1, 2, 3], max_tokens=4, ignore_eos=True, min_tokens=4)
+
+    assert payload["ignore_eos"] is True
+    assert payload["min_tokens"] == 4
 
 
 def test_direct_completions_payload_merges_dynamo_agent_context():
@@ -274,6 +286,57 @@ def test_direct_completions_clamps_oversized_backend_response(monkeypatch):
     assert result["extra"]["response"]["usage"] == {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
 
 
+def test_direct_completions_prefers_token_logprob_cardinality_when_tokens_overcount(monkeypatch):
+    class _Tokenizer:
+        @staticmethod
+        def decode(token_ids, skip_special_tokens=False):
+            return "".join(f"<{token_id}>" for token_id in token_ids)
+
+    class _Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [
+                    {
+                        "text": "inflated detokenized text",
+                        "finish_reason": "length",
+                        "logprobs": {
+                            "tokens": [
+                                "token_id:11",
+                                "token_id:12",
+                                "token_id:13",
+                                "token_id:14",
+                                "token_id:15",
+                            ],
+                            "token_logprobs": [-0.1, -0.2, -0.3],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 99, "total_tokens": 101},
+            }
+
+    monkeypatch.setattr(completions_direct_model.requests, "post", lambda *_args, **_kwargs: _Response())
+    model = DirectCompletionsModel.__new__(DirectCompletionsModel)
+    model.config = DirectCompletionsConfig(base_url="http://dynamo", tokenizer_path="unused")
+    model.tokenizer = _Tokenizer()
+
+    result = model.complete_prompt_ids([1, 2], max_tokens=3)
+
+    assert result["content"] == "<11><12><13>"
+    assert result["extra"]["generated_token_ids"] == [11, 12, 13]
+    assert result["extra"]["token_logprobs"] == [-0.1, -0.2, -0.3]
+    assert result["extra"]["backend_generated_tokens"] == 3
+    assert result["extra"]["usage_completion_tokens"] == 99
+    assert result["extra"]["parsed_generated_token_ids"] == 5
+    assert result["extra"]["raw_token_logprob_count"] == 3
+    assert result["extra"]["tokens_array_overcount"] is True
+    assert result["extra"]["locally_truncated_to_max_tokens"] is False
+
+
 def test_direct_completions_retry_uses_distinct_x_request_ids(monkeypatch):
     class _Response:
         @staticmethod
@@ -312,3 +375,63 @@ def test_direct_completions_retry_uses_distinct_x_request_ids(monkeypatch):
         {"x-request-id": "traj:llm:7:try:0"},
         {"x-request-id": "traj:llm:7:try:1"},
     ]
+
+
+def test_direct_completions_debug_logs_request_and_response(monkeypatch, caplog):
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [
+                    {
+                        "text": "<11><12>",
+                        "finish_reason": "length",
+                        "logprobs": {
+                            "tokens": ["token_id:11", "token_id:12"],
+                            "token_logprobs": [-0.1, -0.2],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            }
+
+    monkeypatch.setenv("SWEPRO_COMPLETIONS_DEBUG", "1")
+    monkeypatch.setattr(completions_direct_model.requests, "post", lambda *_args, **_kwargs: _Response())
+    model = DirectCompletionsModel.__new__(DirectCompletionsModel)
+    model.config = DirectCompletionsConfig(base_url="http://dynamo", tokenizer_path="unused")
+    model.tokenizer = object()
+
+    caplog.set_level(logging.INFO, logger="completions_direct_model")
+    result = model.complete_prompt_ids(
+        [1, 2, 3],
+        max_tokens=4,
+        min_tokens=4,
+        ignore_eos=True,
+        agent_context={"trajectory_id": "traj-1", "session_id": "sess-1"},
+        x_request_id="traj-1:llm:0",
+    )
+
+    debug_records = [
+        json.loads(record.message.split(" ", 1)[1])
+        for record in caplog.records
+        if record.message.startswith(completions_direct_model.COMPLETIONS_DEBUG_LOG_PREFIX)
+    ]
+
+    assert [record["event"] for record in debug_records] == ["completion_request", "completion_response"]
+    assert debug_records[0]["prompt_tokens"] == 3
+    assert debug_records[0]["max_tokens"] == 4
+    assert debug_records[0]["min_tokens"] == 4
+    assert debug_records[0]["ignore_eos"] is True
+    assert debug_records[0]["agent_trajectory_id"] == "traj-1"
+    assert debug_records[1]["status_code"] == 200
+    assert debug_records[1]["requested_max_tokens"] == 4
+    assert debug_records[1]["usage_completion_tokens"] == 2
+    assert debug_records[1]["backend_generated_tokens"] == 2
+    assert debug_records[1]["generated_tokens"] == 2
+    assert result["extra"]["generated_token_ids"] == [11, 12]

@@ -1,0 +1,146 @@
+version: 1
+description: >
+  Trace-replay router benchmark defaults for comparing sticky-session and
+  KV-event routing with the mock trainer. Values in the shell environment
+  override this file, so keep per-run identifiers and live cluster endpoints
+  in the launcher script or command line.
+
+model:
+  args_script: scripts/models/qwen3.5-122B-A10B.sh
+  model: /shared/Qwen3.5-122B-A10B
+  hf_checkpoint: /shared/Qwen3.5-122B-A10B
+  ref_load: /shared/Qwen3.5-122B-A10B_torch_dist
+  prompt_data: /data/swebench-pro/swebench_pro_train_cached_images.jsonl
+  input_key: prompt
+  label_key: instance_id
+
+routing:
+  frontend_url: http://warnold-swepro-frontend:3000
+  tool_events_zmq_port: 20390
+  nats_url: nats://warnold-swepro-nats:4222
+  request_plane: tcp
+  tcp_request_timeout: 1800
+  http_backend_stream_timeout_secs: 1800
+  sglang_server_concurrency: 32
+  router_variant: trace-replay
+
+rollout:
+  function_path: fully_async_rollout.rollout_with_mock_trainer
+  num_rollout: 20
+  batch_size: 8
+  over_sampling_batch_size: 32
+  n_samples_per_prompt: 1
+  global_batch_size: 8
+  temperature: 0
+
+mock_trainer:
+  enabled: true
+  tokens_per_second: 15000
+  weight_update_seconds: 20
+
+trace_replay:
+  path: /data/swebench-pro/traces/trace-replay-sample-qwen35-v1-8192gen-tool120-20260605.jsonl
+  force_fixed_decode: true
+  scale: 1.0
+  mock_reward: true
+  reward: 0.0
+
+async_worker:
+  max_inflight: 128
+  # "auto" resolves in launch_swepro_rl.py to num_rollout * rollout.batch_size.
+  max_started_groups: auto
+  group_max_attempts: 2
+
+agent:
+  mode: sweagent_session
+  max_tool_calls: 0
+  episode_wall_timeout: 0
+  turn_max_tokens: 0
+
+request_timeouts:
+  model_call_timeout: 1800
+  request_timeout: 1800
+  request_retries: 5
+  session_start_timeout: 1200
+  session_start_call_timeout: 1200
+  session_step_request_timeout: 300
+  session_step_call_timeout: 300
+  session_submit_request_timeout: 300
+  session_submit_call_timeout: 300
+  session_close_timeout: 120
+  session_close_call_timeout: 120
+  session_health_timeout: 30
+  session_health_call_timeout: 30
+  session_capacity_retry_delay: 10
+  session_rollout_retries: 1
+
+trainer:
+  actor_num_nodes: 1
+  actor_num_gpus_per_node: 4
+  tp: 8
+  pp: 1
+  cp: 4
+  ep: 32
+  etp: 1
+  qkv_format: thd
+  sequence_parallel: true
+  use_dynamic_batch_size: false
+  micro_batch_size: 1
+  moe_token_dispatcher_type: alltoall
+  seq_length: 131072
+  max_context_len: 131072
+  max_response_len: 131072
+  rollout_num_gpus: 8
+  rollout_num_gpus_per_engine: 2
+  max_tokens_per_gpu: 65536
+  log_probs_chunk_size: 512
+  defer_fp32_logits: true
+  disable_save: true
+  disable_weights_backuper: true
+  update_weights_interval: 2
+  update_weight_buffer_size: 536870912
+  distributed_timeout_minutes: 30
+  optimizer_cpu_offload: true
+  use_precision_aware_optimizer: true
+  overlap_cpu_optimizer_d2h_h2d: true
+
+tachometer:
+  enabled: true
+  binary: tachometer-scraper
+  frequency: 0.5
+  rows_per_parquet: 250000
+  save_interval_secs: 5
+  sync_interval_secs: 0
+  discovery_timeout: 600
+  nixl_port: 0
+
+engine_warmup:
+  enabled: true
+  required: true
+  expected_engines: 4
+  isl: 16384
+  osl: 1
+  timeout: 900
+  discovery_timeout: 600
+  model: /shared/Qwen3.5-122B-A10B
+
+env:
+  NCCL_NVLS_ENABLE: 0
+  NCCL_MNNVL_ENABLE: 0
+  NCCL_CUMEM_ENABLE: 1
+  NCCL_CUMEM_HOST_ENABLE: 1
+  NCCL_STORE_TIMEOUT: 7200
+  NCCL_SOCKET_IFNAME: eth0
+  GLOO_SOCKET_IFNAME: eth0
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: 1
+  NVIDIA_GDRCOPY: 1
+  UCX_TLS: cuda_ipc,cuda_copy,rc
+  UCX_IB_GID_INDEX: 3
+  UCX_RC_TIMEOUT: 600s
+  UCX_KEEPALIVE_INTERVAL: 300s
+  RAY_DEDUP_LOGS: 0
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  SLIME_ASYNC_ALLOW_STALE_ROLLOUTS: 1
+  SLIME_WEIGHT_UPDATE_FLATTENED_BUCKET: 1
+  SLIME_WEIGHT_UPDATE_PER_ENGINE_GROUPS: 1
+  SLIME_WEIGHT_UPDATE_NCCL_MNNVL_ENABLE: 0

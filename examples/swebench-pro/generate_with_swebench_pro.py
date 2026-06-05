@@ -30,6 +30,7 @@ from completions_direct_model import (
 )
 from dynamo_agent_trace import build_agent_context_for_sample, derive_tool_events_zmq_endpoint, llm_request_id
 from sweagent_session import SweAgentSessionClient
+from trace_replay import TraceReplaySessionClient, TraceReplayStore
 
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.mask_utils import MultiTurnLossMaskGenerator
@@ -42,6 +43,8 @@ PATCH_FILE_PREVIEW_LIMIT = 20
 _MODEL: DirectCompletionsModel | None = None
 _MASK_GENERATOR: MultiTurnLossMaskGenerator | None = None
 _SWEAGENT_TEMPLATES: dict[str, str] | None = None
+_TRACE_REPLAY_STORE: TraceReplayStore | None = None
+_TRACE_REPLAY_STORE_PATH: str | None = None
 
 
 SYSTEM_PROMPT = """You are an autonomous software engineer. Produce a minimal git patch that satisfies the issue.
@@ -132,6 +135,13 @@ def _nonnegative_int_env(name: str, default: int) -> int:
     return parsed
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _positive_float_env(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None or value == "":
@@ -143,6 +153,21 @@ def _positive_float_env(name: str, default: float) -> float:
         return default
     if parsed <= 0:
         logger.warning("Ignoring non-positive %s=%r; using %s", name, value, default)
+        return default
+    return parsed
+
+
+def _nonnegative_float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %s", name, value, default)
+        return default
+    if parsed < 0:
+        logger.warning("Ignoring negative %s=%r; using %s", name, value, default)
         return default
     return parsed
 
@@ -246,6 +271,42 @@ def _get_model(args) -> DirectCompletionsModel:
     return _MODEL
 
 
+def _get_trace_replay_store() -> TraceReplayStore | None:
+    path = os.getenv("SWEPRO_TRACE_REPLAY_PATH") or os.getenv("SWEPRO_MOCK_ENV_TRACE_PATH")
+    if not path:
+        return None
+    global _TRACE_REPLAY_STORE, _TRACE_REPLAY_STORE_PATH
+    if _TRACE_REPLAY_STORE is None or _TRACE_REPLAY_STORE_PATH != path:
+        sleep_scale = _nonnegative_float_env("SWEPRO_MOCK_ENV_SCALE", 1.0)
+        _TRACE_REPLAY_STORE = TraceReplayStore.from_path(path, sleep_scale=sleep_scale)
+        _TRACE_REPLAY_STORE_PATH = path
+        logger.info("Loaded %s trace replay plans from %s", len(_TRACE_REPLAY_STORE.plans), path)
+    return _TRACE_REPLAY_STORE
+
+
+def _mock_sleep_scale() -> float:
+    return _nonnegative_float_env("SWEPRO_MOCK_ENV_SCALE", 1.0)
+
+
+def _trace_replay_force_fixed_decode() -> bool:
+    return _bool_env("SWEPRO_TRACE_REPLAY_FORCE_FIXED_DECODE", False)
+
+
+def _mock_reward_value() -> float:
+    raw = os.getenv("SWEPRO_MOCK_ENV_REWARD") or os.getenv("SWEPRO_TRACE_REPLAY_REWARD") or "0.0"
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid mock reward value %r; using 0.0", raw)
+        return 0.0
+
+
+def _uses_mock_reward(metadata: dict[str, Any]) -> bool:
+    if metadata.get("trace_replay") or metadata.get("mock_trace_replay"):
+        return True
+    return _bool_env("SWEPRO_MOCK_REWARD", False)
+
+
 def _get_mask_generator(args) -> MultiTurnLossMaskGenerator:
     global _MASK_GENERATOR
     if _MASK_GENERATOR is None:
@@ -338,6 +399,74 @@ def _submission_trace_fields(submission: str, result: dict[str, Any] | None = No
 
 def _tool_observation_delta_ids(model: DirectCompletionsModel, observation: str) -> list[int]:
     return encode_qwen_tool_observation_delta(model.tokenizer, observation)
+
+
+def _padding_token_id(model: DirectCompletionsModel) -> int:
+    tokenizer = model.tokenizer
+    return int(
+        tokenizer.eos_token_id
+        if tokenizer.eos_token_id is not None
+        else tokenizer.pad_token_id
+        if tokenizer.pad_token_id is not None
+        else 0
+    )
+
+
+def _resize_prompt_token_ids(prompt_token_ids: list[int], target_length: int, pad_token_id: int) -> None:
+    if target_length <= 0:
+        return
+    if len(prompt_token_ids) > target_length:
+        del prompt_token_ids[target_length:]
+    elif len(prompt_token_ids) < target_length:
+        prompt_token_ids.extend([pad_token_id] * (target_length - len(prompt_token_ids)))
+
+
+def _align_current_token_length(
+    *,
+    prompt_token_ids: list[int],
+    response_token_ids: list[int],
+    loss_mask: list[int],
+    rollout_log_probs: list[float],
+    target_length: int,
+    pad_token_id: int,
+) -> None:
+    if target_length <= 0:
+        return
+    current_length = len(prompt_token_ids) + len(response_token_ids)
+    if current_length == target_length:
+        return
+    if current_length < target_length:
+        missing = target_length - current_length
+        response_token_ids.extend([pad_token_id] * missing)
+        loss_mask.extend([0] * missing)
+        rollout_log_probs.extend([0.0] * missing)
+        return
+
+    overflow = current_length - target_length
+    if overflow <= len(response_token_ids):
+        del response_token_ids[-overflow:]
+        del loss_mask[-overflow:]
+        del rollout_log_probs[-overflow:]
+    else:
+        del response_token_ids[:]
+        del loss_mask[:]
+        del rollout_log_probs[:]
+        _resize_prompt_token_ids(prompt_token_ids, target_length, pad_token_id)
+
+
+def _append_untrainable_tokens(
+    response_token_ids: list[int],
+    loss_mask: list[int],
+    rollout_log_probs: list[float],
+    *,
+    token_id: int,
+    count: int,
+) -> None:
+    if count <= 0:
+        return
+    response_token_ids.extend([token_id] * count)
+    loss_mask.extend([0] * count)
+    rollout_log_probs.extend([0.0] * count)
 
 
 def _build_messages(sample: Sample) -> list[dict[str, str]]:
@@ -591,7 +720,18 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
         raise ValueError(f"SWE-bench Pro sample {instance_id} is missing base_commit")
 
     model = _get_model(args)
-    client = SweAgentSessionClient.from_env(args)
+    trace_replay_store = _get_trace_replay_store()
+    trace_replay_plan = trace_replay_store.claim(str(instance_id)) if trace_replay_store else None
+    client = (
+        TraceReplaySessionClient(trace_replay_plan, sleep_scale=_mock_sleep_scale())
+        if trace_replay_plan is not None
+        else SweAgentSessionClient.from_env(args)
+    )
+    if trace_replay_plan is not None:
+        metadata["trace_replay"] = True
+        metadata["trace_replay_trajectory_id"] = trace_replay_plan.trajectory_id
+        metadata["trace_replay_source_instance_id"] = trace_replay_plan.instance_id
+        metadata["trace_replay_turns"] = len(trace_replay_plan.turns)
     messages = _build_sweagent_messages(sample)
     image_name = _metadata_image_name(metadata)
     session_id = None
@@ -626,6 +766,9 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
         session_id = started["session_id"]
         tools = started["tools"]
         prompt_token_ids = model.encode_prompt(messages, tools=tools)
+        pad_token_id = _padding_token_id(model)
+        if trace_replay_plan is not None:
+            _resize_prompt_token_ids(prompt_token_ids, trace_replay_plan.initial_prompt_tokens, pad_token_id)
         _agent_trace_log(
             "session_started",
             trajectory_id=_trajectory_id(agent_context),
@@ -636,7 +779,31 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
             tool_count=len(tools or []),
             prompt_tokens=len(prompt_token_ids),
             tool_events_zmq_endpoint=tool_events_zmq_endpoint,
+            trace_replay=trace_replay_plan is not None,
+            trace_replay_source_trajectory_id=trace_replay_plan.trajectory_id if trace_replay_plan else None,
         )
+        if trace_replay_plan is not None:
+            replay_generated_tokens = [turn.generated_tokens for turn in trace_replay_plan.turns]
+            replay_prompt_tokens = [turn.prompt_tokens for turn in trace_replay_plan.turns]
+            _agent_trace_log(
+                "trace_replay_plan_claimed",
+                trajectory_id=_trajectory_id(agent_context),
+                instance_id=instance_id,
+                session_id=session_id,
+                trace_replay_source_trajectory_id=trace_replay_plan.trajectory_id,
+                trace_replay_source_instance_id=trace_replay_plan.instance_id,
+                trace_replay_turns=len(trace_replay_plan.turns),
+                trace_replay_initial_prompt_tokens=trace_replay_plan.initial_prompt_tokens,
+                trace_replay_max_prompt_tokens=max(replay_prompt_tokens, default=0),
+                trace_replay_total_generated_tokens=sum(replay_generated_tokens),
+                trace_replay_max_generated_tokens=max(replay_generated_tokens, default=0),
+                trace_replay_total_observation_tokens=sum(turn.observation_tokens for turn in trace_replay_plan.turns),
+                trace_replay_total_tool_duration_s=round(
+                    sum(turn.tool_duration_s for turn in trace_replay_plan.turns),
+                    3,
+                ),
+                trace_replay_duration_s=round(trace_replay_plan.duration_s, 3),
+            )
         if max_context is not None and len(prompt_token_ids) >= max_context:
             return _mark_untrainable_sample(
                 sample,
@@ -649,11 +816,27 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 max_context_len=max_context,
             )
 
+        if trace_replay_plan is not None:
+            replay_turn_count = len(trace_replay_plan.turns)
+            if max_tool_calls is not None:
+                replay_turn_count = min(replay_turn_count, max_tool_calls)
+            turn_iter = range(replay_turn_count)
+
         for turn in turn_iter:
             if episode_wall_timeout is not None and time.time() - started_at >= episode_wall_timeout:
                 finish_reason = "length"
                 break
 
+            replay_turn = trace_replay_plan.turn_for(turn) if trace_replay_plan is not None else None
+            if replay_turn is not None:
+                _align_current_token_length(
+                    prompt_token_ids=prompt_token_ids,
+                    response_token_ids=response_token_ids,
+                    loss_mask=loss_mask,
+                    rollout_log_probs=rollout_log_probs,
+                    target_length=replay_turn.prompt_tokens,
+                    pad_token_id=pad_token_id,
+                )
             current_ids = prompt_token_ids + response_token_ids
             remaining_context = _remaining_context(prompt_token_ids, response_token_ids, max_context)
             if remaining_context is not None and remaining_context <= 0:
@@ -662,6 +845,18 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
             max_turn_tokens = _turn_max_tokens(args, sampling_params)
             if remaining_context is not None:
                 max_turn_tokens = min(max_turn_tokens, remaining_context)
+            request_stop = sampling_params.get("stop") or GLM_TOOL_STOPS
+            request_stop_token_ids = sampling_params.get("stop_token_ids") or GLM_TOOL_STOP_TOKEN_IDS
+            request_ignore_eos = False
+            request_min_tokens = None
+            if replay_turn is not None:
+                if _trace_replay_force_fixed_decode():
+                    replay_decode_tokens = replay_turn.generated_tokens or replay_turn.backend_generated_tokens or 0
+                    max_turn_tokens = max(1, min(max_turn_tokens, max(1, replay_decode_tokens)))
+                    request_stop = None
+                    request_stop_token_ids = None
+                    request_ignore_eos = True
+                    request_min_tokens = max_turn_tokens
 
             request_id = llm_request_id(agent_context, turn=turn)
             _agent_trace_log(
@@ -673,8 +868,22 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 x_request_id=request_id,
                 prompt_tokens=len(current_ids),
                 max_tokens=max_turn_tokens,
+                min_tokens=request_min_tokens,
+                ignore_eos=request_ignore_eos,
+                stop_count=len(request_stop) if isinstance(request_stop, list) else (1 if request_stop else 0),
+                stop_token_id_count=(
+                    len(request_stop_token_ids)
+                    if isinstance(request_stop_token_ids, list)
+                    else (1 if request_stop_token_ids else 0)
+                ),
+                stop_token_ids=request_stop_token_ids,
                 response_tokens_so_far=len(response_token_ids),
                 remaining_context=remaining_context,
+                trace_replay=trace_replay_plan is not None,
+                trace_replay_prompt_tokens=replay_turn.prompt_tokens if replay_turn else None,
+                trace_replay_generated_tokens=replay_turn.generated_tokens if replay_turn else None,
+                trace_replay_backend_generated_tokens=replay_turn.backend_generated_tokens if replay_turn else None,
+                trace_replay_force_fixed_decode=_trace_replay_force_fixed_decode() if replay_turn else False,
             )
             result = await _await_with_timeout(
                 asyncio.to_thread(
@@ -687,8 +896,10 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                     temperature=sampling_params.get("temperature", getattr(args, "rollout_temperature", 1.0)),
                     top_p=sampling_params.get("top_p", getattr(args, "rollout_top_p", 1.0)),
                     top_k=sampling_params.get("top_k", getattr(args, "rollout_top_k", None)),
-                    stop=sampling_params.get("stop") or GLM_TOOL_STOPS,
-                    stop_token_ids=sampling_params.get("stop_token_ids") or GLM_TOOL_STOP_TOKEN_IDS,
+                    stop=request_stop,
+                    stop_token_ids=request_stop_token_ids,
+                    ignore_eos=request_ignore_eos,
+                    min_tokens=request_min_tokens,
                 ),
                 timeout=_model_call_timeout_s(),
                 label=f"model completion for {instance_id} turn {turn}",
@@ -700,6 +911,32 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
             if len(generated_logprobs) < len(generated_ids):
                 generated_logprobs.extend([0.0] * (len(generated_ids) - len(generated_logprobs)))
             generated_logprobs = generated_logprobs[: len(generated_ids)]
+            generated_loss_mask = [1] * len(generated_ids)
+            backend_generated_len = len(generated_ids)
+            if replay_turn is not None:
+                target_generated_len = max(0, replay_turn.generated_tokens)
+                if len(generated_ids) > target_generated_len:
+                    if _trace_replay_force_fixed_decode():
+                        raise RuntimeError(
+                            "Trace replay fixed-decode request over-generated: "
+                            f"got {len(generated_ids)} tokens, expected {target_generated_len} "
+                            f"for {instance_id} turn {turn}"
+                        )
+                    generated_ids = generated_ids[:target_generated_len]
+                    generated_logprobs = generated_logprobs[:target_generated_len]
+                    generated_loss_mask = generated_loss_mask[:target_generated_len]
+                    content = model.tokenizer.decode(generated_ids, skip_special_tokens=False)
+                elif len(generated_ids) < target_generated_len:
+                    missing = target_generated_len - len(generated_ids)
+                    if _trace_replay_force_fixed_decode():
+                        raise RuntimeError(
+                            "Trace replay fixed-decode request under-generated: "
+                            f"got {len(generated_ids)} tokens, expected {target_generated_len} "
+                            f"for {instance_id} turn {turn}"
+                        )
+                    generated_ids.extend([pad_token_id] * missing)
+                    generated_logprobs.extend([0.0] * missing)
+                    generated_loss_mask.extend([0] * missing)
             finish_reason = extra.get("finish_reason") or "stop"
             stop_reason = extra.get("stop_reason")
             matched_stop_token_ids = stop_reason_token_ids(stop_reason, model.tokenizer)
@@ -710,6 +947,17 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 generated_ids,
                 matched_stop_token_ids,
             )
+            if replay_turn is not None:
+                finish_reason = replay_turn.finish_reason or finish_reason
+                stop_reason = replay_turn.stop_reason or stop_reason
+                matched_stop_token_ids = stop_reason_token_ids(stop_reason, model.tokenizer)
+                if replay_turn.has_tool_call:
+                    normal_text = ""
+                    tool_calls = [replay_turn.tool_call()]
+                    needs_tool_close = False
+                else:
+                    tool_calls = []
+                    needs_tool_close = False
             _agent_trace_log(
                 "model_response",
                 trajectory_id=_trajectory_id(agent_context),
@@ -729,6 +977,13 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 parsed_tool_count=len(tool_calls),
                 parsed_tool_names=[_tool_call_name(tool_call) for tool_call in tool_calls],
                 needs_tool_close=needs_tool_close,
+                trace_replay=trace_replay_plan is not None,
+                trace_replay_backend_generated_tokens=backend_generated_len,
+                trace_replay_generated_tokens=replay_turn.generated_tokens if replay_turn else None,
+                trace_replay_backend_target_tokens=replay_turn.backend_generated_tokens if replay_turn else None,
+                trace_replay_tool_name=replay_turn.tool_name if replay_turn else None,
+                trace_replay_tool_duration_s=replay_turn.tool_duration_s if replay_turn else None,
+                trace_replay_observation_tokens=replay_turn.observation_tokens if replay_turn else None,
             )
             content_for_history = _assistant_content_for_history(content, tool_calls)
             if needs_tool_close:
@@ -739,7 +994,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
             messages.append({"role": "assistant", "content": content_for_history})
             response_text_parts.append(content_for_history)
             response_token_ids.extend(generated_ids)
-            loss_mask.extend([1] * len(generated_ids))
+            loss_mask.extend(generated_loss_mask)
             rollout_log_probs.extend(float(x) for x in generated_logprobs)
             if stop_closer_ids:
                 response_token_ids.extend(stop_closer_ids)
@@ -833,6 +1088,9 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 submitted=submitted,
                 tool_error=step.get("tool_error"),
                 session_dropped=step.get("session_dropped"),
+                trace_replay=trace_replay_plan is not None,
+                trace_replay_tool_duration_s=replay_turn.tool_duration_s if replay_turn else None,
+                trace_replay_observation_tokens=replay_turn.observation_tokens if replay_turn else None,
                 **_submission_trace_fields(step.get("submission") or "", step),
             )
             if step.get("session_dropped"):
@@ -876,10 +1134,20 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                     "content": observation_content,
                 }
             )
-            observation_ids = _tool_observation_delta_ids(model, observation_content)
-            response_token_ids.extend(observation_ids)
-            loss_mask.extend([0] * len(observation_ids))
-            rollout_log_probs.extend([0.0] * len(observation_ids))
+            if replay_turn is not None:
+                observation_token_count = max(0, replay_turn.observation_tokens)
+                _append_untrainable_tokens(
+                    response_token_ids,
+                    loss_mask,
+                    rollout_log_probs,
+                    token_id=pad_token_id,
+                    count=observation_token_count,
+                )
+            else:
+                observation_ids = _tool_observation_delta_ids(model, observation_content)
+                response_token_ids.extend(observation_ids)
+                loss_mask.extend([0] * len(observation_ids))
+                rollout_log_probs.extend([0.0] * len(observation_ids))
             if _trim_response_to_context(
                 prompt_token_ids=prompt_token_ids,
                 response_token_ids=response_token_ids,
@@ -1167,6 +1435,25 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
 
 async def _reward_one(args, sample: Sample) -> float:
     metadata = _metadata(sample)
+    if _uses_mock_reward(metadata):
+        reward = _mock_reward_value()
+        result = {
+            "passed": reward > 0,
+            "reward": reward,
+            "mock_trace_replay": True,
+            "reason": "trace replay reward bypass",
+        }
+        metadata["eval"] = result
+        metadata["raw_reward"] = reward
+        _agent_trace_log(
+            "mock_reward",
+            trajectory_id=_trajectory_id(metadata.get("dynamo_agent_context")),
+            trace_replay_source_trajectory_id=metadata.get("trace_replay_trajectory_id"),
+            instance_id=metadata.get("instance_id") or sample.label,
+            reward=reward,
+        )
+        return reward
+
     patch = metadata.get("patch", sample.response)
     if not patch:
         metadata["eval"] = {"passed": False, "error": "empty patch"}
