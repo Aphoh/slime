@@ -8,6 +8,7 @@ completions endpoint.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -25,6 +26,65 @@ except Exception:  # pragma: no cover - parser-only local tooling may not have t
 def _env(name: str, default: str | None = None) -> str | None:
     value = os.getenv(name)
     return value if value not in (None, "") else default
+
+
+logger = logging.getLogger(__name__)
+COMPLETIONS_DEBUG_LOG_PREFIX = "SWEPRO_COMPLETIONS_DEBUG"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = _env(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _json_log_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_log_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_log_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _round_s(value: float | None) -> float | None:
+    return round(value, 3) if value is not None else None
+
+
+def _payload_debug_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    prompt = payload.get("prompt") or []
+    stop = payload.get("stop")
+    stop_list = stop if isinstance(stop, list) else ([stop] if stop else [])
+    nvext = payload.get("nvext") if isinstance(payload.get("nvext"), dict) else {}
+    agent_context = nvext.get("agent_context") if isinstance(nvext, dict) else None
+    return {
+        "model": payload.get("model"),
+        "prompt_tokens": len(prompt),
+        "max_tokens": payload.get("max_tokens"),
+        "min_tokens": payload.get("min_tokens"),
+        "ignore_eos": payload.get("ignore_eos"),
+        "temperature": payload.get("temperature"),
+        "top_p": payload.get("top_p"),
+        "top_k": payload.get("top_k"),
+        "stream": payload.get("stream"),
+        "return_tokens_as_token_ids": payload.get("return_tokens_as_token_ids"),
+        "logprobs": payload.get("logprobs"),
+        "stop_count": len(stop_list),
+        "stop": stop_list,
+        "nvext_extra_fields": nvext.get("extra_fields") if isinstance(nvext, dict) else None,
+        "agent_trajectory_id": agent_context.get("trajectory_id") if isinstance(agent_context, dict) else None,
+        "agent_session_id": agent_context.get("session_id") if isinstance(agent_context, dict) else None,
+    }
+
+
+def _completion_debug_log(event: str, **fields: Any) -> None:
+    if not _env_flag("SWEPRO_COMPLETIONS_DEBUG"):
+        return
+    payload = {"event": event}
+    payload.update({key: _json_log_value(value) for key, value in fields.items() if value is not None})
+    logger.info("%s %s", COMPLETIONS_DEBUG_LOG_PREFIX, json.dumps(payload, sort_keys=True, ensure_ascii=False))
 
 
 def token_ids_from_logprob_tokens(tokens: list[Any], tokenizer) -> list[int]:
@@ -202,6 +262,10 @@ class DirectCompletionsModel:
         top_k = kwargs.get("top_k", self.config.top_k)
         if top_k is not None and int(top_k) > 0:
             payload["top_k"] = int(top_k)
+        if kwargs.get("ignore_eos") is not None:
+            payload["ignore_eos"] = bool(kwargs["ignore_eos"])
+        if kwargs.get("min_tokens") is not None:
+            payload["min_tokens"] = int(kwargs["min_tokens"])
         stop_token_ids = kwargs.get("stop_token_ids")
         stop = kwargs.get("stop")
         if stop_token_ids:
@@ -247,16 +311,49 @@ class DirectCompletionsModel:
     ) -> dict[str, Any]:
         url = f"{self.config.base_url}/v1/completions"
         last_error: Exception | None = None
+        success_attempt: int | None = None
+        success_elapsed_s: float | None = None
+        response_status_code: int | None = None
         for attempt in range(self.config.retries):
+            attempt_started_at = time.monotonic()
+            attempt_status_code: int | None = None
             try:
                 request_id = f"{x_request_id}:try:{attempt}" if x_request_id else None
                 headers = {"x-request-id": request_id} if request_id else None
+                _completion_debug_log(
+                    "completion_request",
+                    url=url,
+                    attempt=attempt,
+                    retries=self.config.retries,
+                    x_request_id=x_request_id,
+                    request_id=request_id,
+                    timeout_s=self.config.timeout,
+                    **_payload_debug_fields(payload),
+                )
                 response = requests.post(url, json=payload, headers=headers, timeout=self.config.timeout)
+                attempt_status_code = getattr(response, "status_code", None)
+                response_status_code = attempt_status_code
                 response.raise_for_status()
                 data = response.json()
+                success_attempt = attempt
+                success_elapsed_s = time.monotonic() - attempt_started_at
                 break
             except Exception as exc:
                 last_error = exc
+                _completion_debug_log(
+                    "completion_request_error",
+                    url=url,
+                    attempt=attempt,
+                    retries=self.config.retries,
+                    x_request_id=x_request_id,
+                    request_id=request_id,
+                    status_code=attempt_status_code,
+                    elapsed_s=_round_s(time.monotonic() - attempt_started_at),
+                    error_type=type(exc).__name__,
+                    error=repr(exc),
+                    will_retry=attempt + 1 < self.config.retries,
+                    **_payload_debug_fields(payload),
+                )
                 if attempt + 1 >= self.config.retries:
                     raise
                 time.sleep(min(2**attempt, 30))
@@ -270,7 +367,21 @@ class DirectCompletionsModel:
         token_logprobs = list(logprobs.get("token_logprobs") or [])
         content = choice.get("text", "")
         requested_max_tokens = int(payload["max_tokens"])
-        backend_generated_tokens = len(generated_token_ids)
+        raw_parsed_generated_tokens = len(generated_token_ids)
+        raw_token_logprob_count = len(token_logprobs)
+        usage = data.get("usage") or {}
+        usage_completion_tokens = usage.get("completion_tokens")
+        backend_generated_tokens = raw_token_logprob_count or len(generated_token_ids)
+
+        # Dynamo/SGLang can return an inflated logprobs.tokens array on
+        # completions requests even when token_logprobs has the true generated
+        # length. Keep token IDs aligned to the authoritative logprob cardinality.
+        tokens_array_overcount = False
+        if raw_token_logprob_count and len(generated_token_ids) > raw_token_logprob_count:
+            generated_token_ids = generated_token_ids[:raw_token_logprob_count]
+            content = _decode_token_ids(self.tokenizer, generated_token_ids)
+            choice["text"] = content
+            tokens_array_overcount = True
         locally_truncated_to_max_tokens = False
         if len(generated_token_ids) > requested_max_tokens:
             generated_token_ids = generated_token_ids[:requested_max_tokens]
@@ -295,12 +406,39 @@ class DirectCompletionsModel:
             "stop_reason": response_nvext.get("stop_reason", choice.get("stop_reason")),
             "requested_max_tokens": requested_max_tokens,
             "backend_generated_tokens": backend_generated_tokens,
+            "usage_completion_tokens": usage_completion_tokens,
+            "parsed_generated_token_ids": raw_parsed_generated_tokens,
+            "raw_token_logprob_count": raw_token_logprob_count,
+            "tokens_array_overcount": tokens_array_overcount,
             "locally_truncated_to_max_tokens": locally_truncated_to_max_tokens,
         }
         if locally_truncated_to_max_tokens and data.get("usage"):
             usage = data["usage"]
             usage["completion_tokens"] = min(int(usage.get("completion_tokens", 0)), requested_max_tokens)
             usage["total_tokens"] = int(usage.get("prompt_tokens", len(payload["prompt"]))) + usage["completion_tokens"]
+        _completion_debug_log(
+            "completion_response",
+            url=url,
+            attempt=success_attempt,
+            x_request_id=x_request_id,
+            status_code=response_status_code,
+            elapsed_s=_round_s(success_elapsed_s),
+            requested_max_tokens=requested_max_tokens,
+            finish_reason=choice.get("finish_reason"),
+            stop_reason=response_nvext.get("stop_reason", choice.get("stop_reason")),
+            usage_prompt_tokens=usage.get("prompt_tokens"),
+            usage_completion_tokens=usage.get("completion_tokens"),
+            usage_total_tokens=usage.get("total_tokens"),
+            backend_generated_tokens=backend_generated_tokens,
+            raw_parsed_generated_tokens=raw_parsed_generated_tokens,
+            raw_token_logprob_count=raw_token_logprob_count,
+            generated_tokens=len(generated_token_ids),
+            token_logprobs=len(token_logprobs),
+            response_text_chars=len(content),
+            tokens_array_overcount=tokens_array_overcount,
+            locally_truncated_to_max_tokens=locally_truncated_to_max_tokens,
+            **_payload_debug_fields(payload),
+        )
         result = {"content": content, "message": content, "extra": extra}
         return result
 
