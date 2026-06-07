@@ -63,6 +63,8 @@ COPY ${TACHOMETER_SCRAPER_BINARY} /usr/local/bin/tachometer-scraper
 
 FROM ${BASE_IMAGE}
 
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
 COPY --from=builder /build/dynamo /opt/dynamo
 COPY --from=builder /build/dist/*.whl /tmp/
 COPY --from=tachometer_scraper /usr/local/bin/tachometer-scraper /usr/local/bin/tachometer-scraper
