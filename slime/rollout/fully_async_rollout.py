@@ -292,6 +292,8 @@ class AsyncRolloutWorker:
         self.cancelled_count = 0
         self.shutdown_drained_count = 0
         self.shutdown_cancelled_count = 0
+        self.completed_backlog = []
+        self.completed_backlog_lock = threading.Lock()
 
     def snapshot(self) -> dict[str, int | float | bool]:
         inflight_by_count = max(0, self.started_count - self.completed_count - self.failed_count - self.cancelled_count)
@@ -317,6 +319,7 @@ class AsyncRolloutWorker:
             "shutdown_cancelled": int(self.shutdown_cancelled_count),
             "max_started_groups": int(self.max_started_groups),
             "inflight_by_count": int(inflight_by_count),
+            "completed_backlog": int(self.get_completed_backlog_size()),
         }
 
     def log_summary(self, event: str, **extra) -> None:
@@ -347,12 +350,27 @@ class AsyncRolloutWorker:
 
     def get_completed_groups(self) -> list[tuple[int, list[Sample]]]:
         completed: list[tuple[int, list[Sample]]] = []
+        with self.completed_backlog_lock:
+            if self.completed_backlog:
+                completed.extend(self.completed_backlog)
+                self.completed_backlog = []
         while True:
             try:
                 completed.append(self.output_queue.get_nowait())
             except queue.Empty:
                 break
         return completed
+
+    def return_completed_groups(self, groups: list[tuple[int, list[Sample]]]) -> None:
+        """Preserve completed groups that arrived before the current batch filled."""
+        if not groups:
+            return
+        with self.completed_backlog_lock:
+            self.completed_backlog = list(groups) + self.completed_backlog
+
+    def get_completed_backlog_size(self) -> int:
+        with self.completed_backlog_lock:
+            return len(self.completed_backlog)
 
     def queue_size(self) -> int:
         return self.output_queue.qsize()
@@ -562,7 +580,6 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
             drained = 0
             for gid, group in worker.get_completed_groups():
                 collected[gid] = group
-                worker.accepted_group_count += 1
                 drained += 1
 
             if not drained:
@@ -616,11 +633,17 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
                 return int(idx)
         return 0
 
-    out = sorted(collected.values(), key=_key)[:target]
+    ordered = sorted(collected.items(), key=lambda item: _key(item[1]))
+    selected = ordered[:target]
+    leftovers = ordered[target:]
+    worker.return_completed_groups(leftovers)
+    out = [group for _, group in selected]
+    worker.accepted_group_count += len(out)
+    duration = time.time() - started
     logger.info(
         "fully-async rollout %d: done in %.1fs, queue_left=%d",
         rollout_id,
-        time.time() - started,
+        duration,
         worker.queue_size(),
     )
     worker.log_summary(
@@ -628,7 +651,8 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[li
         rollout_id=int(rollout_id),
         target_groups=int(target),
         returned_groups=len(out),
-        duration_s=round(time.time() - started, 3),
+        leftover_completed_groups=len(leftovers),
+        duration_s=round(duration, 3),
     )
     return out
 

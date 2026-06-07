@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import importlib.util
 import json
@@ -108,6 +109,40 @@ def test_async_worker_summary_is_structured_and_includes_shutdown_counters(monke
     assert payload["inflight_by_count"] == 2
     assert payload["target_groups"] == 2
     assert payload["returned_groups"] == 2
+
+
+def test_generate_rollout_preserves_overflow_completed_groups(monkeypatch):
+    rollout = _load_fully_async_module()
+    rollout.GenerateState = lambda _args: SimpleNamespace(sampling_params={})
+    args = SimpleNamespace(
+        rollout_batch_size=2,
+        rollout_global_dataset=True,
+        n_samples_per_prompt=1,
+        sglang_server_concurrency=4,
+        rollout_num_gpus=2,
+        rollout_num_gpus_per_engine=1,
+    )
+    worker = rollout.AsyncRolloutWorker(args, SimpleNamespace())
+    monkeypatch.setattr(rollout, "_get_global_worker", lambda _args, _data_buffer: worker)
+
+    for group_id in range(5):
+        sample = SimpleNamespace(
+            prompt=f"prompt-{group_id}",
+            response=f"response-{group_id}",
+            label=f"label-{group_id}",
+            reward=0.0,
+            index=group_id,
+        )
+        worker.output_queue.put((group_id, [sample]))
+    worker.started_count = 5
+    worker.completed_count = 5
+
+    first_batch = asyncio.run(rollout._generate_rollout_async(args, 0, SimpleNamespace()))
+    second_batch = asyncio.run(rollout._generate_rollout_async(args, 1, SimpleNamespace()))
+
+    assert [group[0].index for group in first_batch] == [0, 1]
+    assert [group[0].index for group in second_batch] == [2, 3]
+    assert worker.get_completed_backlog_size() == 1
 
 
 def test_stop_global_worker_keeps_handle_when_thread_does_not_stop():

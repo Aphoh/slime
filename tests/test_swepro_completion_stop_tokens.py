@@ -35,7 +35,7 @@ def test_direct_completions_payload_maps_glm_stop_token_ids_to_stop_strings():
     assert payload["prompt"] == [1, 2, 3]
     assert payload["stop"] == ["</tool_call>"]
     assert "stop_token_ids" not in payload
-    assert payload["nvext"] == {"extra_fields": ["stop_reason"]}
+    assert payload["nvext"] == {"extra_fields": ["stop_reason", "completion_token_ids"]}
 
 
 def test_direct_completions_payload_can_ignore_eos_for_trace_replay():
@@ -59,7 +59,7 @@ def test_direct_completions_payload_merges_dynamo_agent_context():
 
     payload = model._build_payload_from_ids([1, 2, 3], agent_context=agent_context)
 
-    assert payload["nvext"]["extra_fields"] == ["stop_reason"]
+    assert payload["nvext"]["extra_fields"] == ["stop_reason", "completion_token_ids"]
     assert payload["nvext"]["agent_context"] == agent_context
     assert "phase" not in payload["nvext"]["agent_context"]
 
@@ -234,7 +234,7 @@ def test_direct_completions_carries_stop_reason(monkeypatch):
 
     assert posted_payloads[0]["stop"] == ["</tool_call>"]
     assert "stop_token_ids" not in posted_payloads[0]
-    assert posted_payloads[0]["nvext"] == {"extra_fields": ["stop_reason"]}
+    assert posted_payloads[0]["nvext"] == {"extra_fields": ["stop_reason", "completion_token_ids"]}
     assert posted_headers[0] == {"x-request-id": "traj:llm:0:try:0"}
     assert result["extra"]["stop_reason"] == f"token_id:{GLM_TOOL_CLOSE_TOKEN_ID}"
     assert result["extra"]["generated_token_ids"] == [GLM_TOOL_CALL_TOKEN_ID]
@@ -335,6 +335,49 @@ def test_direct_completions_prefers_token_logprob_cardinality_when_tokens_overco
     assert result["extra"]["raw_token_logprob_count"] == 3
     assert result["extra"]["tokens_array_overcount"] is True
     assert result["extra"]["locally_truncated_to_max_tokens"] is False
+
+
+def test_direct_completions_prefers_completion_token_ids_over_short_logprobs(monkeypatch):
+    class _Tokenizer:
+        @staticmethod
+        def decode(token_ids, skip_special_tokens=False):
+            return "".join(f"<{token_id}>" for token_id in token_ids)
+
+    class _Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [
+                    {
+                        "text": "full generated text",
+                        "finish_reason": "length",
+                        "logprobs": {
+                            "tokens": ["token_id:11", "token_id:12", "token_id:13"],
+                            "token_logprobs": [-0.1, -0.2, -0.3],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 5, "total_tokens": 7},
+                "nvext": {"completion_token_ids": [11, 12, 13, 14, 15]},
+            }
+
+    monkeypatch.setattr(completions_direct_model.requests, "post", lambda *_args, **_kwargs: _Response())
+    model = DirectCompletionsModel.__new__(DirectCompletionsModel)
+    model.config = DirectCompletionsConfig(base_url="http://dynamo", tokenizer_path="unused")
+    model.tokenizer = _Tokenizer()
+
+    result = model.complete_prompt_ids([1, 2], max_tokens=5)
+
+    assert result["extra"]["generated_token_ids"] == [11, 12, 13, 14, 15]
+    assert result["extra"]["token_logprobs"] == [-0.1, -0.2, -0.3, 0.0, 0.0]
+    assert result["extra"]["backend_generated_tokens"] == 5
+    assert result["extra"]["generated_token_source"] == "completion_token_ids"
+    assert result["extra"]["raw_token_logprob_count"] == 3
+    assert result["extra"]["tokens_array_overcount"] is False
 
 
 def test_direct_completions_retry_uses_distinct_x_request_ids(monkeypatch):

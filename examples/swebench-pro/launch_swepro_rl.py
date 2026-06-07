@@ -1117,7 +1117,7 @@ while true; do
     ray job status --address="$address" --log-style=record --log-color=false "$job_id"
   }} >> "$log_dir/ray-status.log" 2>&1
 
-  if tail -40 "$log_dir/ray-status.log" | grep -Eq "SUCCEEDED|FAILED|STOPPED"; then
+  if tail -40 "$log_dir/ray-status.log" | grep -Eiq "SUCCEEDED|FAILED|STOPPED|Job .+ (succeeded|failed|stopped)"; then
     break
   fi
   if ! kill -0 "$logs_pid" >/dev/null 2>&1; then
@@ -1338,7 +1338,7 @@ while true; do
     echo "===== $(date -Is) ====="
     ray job status --address="$address" --log-style=record --log-color=false "$job_id"
   } >> "$metrics_dir/ray-status-for-metrics.log" 2>&1 || true
-  if tail -40 "$metrics_dir/ray-status-for-metrics.log" | grep -Eq "SUCCEEDED|FAILED|STOPPED"; then
+  if tail -40 "$metrics_dir/ray-status-for-metrics.log" | grep -Eiq "SUCCEEDED|FAILED|STOPPED|Job .+ (succeeded|failed|stopped)"; then
     break
   fi
   if ! kill -0 "$scraper_pid" >/dev/null 2>&1; then

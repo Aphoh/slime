@@ -69,6 +69,7 @@ def _payload_debug_fields(payload: dict[str, Any]) -> dict[str, Any]:
         "top_p": payload.get("top_p"),
         "top_k": payload.get("top_k"),
         "stream": payload.get("stream"),
+        "detokenize": payload.get("detokenize"),
         "return_tokens_as_token_ids": payload.get("return_tokens_as_token_ids"),
         "logprobs": payload.get("logprobs"),
         "stop_count": len(stop_list),
@@ -198,6 +199,8 @@ class DirectCompletionsConfig:
     top_k: int | None = None
     timeout: float = 600.0
     retries: int = 5
+    return_logprobs: bool = True
+    detokenize: bool = True
 
     @classmethod
     def from_env(cls) -> "DirectCompletionsConfig":
@@ -217,6 +220,8 @@ class DirectCompletionsConfig:
             top_k=int(value) if (value := _env("SWEPRO_TOP_K")) else None,
             timeout=float(_env("SWEPRO_REQUEST_TIMEOUT", "600") or "600"),
             retries=int(_env("SWEPRO_REQUEST_RETRIES", "5") or "5"),
+            return_logprobs=_env_flag("SWEPRO_COMPLETIONS_RETURN_LOGPROBS", True),
+            detokenize=_env_flag("SWEPRO_COMPLETIONS_DETOKENIZE", True),
         )
 
 
@@ -254,11 +259,14 @@ class DirectCompletionsModel:
             "max_tokens": int(kwargs.get("max_tokens", self.config.max_tokens)),
             "temperature": float(kwargs.get("temperature", self.config.temperature)),
             "top_p": float(kwargs.get("top_p", self.config.top_p)),
-            "logprobs": 0,
-            "return_tokens_as_token_ids": True,
             "stream": False,
-            "nvext": {"extra_fields": ["stop_reason"]},
+            "nvext": {"extra_fields": ["stop_reason", "completion_token_ids"]},
         }
+        if not self.config.detokenize:
+            payload["detokenize"] = False
+        if self.config.return_logprobs:
+            payload["logprobs"] = 0
+            payload["return_tokens_as_token_ids"] = True
         top_k = kwargs.get("top_k", self.config.top_k)
         if top_k is not None and int(top_k) > 0:
             payload["top_k"] = int(top_k)
@@ -361,23 +369,51 @@ class DirectCompletionsModel:
             raise RuntimeError(f"completion request failed: {last_error}")
 
         choice = data["choices"][0]
-        response_nvext = data.get("nvext") or {}
+        response_nvext = {}
+        if isinstance(data.get("nvext"), dict):
+            response_nvext.update(data["nvext"])
+        if isinstance(choice.get("nvext"), dict):
+            response_nvext.update(choice["nvext"])
         logprobs = choice.get("logprobs") or {}
-        generated_token_ids = token_ids_from_logprob_tokens(logprobs.get("tokens") or [], self.tokenizer)
+        completion_token_ids = response_nvext.get("completion_token_ids")
+        generated_token_ids = [int(token_id) for token_id in completion_token_ids or []]
+        generated_token_source = "completion_token_ids" if generated_token_ids else None
+        if not generated_token_ids:
+            generated_token_ids = token_ids_from_logprob_tokens(logprobs.get("tokens") or [], self.tokenizer)
+            generated_token_source = "logprobs_tokens" if generated_token_ids else None
         token_logprobs = list(logprobs.get("token_logprobs") or [])
         content = choice.get("text", "")
         requested_max_tokens = int(payload["max_tokens"])
+        if not generated_token_ids:
+            generated_token_ids = token_ids_for_text(self.tokenizer, content)
+            generated_token_source = "text" if generated_token_ids else None
+            if not self.config.return_logprobs and payload.get("ignore_eos") and payload.get("min_tokens") == requested_max_tokens:
+                pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+                if pad_token_id is None:
+                    pad_token_id = self.tool_token_ids.eos
+                if len(generated_token_ids) < requested_max_tokens:
+                    generated_token_ids.extend([pad_token_id] * (requested_max_tokens - len(generated_token_ids)))
+                elif len(generated_token_ids) > requested_max_tokens:
+                    generated_token_ids = generated_token_ids[:requested_max_tokens]
         raw_parsed_generated_tokens = len(generated_token_ids)
         raw_token_logprob_count = len(token_logprobs)
         usage = data.get("usage") or {}
         usage_completion_tokens = usage.get("completion_tokens")
-        backend_generated_tokens = raw_token_logprob_count or len(generated_token_ids)
+        backend_generated_tokens = (
+            len(generated_token_ids)
+            if generated_token_source == "completion_token_ids"
+            else raw_token_logprob_count or len(generated_token_ids)
+        )
 
         # Dynamo/SGLang can return an inflated logprobs.tokens array on
         # completions requests even when token_logprobs has the true generated
         # length. Keep token IDs aligned to the authoritative logprob cardinality.
         tokens_array_overcount = False
-        if raw_token_logprob_count and len(generated_token_ids) > raw_token_logprob_count:
+        if (
+            generated_token_source == "logprobs_tokens"
+            and raw_token_logprob_count
+            and len(generated_token_ids) > raw_token_logprob_count
+        ):
             generated_token_ids = generated_token_ids[:raw_token_logprob_count]
             content = _decode_token_ids(self.tokenizer, generated_token_ids)
             choice["text"] = content
@@ -409,6 +445,7 @@ class DirectCompletionsModel:
             "usage_completion_tokens": usage_completion_tokens,
             "parsed_generated_token_ids": raw_parsed_generated_tokens,
             "raw_token_logprob_count": raw_token_logprob_count,
+            "generated_token_source": generated_token_source,
             "tokens_array_overcount": tokens_array_overcount,
             "locally_truncated_to_max_tokens": locally_truncated_to_max_tokens,
         }
@@ -432,6 +469,7 @@ class DirectCompletionsModel:
             backend_generated_tokens=backend_generated_tokens,
             raw_parsed_generated_tokens=raw_parsed_generated_tokens,
             raw_token_logprob_count=raw_token_logprob_count,
+            generated_token_source=generated_token_source,
             generated_tokens=len(generated_token_ids),
             token_logprobs=len(token_logprobs),
             response_text_chars=len(content),
