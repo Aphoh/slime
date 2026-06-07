@@ -49,7 +49,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     mkdir -p /build/dist && \
     cp target/wheels/*.whl /build/dist/
 
-FROM ${BASE_IMAGE} AS tachometer_scraper
+FROM scratch AS tachometer_scraper
+
+ARG TACHOMETER_SCRAPER_BINARY
 
 # CI artifact provenance:
 #   repo: NVIDIA-dev/warnold-tachometer
@@ -57,6 +59,7 @@ FROM ${BASE_IMAGE} AS tachometer_scraper
 #   artifact: scraper-aarch64-unknown-linux-gnu
 #   artifact digest: sha256:dd711431b95a13a8b566761c3e2b1edc75ff6bf827037f0d6f093969d62fa812
 #   commit: e7823a01e52120cb388b81a871c84932df22ad05
+COPY ${TACHOMETER_SCRAPER_BINARY} /usr/local/bin/tachometer-scraper
 
 FROM ${BASE_IMAGE}
 
