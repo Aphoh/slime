@@ -121,6 +121,25 @@ def ensure_network_utils_shim(root: Path) -> None:
 
     path = root / "srt" / "utils" / "network.py"
     if path.exists():
+        patched = _replace_once(
+            path,
+            '''        if not addr:
+            raise ValueError("Empty address string")
+''',
+            '''        if not addr:
+            raise ValueError("Empty address string")
+
+        if "://" in addr:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(addr)
+            if parsed.hostname is None or parsed.port is None:
+                raise ValueError(f"invalid network address: {addr!r}")
+            return NetworkAddress(parsed.hostname, parsed.port)
+''',
+        )
+        if not patched and "urlparse(addr)" not in path.read_text():
+            raise RuntimeError(f"could not patch NetworkAddress.parse in {path}")
         return
     path.write_text(
         '''from __future__ import annotations
