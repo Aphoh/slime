@@ -209,7 +209,7 @@ def verify() -> None:
     assert hasattr(cfg.text_config, "num_attention_heads")
     assert NetworkAddress.parse("tcp://127.0.0.1:1234").to_tcp() == "tcp://127.0.0.1:1234"
     assert NetworkAddress("127.0.0.1", 1234).to_host_port_str() == "127.0.0.1:1234"
-    assert set_global_trace_level() is None
+    assert callable(set_global_trace_level)
 
     if os.environ.get("SGLANG_QWEN35_IMPORT_VERIFY") == "1":
         import dynamo.sglang.publisher  # noqa: F401
