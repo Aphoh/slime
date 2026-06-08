@@ -76,7 +76,8 @@ RUN pip install --no-cache-dir --force-reinstall --no-deps /tmp/*.whl && \
     chmod 0755 /usr/local/bin/tachometer-scraper && \
     cd /opt/dynamo && \
     pip install --no-cache-dir -e ".[sglang]" --no-deps && \
-    pip install --no-cache-dir nats-py nixl "transformers>=5.0" "fla-core==0.4.1" "ray[default]" && \
+    pip install --no-cache-dir nats-py nixl "transformers>=5.0" "fla-core==0.4.1" "ray[default]" \
+      wandb tensorboard pylatexenc qwen_vl_utils && \
     python3 /code/slime/examples/swebench-pro/patch_sglang_qwen35.py && \
     ln -sfn /root/src/Megatron-LM /root/Megatron-LM && \
     rm -f /tmp/*.whl
