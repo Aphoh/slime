@@ -842,6 +842,7 @@ spec:
               --max-prefill-tokens "${SGLANG_MAX_PREFILL_TOKENS:-16384}"
               --chunked-prefill-size "${SGLANG_CHUNKED_PREFILL_SIZE:-16384}"
               --stream-interval 50
+              --stream-output
               --scheduler-recv-interval 30
               --tokenizer-worker-num "${SGLANG_TOKENIZER_WORKER_NUM:-1}"
               --skip-server-warmup
