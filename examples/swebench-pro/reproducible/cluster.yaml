@@ -1,0 +1,44 @@
+version: 1
+name: swepro-dynamo-gcp02
+
+# Resolve relative to this file. Inside the mounted pod checkout this still
+# points at /code/slime if the command is run from this repository checkout.
+repo_root: ../../..
+
+ray:
+  address: http://127.0.0.1:8265
+  start_head:
+    enabled: false
+  job:
+    no_wait: false
+
+resources:
+  actor_num_nodes: 4
+  actor_num_gpus_per_node: 4
+  rollout_num_gpus: 4
+  rollout_num_gpus_per_engine: 2
+
+dynamo:
+  enabled: true
+  frontend_url: http://warnold-swepro-frontend:3000
+  nats_url: nats://warnold-swepro-nats:4222
+  worker_system_port: 30001
+  frontend_wait_timeout: 600
+  tool_events_zmq_port: 20390
+
+runtime_env:
+  env_vars:
+    NCCL_NVLS_ENABLE: auto
+    NCCL_MNNVL_ENABLE: 0
+    NCCL_CUMEM_ENABLE: 1
+    NCCL_CUMEM_HOST_ENABLE: 1
+    NCCL_STORE_TIMEOUT: 7200
+    NCCL_SOCKET_IFNAME: eth0
+    GLOO_SOCKET_IFNAME: eth0
+    TORCH_NCCL_ASYNC_ERROR_HANDLING: 1
+    RAY_DEDUP_LOGS: 0
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+artifacts:
+  root_dir: ../../../.context/swepro-runs
+  durable_logs: true

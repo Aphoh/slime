@@ -627,6 +627,14 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_swepro_experiment_interface.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_agent_trajectory.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_rollout_validation.py"
             },
             {

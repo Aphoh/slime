@@ -1,0 +1,199 @@
+version: 1
+name: swepro-qwen35-dynamo
+description: >
+  Representative SWE-Pro/Dynamo experiment using the simplified two-file
+  interface. Argument groups are literal stock slime CLI tokens.
+
+entrypoint: train_async.py
+model_args_script: scripts/models/qwen3.5-122B-A10B.sh
+
+swepro:
+  agent_mode: sweagent_session
+  max_tool_calls: 0
+  episode_wall_timeout: 0
+  turn_max_tokens: 0
+  model_call_timeout: 1800
+  request_timeout: 1800
+  request_retries: 5
+  session_start_timeout: 1200
+  session_step_request_timeout: 300
+  session_submit_request_timeout: 300
+  session_close_timeout: 120
+  session_health_timeout: 30
+  session_rollout_retries: 1
+
+argument_groups:
+  trainer_shape:
+    - --seq-length
+    - 131072
+    - --qkv-format
+    - thd
+    - --distributed-backend
+    - cpu:gloo,cuda:nccl
+    - --tensor-model-parallel-size
+    - 2
+    - --sequence-parallel
+    - --pipeline-model-parallel-size
+    - 8
+    - --context-parallel-size
+    - 1
+    - --expert-model-parallel-size
+    - 2
+    - --expert-tensor-parallel-size
+    - 1
+    - --moe-token-dispatcher-type
+    - alltoall
+
+  checkpoints:
+    - --hf-checkpoint
+    - /shared/Qwen3.5-122B-A10B
+    - --ref-load
+    - /shared/Qwen3.5-122B-A10B_torch_dist
+
+  swepro_real_rollout:
+    - --rollout-function-path
+    - slime.rollout.sglang_rollout.generate_rollout
+    - --custom-generate-function-path
+    - generate_with_swebench_pro.generate
+    - --custom-rm-path
+    - generate_with_swebench_pro.reward_func
+    - --prompt-data
+    - /data/swebench-pro/swebench_pro_train_cached_images.jsonl
+    - --input-key
+    - prompt
+    - --label-key
+    - instance_id
+    - --rollout-shuffle
+    - --num-rollout
+    - 10
+    - --rollout-batch-size
+    - 16
+    - --over-sampling-batch-size
+    - 16
+    - --n-samples-per-prompt
+    - 4
+    - --rollout-max-response-len
+    - 131072
+    - --rollout-max-context-len
+    - 131072
+    - --rollout-temperature
+    - 1
+    - --global-batch-size
+    - 64
+    - --balance-data
+
+  swepro_trace_replay_rollout:
+    - --debug-rollout-only
+    - --rollout-function-path
+    - slime.rollout.fully_async_rollout.rollout_with_mock_trainer
+    - --custom-generate-function-path
+    - generate_with_swebench_pro.generate
+    - --custom-rm-path
+    - generate_with_swebench_pro.reward_func
+    - --prompt-data
+    - /data/swebench-pro/swebench_pro_train_cached_images.jsonl
+    - --input-key
+    - prompt
+    - --label-key
+    - instance_id
+    - --num-rollout
+    - 20
+    - --rollout-batch-size
+    - 8
+    - --over-sampling-batch-size
+    - 32
+    - --n-samples-per-prompt
+    - 1
+    - --rollout-max-response-len
+    - 131072
+    - --rollout-max-context-len
+    - 131072
+    - --rollout-temperature
+    - 0
+    - --global-batch-size
+    - 8
+    - --mock-trainer-tokens-per-second
+    - 15000
+    - --mock-weight-update-seconds
+    - 20
+
+  optimizer:
+    - --optimizer
+    - adam
+    - --lr
+    - 1e-6
+    - --lr-decay-style
+    - constant
+    - --min-lr
+    - 1e-6
+    - --weight-decay
+    - 0.1
+    - --adam-beta1
+    - 0.9
+    - --adam-beta2
+    - 0.98
+    - --use-precision-aware-optimizer
+    - --optimizer-cpu-offload
+    - --overlap-cpu-optimizer-d2h-h2d
+
+  grpo:
+    - --advantage-estimator
+    - grpo
+    - --disable-rewards-normalization
+    - --update-weights-interval
+    - 2
+
+  perf:
+    - --use-dynamic-batch-size
+    - --max-tokens-per-gpu
+    - 131072
+    - --log-probs-chunk-size
+    - 64
+    - --defer-fp32-logits
+    - --recompute-granularity
+    - full
+    - --recompute-method
+    - uniform
+    - --recompute-num-layers
+    - 1
+
+  stability:
+    - --attention-dropout
+    - 0.0
+    - --hidden-dropout
+    - 0.0
+    - --accumulate-allreduce-grads-in-fp32
+    - --attention-softmax-in-fp32
+    - --attention-backend
+    - flash
+
+modes:
+  run:
+    description: Real SWE-Pro async RL rollouts with delayed weight updates.
+    include_groups:
+      - trainer_shape
+      - checkpoints
+      - swepro_real_rollout
+      - optimizer
+      - grpo
+      - perf
+      - stability
+
+  perf-test:
+    description: Deterministic trace replay through Dynamo with a mock trainer.
+    include_groups:
+      - trainer_shape
+      - checkpoints
+      - swepro_trace_replay_rollout
+      - optimizer
+      - grpo
+      - perf
+      - stability
+    swepro:
+      trace_replay_path: /data/swebench-pro/traces/trace-replay-sample-qwen35-v1-8192gen-tool120-20260605.jsonl
+      trace_replay_force_fixed_decode: true
+      mock_env_scale: 1.0
+      mock_env_reward: 0.0
+      async_max_inflight: 128
+      async_max_started_groups: auto
+      async_group_max_attempts: 2

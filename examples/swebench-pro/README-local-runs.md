@@ -57,6 +57,19 @@ trajectory.
 
 ## Launch With A YAML Config
 
+Prefer the reproducible two-file interface for new experiments:
+
+```bash
+python3 examples/swebench-pro/run_experiment.py \
+  --cluster examples/swebench-pro/reproducible/cluster.yaml \
+  --experiment examples/swebench-pro/reproducible/experiment_config.yaml \
+  --dry-run
+```
+
+Use `--mode perf-test` with the same two files for the trace-replay performance
+test path. See `examples/swebench-pro/reproducible/README.md` for the full
+workflow.
+
 Use `examples/swebench-pro/router_bench_trace_replay.yaml` as the baseline
 config for mocked-trainer/router runs. Explicit environment variables override
 YAML values, so keep run identifiers and one-off router flags in the shell:
