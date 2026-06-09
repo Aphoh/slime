@@ -86,6 +86,7 @@ spec:
             --max-prefill-tokens 16384 \
             --chunked-prefill-size 16384 \
             --stream-interval 50 \
+            --stream-output \
             --scheduler-recv-interval 30 \
             --tokenizer-worker-num 1 \
             --skip-server-warmup \
@@ -225,6 +226,7 @@ spec:
             --max-prefill-tokens 16384 \
             --chunked-prefill-size 16384 \
             --stream-interval 50 \
+            --stream-output \
             --scheduler-recv-interval 30 \
             --tokenizer-worker-num 1 \
             --skip-server-warmup \

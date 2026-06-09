@@ -195,6 +195,14 @@ _examples_synced/
 .context/tachometer-ci/
 .context/traces/
 .context/perf-artifacts/
+.context/Dockerfile.dynamo-sglang0512-main-b5ff7e2
+.context/k8s-swepro-*-v120.yaml
+.context/k8s-swepro-trainer-head-routerbench.yaml
+.context/overlap_score_only_router.py
+.context/simulate_router_load_weight.py
+.context/routerbench-kv-vs-sticky-tachometer-*/
+.context/routerbench-router-iteration-*/
+.context/routerbench-parquet/
 qwen3.5-122b-perf-results/*/raw/
 .env
 .DS_Store

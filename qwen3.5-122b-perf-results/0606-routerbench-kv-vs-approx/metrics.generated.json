@@ -1,0 +1,297 @@
+{
+  "title": "RouterBench trace replay: KV-event routing vs approximate routing",
+  "date_utc": "2026-06-06",
+  "cluster": "nv-prd-dgxc.teleport.sh-dynamo-gcp-dev-02",
+  "namespace": "warnold-dynamo",
+  "trace_replay_path": "/data/swebench-pro/traces/trace-replay-sample-qwen35-v1-8192gen-tool120-20260605.jsonl",
+  "run_shape": {
+    "num_rollout": 20,
+    "rollout_batch_size": 8,
+    "over_sampling_batch_size": 32,
+    "max_started_groups": 160,
+    "max_inflight": 128,
+    "model_calls": 3085,
+    "trajectories": 160,
+    "mock_trainer_tokens_per_second": 15000,
+    "mock_weight_update_seconds": 20,
+    "request_plane": "tcp",
+    "engines": 4,
+    "gpus_per_engine": 2,
+    "sglang_max_running_requests": 128
+  },
+  "runs": {
+    "kv_events": {
+      "run_id": "routerbench_kvevents_trace_replay_streamfix2_20260606T0514Z",
+      "remote_run_dir": "/data/swebench-pro/runs/routerbench_kvevents_trace_replay_streamfix2_20260606T0514Z",
+      "router_mode": "kv routing with KV events enabled",
+      "succeeded": true,
+      "accepted": 160,
+      "completed": 160,
+      "failed": 0,
+      "aborted": 0,
+      "cancelled": 0,
+      "event_span_s": 686.0,
+      "trajectory_duration_s": {
+        "count": 160,
+        "mean": 281.875,
+        "p50": 258.0,
+        "p90": 462.6,
+        "p95": 503.45,
+        "max": 628.0
+      },
+      "planned_trace_duration_s": {
+        "count": 160,
+        "mean": 87.41543125,
+        "p50": 83.2385,
+        "p90": 102.7313,
+        "p95": 133.62205,
+        "max": 238.462
+      },
+      "actual_minus_planned_s": {
+        "count": 160,
+        "mean": 194.45956875,
+        "p50": 166.286,
+        "p90": 360.231,
+        "p95": 389.72555,
+        "max": 488.447
+      },
+      "first_batch_duration_s": 169.025,
+      "last_batch_duration_s": 45.268,
+      "event_counts": {
+        "session_started": 160,
+        "trace_replay_plan_claimed": 160,
+        "model_request": 3085,
+        "model_response": 3085,
+        "tool_step_request": 3080,
+        "tool_step_response": 3080,
+        "model_stop_without_tool": 5,
+        "submit_request": 160,
+        "submit_response": 160,
+        "session_close_request": 160,
+        "session_close_response": 160,
+        "rollout_finished": 160,
+        "mock_reward": 160
+      },
+      "tokens": {
+        "model_prompt_tokens_sum": 47993084,
+        "model_requested_tokens_sum": 979819,
+        "model_completion_tokens_sum": 979819,
+        "rollout_response_tokens_sum": 4185489,
+        "trainable_tokens_sum": 979819
+      },
+      "finish_reasons": {
+        "length": 155,
+        "stop": 5
+      },
+      "statuses": {
+        "Status.TRUNCATED": 155,
+        "Status.COMPLETED": 5
+      },
+      "tachometer": {
+        "final_parquet": "/data/swebench-pro/runs/routerbench_kvevents_trace_replay_streamfix2_20260606T0514Z/metrics/tachometer-local/final.parquet",
+        "rows": 989088,
+        "sglang_realtime_token_deltas": {
+          "decode": 272444.0,
+          "prefill_cache": 9780224.0,
+          "prefill_compute": 4463616.0
+        },
+        "engine_queue_reqs_per_series_max": {
+          "mean": 4.25,
+          "p50": 4.0,
+          "p90": 5.4,
+          "max": 6.0
+        },
+        "engine_running_reqs_per_series_max": {
+          "mean": 37.5,
+          "p50": 38.0,
+          "p90": 40.8,
+          "max": 42.0
+        },
+        "engine_retracted_reqs_max": 0.0,
+        "engine_cache_hit_rate_sample": {
+          "mean": 0.08353129167713828,
+          "p50": 0.0,
+          "p90": 0.30315208733081717,
+          "max": 0.9972299337387085
+        },
+        "engine_token_usage_sample": {
+          "mean": 0.11428715190903803,
+          "p50": 0.041992489248514175,
+          "p90": 0.33331691324710844,
+          "max": 0.46019333600997925
+        },
+        "engine_mamba_usage_sample": {
+          "mean": 0.10268972126405325,
+          "p50": 0.013651876710355282,
+          "p90": 0.32764506340026855,
+          "max": 0.5665528774261475
+        },
+        "frontend_ttft_seconds_hist_delta": {
+          "count": 3085.0,
+          "p50": 1.3739514348785873,
+          "p90": 3.6106805293005673,
+          "p95": 4.339650283553875
+        },
+        "sglang_queue_time_seconds_hist_delta": {
+          "count": 6170.0,
+          "p50": 0.06502951096121416,
+          "p90": 0.6992248062015504,
+          "p95": 0.9383720930232557
+        }
+      }
+    },
+    "approx": {
+      "run_id": "routerbench_approx_trace_replay_streamfix_20260606T0555Z",
+      "remote_run_dir": "/data/swebench-pro/runs/routerbench_approx_trace_replay_streamfix_20260606T0555Z",
+      "router_mode": "KV router approximate mode, KV events disabled, router prefill load scale 1",
+      "succeeded": true,
+      "accepted": 160,
+      "completed": 160,
+      "failed": 0,
+      "aborted": 0,
+      "cancelled": 0,
+      "event_span_s": 655.0,
+      "trajectory_duration_s": {
+        "count": 160,
+        "mean": 251.3125,
+        "p50": 223.5,
+        "p90": 420.8,
+        "p95": 461.6,
+        "max": 567.0
+      },
+      "planned_trace_duration_s": {
+        "count": 160,
+        "mean": 87.41543125,
+        "p50": 83.2385,
+        "p90": 102.7313,
+        "p95": 133.62205,
+        "max": 238.462
+      },
+      "actual_minus_planned_s": {
+        "count": 160,
+        "mean": 163.89706875,
+        "p50": 131.83,
+        "p90": 322.9764,
+        "p95": 356.1168,
+        "max": 455.447
+      },
+      "first_batch_duration_s": 159.711,
+      "last_batch_duration_s": 41.599,
+      "event_counts": {
+        "session_started": 160,
+        "trace_replay_plan_claimed": 160,
+        "model_request": 3085,
+        "model_response": 3085,
+        "tool_step_request": 3080,
+        "tool_step_response": 3080,
+        "model_stop_without_tool": 5,
+        "submit_request": 160,
+        "submit_response": 160,
+        "session_close_request": 160,
+        "session_close_response": 160,
+        "rollout_finished": 160,
+        "mock_reward": 160
+      },
+      "tokens": {
+        "model_prompt_tokens_sum": 47993084,
+        "model_requested_tokens_sum": 979819,
+        "model_completion_tokens_sum": 979819,
+        "rollout_response_tokens_sum": 4185489,
+        "trainable_tokens_sum": 979819
+      },
+      "finish_reasons": {
+        "length": 155,
+        "stop": 5
+      },
+      "statuses": {
+        "Status.TRUNCATED": 155,
+        "Status.COMPLETED": 5
+      },
+      "tachometer": {
+        "final_parquet": "/data/swebench-pro/runs/routerbench_approx_trace_replay_streamfix_20260606T0555Z/metrics/tachometer-local/final.parquet",
+        "rows": 603139,
+        "sglang_realtime_token_deltas": {
+          "decode": 261608.0,
+          "prefill_cache": 9557184.0,
+          "prefill_compute": 3060992.0
+        },
+        "engine_queue_reqs_per_series_max": {
+          "mean": 22.0,
+          "p50": 22.0,
+          "p90": 27.7,
+          "max": 28.0
+        },
+        "engine_running_reqs_per_series_max": {
+          "mean": 37.25,
+          "p50": 37.0,
+          "p90": 39.4,
+          "max": 40.0
+        },
+        "engine_retracted_reqs_max": 0.0,
+        "engine_cache_hit_rate_sample": {
+          "mean": 0.12787212253522492,
+          "p50": 0.0,
+          "p90": 0.811862856149674,
+          "max": 0.9983948469161987
+        },
+        "engine_token_usage_sample": {
+          "mean": 0.15020919553871248,
+          "p50": 0.134197399020195,
+          "p90": 0.3180099666118622,
+          "max": 0.3956037163734436
+        },
+        "engine_mamba_usage_sample": {
+          "mean": 0.13928003229009434,
+          "p50": 0.08191126585006714,
+          "p90": 0.35733789205551164,
+          "max": 0.5597269535064697
+        },
+        "frontend_ttft_seconds_hist_delta": {
+          "count": 3085.0,
+          "p50": 1.455530474040632,
+          "p90": 3.6923469387755103,
+          "p95": 4.25448250728863
+        },
+        "sglang_queue_time_seconds_hist_delta": {
+          "count": 6170.0,
+          "p50": 0.07184443409408478,
+          "p90": 1.3271812080536913,
+          "p95": 1.8447986577181208
+        }
+      }
+    }
+  },
+  "paired_comparison": {
+    "common_source_trajectories": 160,
+    "approx_faster_count": 158,
+    "kv_faster_count": 0,
+    "tie_count": 2,
+    "approx_minus_kv_duration_s": {
+      "count": 160,
+      "mean": -30.5625,
+      "p50": -32.0,
+      "p90": -9.0,
+      "p95": -4.0,
+      "max": 0.0
+    },
+    "approx_over_kv_ratio": {
+      "count": 160,
+      "mean": 0.890389713267336,
+      "p50": 0.8932186732186732,
+      "p90": 0.9485483870967741,
+      "p95": 0.9720583160800552,
+      "max": 1.0
+    },
+    "event_span_delta_s": -31.0,
+    "event_span_ratio_approx_over_kv": 0.9548104956268222,
+    "mean_duration_improvement_percent": 10.841012193055431,
+    "p50_duration_improvement_percent": 13.372093023255815,
+    "p90_duration_improvement_percent": 9.035019455252918
+  },
+  "caveats": [
+    "Primary comparison uses Ray driver SWEPRO_AGENT_TRACE timestamps grouped by trace_replay_source_trajectory_id; this gives a paired comparison over the same 160 source trajectories.",
+    "KV Tachometer collection was manually stopped after the Ray job because the old launcher terminal-state grep missed Ray's 'Job ... succeeded' wording; counter rates over collector wall time are therefore not used as primary evidence.",
+    "Frontend pod logs are cumulative across frontend restarts, so routing-mode evidence must be read from the relevant startup tail: KV run has kv-events subscriber; approx run logs 'Skipping KV event subscription (use_kv_events=false, overlap_score_credit=1)'.",
+    "Approx engines were relaunched with SWEPRO_DYNAMO_ROUTER_KV_EVENTS=0, so the approximate run disables engine KV event publication as well as frontend KV event consumption."
+  ]
+}

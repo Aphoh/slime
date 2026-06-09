@@ -1,0 +1,85 @@
+{
+  "title": "RouterBench router iteration: KV events versus sticky-session routing",
+  "date_utc": "2026-06-08",
+  "cluster": "nv-prd-dgxc.teleport.sh-dynamo-gcp-dev-02",
+  "namespace": "warnold-dynamo",
+  "trace_replay_path": "/data/swebench-pro/traces/trace-replay-sample-qwen35-v1-8192gen-tool120-20260605.jsonl",
+  "run_shape": {
+    "trajectories": 400,
+    "model_requests": 7656,
+    "model_responses": 7656,
+    "generated_trainable_tokens": 2474472,
+    "mock_trainer_tokens_per_second": 15000,
+    "mock_weight_update_seconds": 20,
+    "engines": 4,
+    "gpus_per_engine": 2,
+    "fixed_decode": true,
+    "ignore_eos": true,
+    "max_generated_tokens_per_turn": 8192,
+    "max_tool_duration_s": 120
+  },
+  "baseline": {
+    "name": "approx_no_kv_events_load_0.02",
+    "trajectories_per_minute": 21.034181,
+    "mean_e2e_s": 244.0675,
+    "p90_e2e_s": 447.2
+  },
+  "runs": [
+    {
+      "name": "kv_events_ttl10_prefillscale8_load1",
+      "trajectories_per_minute": 21.0711,
+      "mean_e2e_s": 255.255,
+      "p90_e2e_s": 461.3,
+      "result": "beats sticky on throughput only"
+    },
+    {
+      "name": "kv_events_ttl10_prefillscale16_load1",
+      "trajectories_per_minute": 21.5633,
+      "mean_e2e_s": 245.88,
+      "p90_e2e_s": 442.0,
+      "result": "misses sticky mean e2e"
+    },
+    {
+      "name": "kv_events_ttl10_prefillscale16_load0.1",
+      "trajectories_per_minute": 21.9579,
+      "mean_e2e_s": 244.935,
+      "p90_e2e_s": 444.0,
+      "result": "misses sticky mean e2e by 0.8675s"
+    },
+    {
+      "name": "kv_events_ttl10_prefillscale16_load0.05",
+      "trajectories_per_minute": 21.6216,
+      "mean_e2e_s": 249.09,
+      "p90_e2e_s": 458.0,
+      "result": "regressed versus sticky"
+    },
+    {
+      "name": "kv_events_ttl10_prefillscale24_load0.1",
+      "trajectories_per_minute": 20.6186,
+      "mean_e2e_s": 249.675,
+      "p90_e2e_s": 466.0,
+      "result": "regressed versus sticky"
+    },
+    {
+      "name": "kv_events_ttl5_prefillscale16_load0.1",
+      "completed_trajectories": 288,
+      "result": "stopped partial run"
+    },
+    {
+      "name": "kv_events_ttl10_prefillscale16_load0.15",
+      "trajectories_per_minute": 21.6411,
+      "mean_e2e_s": 241.4,
+      "p90_e2e_s": 439.0,
+      "result": "best completed run"
+    }
+  ],
+  "best_vs_baseline": {
+    "throughput_improvement_pct": 3.945845292190222,
+    "mean_e2e_reduction_pct": 1.0921109314559577,
+    "p90_e2e_reduction_pct": 1.8336314841223202
+  },
+  "local_artifacts": {
+    "router_iteration": ".context/routerbench-router-iteration-20260608/",
+    "tachometer_analysis": ".context/routerbench-kv-vs-sticky-tachometer-20260608/"
+  }
+}
