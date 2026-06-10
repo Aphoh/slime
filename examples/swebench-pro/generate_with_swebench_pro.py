@@ -266,6 +266,8 @@ def _get_model(args) -> DirectCompletionsModel:
             top_k=getattr(args, "rollout_top_k", None),
             timeout=float(os.getenv("SWEPRO_REQUEST_TIMEOUT", "1800")),
             retries=int(os.getenv("SWEPRO_REQUEST_RETRIES", "5")),
+            metadata_upload_url=os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_URL"),
+            metadata_upload_format=os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT", "msgpack"),
         )
         _MODEL = DirectCompletionsModel(config)
     return _MODEL
