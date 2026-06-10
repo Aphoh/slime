@@ -7,11 +7,13 @@ completions endpoint.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +61,7 @@ def _payload_debug_fields(payload: dict[str, Any]) -> dict[str, Any]:
     stop_list = stop if isinstance(stop, list) else ([stop] if stop else [])
     nvext = payload.get("nvext") if isinstance(payload.get("nvext"), dict) else {}
     agent_context = nvext.get("agent_context") if isinstance(nvext, dict) else None
+    metadata_upload = nvext.get("metadata_upload") if isinstance(nvext, dict) else None
     return {
         "model": payload.get("model"),
         "prompt_tokens": len(prompt),
@@ -75,6 +78,8 @@ def _payload_debug_fields(payload: dict[str, Any]) -> dict[str, Any]:
         "stop_count": len(stop_list),
         "stop": stop_list,
         "nvext_extra_fields": nvext.get("extra_fields") if isinstance(nvext, dict) else None,
+        "metadata_upload_url": metadata_upload.get("url") if isinstance(metadata_upload, dict) else None,
+        "metadata_upload_format": metadata_upload.get("format") if isinstance(metadata_upload, dict) else None,
         "agent_trajectory_id": agent_context.get("trajectory_id") if isinstance(agent_context, dict) else None,
         "agent_session_id": agent_context.get("session_id") if isinstance(agent_context, dict) else None,
     }
@@ -201,6 +206,8 @@ class DirectCompletionsConfig:
     retries: int = 5
     return_logprobs: bool = True
     detokenize: bool = True
+    metadata_upload_url: str | None = None
+    metadata_upload_format: str = "msgpack"
 
     @classmethod
     def from_env(cls) -> "DirectCompletionsConfig":
@@ -222,6 +229,8 @@ class DirectCompletionsConfig:
             retries=int(_env("SWEPRO_REQUEST_RETRIES", "5") or "5"),
             return_logprobs=_env_flag("SWEPRO_COMPLETIONS_RETURN_LOGPROBS", True),
             detokenize=_env_flag("SWEPRO_COMPLETIONS_DETOKENIZE", True),
+            metadata_upload_url=_env("SWEPRO_DYNAMO_METADATA_UPLOAD_URL"),
+            metadata_upload_format=_env("SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT", "msgpack") or "msgpack",
         )
 
 
@@ -321,12 +330,25 @@ class DirectCompletionsModel:
         last_error: Exception | None = None
         success_attempt: int | None = None
         success_elapsed_s: float | None = None
+        success_metadata_upload_url: str | None = None
         response_status_code: int | None = None
         for attempt in range(self.config.retries):
             attempt_started_at = time.monotonic()
             attempt_status_code: int | None = None
             try:
                 request_id = f"{x_request_id}:try:{attempt}" if x_request_id else None
+                metadata_upload_url = None
+                if self.config.metadata_upload_url:
+                    metadata_request_id = request_id or f"anonymous:{uuid.uuid4().hex}"
+                    readable_id = re.sub(r"[^A-Za-z0-9._-]+", "-", metadata_request_id).strip("-")[:120]
+                    request_hash = hashlib.sha256(metadata_request_id.encode("utf-8")).hexdigest()[:16]
+                    metadata_upload_url = (
+                        f"{self.config.metadata_upload_url.rstrip('/')}/{readable_id or 'request'}-{request_hash}"
+                    )
+                    payload["nvext"]["metadata_upload"] = {
+                        "url": metadata_upload_url,
+                        "format": self.config.metadata_upload_format,
+                    }
                 headers = {"x-request-id": request_id} if request_id else None
                 _completion_debug_log(
                     "completion_request",
@@ -345,6 +367,7 @@ class DirectCompletionsModel:
                 data = response.json()
                 success_attempt = attempt
                 success_elapsed_s = time.monotonic() - attempt_started_at
+                success_metadata_upload_url = metadata_upload_url
                 break
             except Exception as exc:
                 last_error = exc
@@ -448,6 +471,7 @@ class DirectCompletionsModel:
             "generated_token_source": generated_token_source,
             "tokens_array_overcount": tokens_array_overcount,
             "locally_truncated_to_max_tokens": locally_truncated_to_max_tokens,
+            "metadata_upload_url": success_metadata_upload_url,
         }
         if locally_truncated_to_max_tokens and data.get("usage"):
             usage = data["usage"]

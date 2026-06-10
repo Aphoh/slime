@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import sys
@@ -62,6 +63,61 @@ def test_direct_completions_payload_merges_dynamo_agent_context():
     assert payload["nvext"]["extra_fields"] == ["stop_reason", "completion_token_ids"]
     assert payload["nvext"]["agent_context"] == agent_context
     assert "phase" not in payload["nvext"]["agent_context"]
+
+
+def test_direct_completions_injects_retry_specific_metadata_upload_urls(monkeypatch):
+    class _Tokenizer:
+        @staticmethod
+        def decode(token_ids, skip_special_tokens=False):
+            return "".join(f"<{token_id}>" for token_id in token_ids)
+
+    class _Response:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [
+                    {
+                        "text": "<11>",
+                        "finish_reason": "stop",
+                        "logprobs": {"tokens": ["token_id:11"], "token_logprobs": [-0.1]},
+                    }
+                ],
+                "nvext": {"completion_token_ids": [11]},
+            }
+
+    posted_payloads = []
+
+    def _post(_url, json, headers, timeout):
+        posted_payloads.append(copy.deepcopy(json))
+        if len(posted_payloads) == 1:
+            raise RuntimeError("transient")
+        return _Response()
+
+    monkeypatch.setattr(completions_direct_model.requests, "post", _post)
+    monkeypatch.setattr(completions_direct_model.time, "sleep", lambda _seconds: None)
+    model = DirectCompletionsModel.__new__(DirectCompletionsModel)
+    model.config = DirectCompletionsConfig(
+        base_url="http://dynamo",
+        tokenizer_path="unused",
+        retries=2,
+        metadata_upload_url="s3://rollout-metadata/run-1",
+    )
+    model.tokenizer = _Tokenizer()
+
+    result = model.complete_prompt_ids([1, 2], max_tokens=1, x_request_id="session:sample:turn:0")
+
+    first = posted_payloads[0]["nvext"]["metadata_upload"]
+    second = posted_payloads[1]["nvext"]["metadata_upload"]
+    assert first["format"] == "msgpack"
+    assert second["format"] == "msgpack"
+    assert first["url"].startswith("s3://rollout-metadata/run-1/session-sample-turn-0-try-0-")
+    assert second["url"].startswith("s3://rollout-metadata/run-1/session-sample-turn-0-try-1-")
+    assert first["url"] != second["url"]
+    assert result["extra"]["metadata_upload_url"] == second["url"]
 
 
 def test_glm_stop_strings_from_token_ids_normalizes_known_stops():
