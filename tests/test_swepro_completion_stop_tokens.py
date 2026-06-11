@@ -5,6 +5,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "swebench-pro"
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -99,6 +101,14 @@ def test_direct_completions_injects_retry_specific_metadata_upload_urls(monkeypa
 
     monkeypatch.setattr(completions_direct_model.requests, "post", _post)
     monkeypatch.setattr(completions_direct_model.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        completions_direct_model,
+        "_read_uploaded_metadata",
+        lambda _url, _format: {
+            "output_token_logprobs": [[-0.1, 11]],
+            "finish_reason": {"type": "stop"},
+        },
+    )
     model = DirectCompletionsModel.__new__(DirectCompletionsModel)
     model.config = DirectCompletionsConfig(
         base_url="http://dynamo",
