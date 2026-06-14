@@ -29,6 +29,8 @@ def test_build_dynamo_payload_supports_completions_and_responses():
         top_k=20,
         stop=["END"],
         stop_token_ids=[99],
+        no_stop_trim=True,
+        spaces_between_special_tokens=False,
         stream=True,
         return_logprobs=True,
         metadata_upload_url="s3://bucket/run/request",
@@ -39,8 +41,11 @@ def test_build_dynamo_payload_supports_completions_and_responses():
     assert completions["return_tokens_as_token_ids"] is True
     assert completions["stop"] == ["END"]
     assert completions["stop_token_ids"] == [99]
+    assert completions["no_stop_trim"] is True
+    assert completions["include_stop_str_in_output"] is True
+    assert completions["spaces_between_special_tokens"] is False
     assert completions["nvext"]["extra_fields"] == ["stop_reason", "completion_token_ids"]
-    assert completions["nvext"]["metadata_upload"]["url"] == "s3://bucket/run/request"
+    assert completions["nvext"]["metadata_upload"] == {"url": "s3://bucket/run/request"}
 
     responses = build_dynamo_payload(
         api_mode="responses",
@@ -60,6 +65,7 @@ def test_build_dynamo_payload_supports_completions_and_responses():
         spaces_between_special_tokens=False,
         stream=True,
         return_logprobs=True,
+        metadata_upload_url="s3://bucket/run/request",
     )
     assert responses["input"] == [{"role": "user", "content": "hello"}]
     assert responses["previous_response_id"] == "resp_previous"
@@ -69,14 +75,15 @@ def test_build_dynamo_payload_supports_completions_and_responses():
     assert responses["nvext"]["token_data"] == [1, 2]
     assert responses["seed"] == 123
     assert responses["skip_special_tokens"] is False
-    assert responses["no_stop_trim"] is True
+    assert "no_stop_trim" not in responses
     assert responses["include_stop_str_in_output"] is True
-    assert responses["spaces_between_special_tokens"] is False
+    assert "spaces_between_special_tokens" not in responses
     assert responses["nvext"]["extra_fields"] == [
         "stop_reason",
         "completion_token_ids",
         "completion_token_logprobs",
     ]
+    assert responses["nvext"]["metadata_upload"] == {"url": "s3://bucket/run/request"}
 
 
 def test_metadata_upload_url_is_stable_and_request_specific():
@@ -415,7 +422,16 @@ def test_short_routed_expert_suffix_rejects_trainable_tokens():
         )
 
 
-def test_generate_dynamo_stream_cancellation_keeps_prefix_without_s3(monkeypatch):
+@pytest.mark.parametrize(
+    ("metadata_enabled", "expected_tokens", "expected_logprobs"),
+    [
+        (True, [1, 2, 11, 12], [-0.1, -0.2]),
+        (False, [1, 2, 11], [-0.1]),
+    ],
+)
+def test_generate_dynamo_stream_cancellation_uses_s3_and_preserves_non_s3_fallback(
+    monkeypatch, metadata_enabled, expected_tokens, expected_logprobs
+):
     from slime.rollout import sglang_rollout
 
     class FakeTokenizer:
@@ -450,7 +466,7 @@ def test_generate_dynamo_stream_cancellation_keeps_prefix_without_s3(monkeypatch
             state.aborted = True
             yield "data: " + json.dumps(
                 {
-                    "delta": "x",
+                    "delta": "xy",
                     "nvext": {
                         "completion_token_ids": [11, 12],
                         "completion_token_logprobs": [-0.1],
@@ -463,24 +479,33 @@ def test_generate_dynamo_stream_cancellation_keeps_prefix_without_s3(monkeypatch
             captured.update(method=method, url=url, payload=json, headers=headers)
             return FakeResponse()
 
-    async def unexpected_metadata_read(*_args, **_kwargs):
-        raise AssertionError("cancelled streams must not wait for S3 metadata")
+    async def read_cancelled_metadata(url, payload_format, *, required):
+        captured["metadata_read"] = (url, payload_format, required)
+        return {
+            "output_token_logprobs": [[-0.1, 11, "x"], [-0.2, 12, "y"]],
+            "finish_reason": {"type": "abort"},
+            "routed_experts": np.arange(3, dtype=np.int32).reshape(3, 1, 1),
+            "weight_version": "policy-7",
+        }
 
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
     monkeypatch.setattr(sglang_rollout.http_utils, "_http_client", FakeClient())
-    monkeypatch.setattr(sglang_rollout, "_read_dynamo_metadata", unexpected_metadata_read)
+    monkeypatch.setattr(sglang_rollout, "_read_dynamo_metadata", read_cancelled_metadata)
 
     args = SimpleNamespace(
         dynamo_api_mode="responses",
         sglang_router_ip="dynamo",
         sglang_router_port=3000,
         hf_checkpoint="model",
-        dynamo_metadata_upload_url="s3://bucket/run",
+        dynamo_metadata_upload_url="s3://bucket/run" if metadata_enabled else None,
         dynamo_metadata_upload_format="msgpack",
         dynamo_request_retries=1,
         dynamo_responses_store=True,
         partial_rollout=True,
         mask_offpolicy_in_partial_rollout=True,
+        num_layers=1,
+        moe_router_topk=1,
+        num_experts=4,
     )
     sample = Sample(
         group_index=0,
@@ -507,15 +532,28 @@ def test_generate_dynamo_stream_cancellation_keeps_prefix_without_s3(monkeypatch
     )
 
     assert result.status == Sample.Status.ABORTED
-    assert result.tokens == [1, 2, 11]
-    assert result.rollout_log_probs == [-0.1]
-    assert result.response == "<11>"
+    assert result.tokens == expected_tokens
+    assert result.rollout_log_probs == expected_logprobs
+    assert result.response == "".join(f"<{token_id}>" for token_id in expected_tokens[2:])
     assert result.metadata["dynamo_response_id"] == "resp_partial"
     assert "dynamo_previous_response_id" not in result.metadata
     assert captured["url"].endswith("/v1/responses")
     assert captured["payload"]["stream"] is True
     assert captured["payload"]["seed"] == 9
     assert not state.active_dynamo_tasks
+    request_id = captured["headers"]["x-request-id"]
+    request_identity = sample.session_id or "rollout-0-0"
+    nonce = request_id.removeprefix(f"{request_identity}:").removesuffix(":try:0")
+    assert len(nonce) == 32
+
+    if metadata_enabled:
+        assert captured["metadata_read"][1:] == ("msgpack", False)
+        assert result.weight_versions == ["policy-7"]
+        assert result.rollout_routed_experts.shape == (3, 1, 1)
+    else:
+        assert "metadata_read" not in captured
+        assert result.weight_versions == []
+        assert result.rollout_routed_experts is None
 
 
 def test_dynamo_worker_streams_and_requests_routes_by_default(monkeypatch):

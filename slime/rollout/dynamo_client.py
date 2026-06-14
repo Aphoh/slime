@@ -44,7 +44,6 @@ def build_dynamo_payload(
     previous_response_id: str | None = None,
     store: bool = False,
     metadata_upload_url: str | None = None,
-    metadata_upload_format: str = "msgpack",
     agent_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if api_mode not in DYNAMO_API_MODES:
@@ -57,10 +56,7 @@ def build_dynamo_payload(
         "extra_fields": extra_fields,
     }
     if metadata_upload_url:
-        nvext["metadata_upload"] = {
-            "url": metadata_upload_url,
-            "format": metadata_upload_format,
-        }
+        nvext["metadata_upload"] = {"url": metadata_upload_url}
     if agent_context:
         nvext["agent_context"] = dict(agent_context)
 
@@ -111,9 +107,10 @@ def build_dynamo_payload(
     if skip_special_tokens is not None:
         payload["skip_special_tokens"] = bool(skip_special_tokens)
     if no_stop_trim is not None:
-        payload["no_stop_trim"] = bool(no_stop_trim)
+        if api_mode == "completions":
+            payload["no_stop_trim"] = bool(no_stop_trim)
         payload["include_stop_str_in_output"] = bool(no_stop_trim)
-    if spaces_between_special_tokens is not None:
+    if spaces_between_special_tokens is not None and api_mode == "completions":
         payload["spaces_between_special_tokens"] = bool(spaces_between_special_tokens)
     if stop:
         payload["stop"] = stop

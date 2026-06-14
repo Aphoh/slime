@@ -350,7 +350,8 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
     assert request_task is not None
     state.active_dynamo_tasks.add(request_task)
 
-    request_base_id = sample.session_id or f"rollout-{sample.group_index}-{sample.index}-{uuid.uuid4().hex}"
+    request_identity = sample.session_id or f"rollout-{sample.group_index}-{sample.index}"
+    request_base_id = f"{request_identity}:{uuid.uuid4().hex}"
     metadata_root, metadata_format = _dynamo_metadata_settings(args)
     retries = max(1, int(getattr(args, "dynamo_request_retries", 3)))
     store_response = api_mode == "responses" and bool(getattr(args, "dynamo_responses_store", False) or sample.metadata.get("dynamo_previous_response_id"))
@@ -385,7 +386,6 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
                 stream=True,
                 return_logprobs=True,
                 metadata_upload_url=metadata_upload_url,
-                metadata_upload_format=metadata_format,
             )
             headers = {"x-request-id": request_id}
             saw_output = False
@@ -447,7 +447,14 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
 
         state.active_dynamo_tasks.discard(request_task)
         uploaded_metadata = None
-        if not cancelled:
+        if cancelled and metadata_upload_url:
+            _clear_task_cancellation(request_task)
+            uploaded_metadata = await _read_dynamo_metadata(
+                metadata_upload_url,
+                metadata_format,
+                required=False,
+            )
+        elif not cancelled:
             if generation.terminal_event_received:
                 _clear_task_cancellation(request_task)
             try:
@@ -468,9 +475,12 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
         if uploaded_metadata is not None:
             generation.apply_metadata(uploaded_metadata)
         if cancelled:
-            paired_prefix_len = min(len(generation.token_ids), len(generation.token_logprobs))
-            generation.token_ids = generation.token_ids[:paired_prefix_len]
-            generation.token_logprobs = generation.token_logprobs[:paired_prefix_len]
+            if uploaded_metadata is None:
+                paired_prefix_len = min(len(generation.token_ids), len(generation.token_logprobs))
+                generation.token_ids = generation.token_ids[:paired_prefix_len]
+                generation.token_logprobs = generation.token_logprobs[:paired_prefix_len]
+            else:
+                generation.align_logprobs(required=bool(generation.token_ids))
             generation.text = ""
         else:
             generation.align_logprobs(required=bool(generation.token_ids))
