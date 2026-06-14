@@ -7,17 +7,20 @@ prompts locally with the HF tokenizer and sends exact token IDs through either
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
 import re
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import requests
+from slime.rollout.dynamo_client import (
+    build_dynamo_payload,
+    build_metadata_upload_url,
+    read_uploaded_metadata as _read_uploaded_metadata,
+)
 
 try:
     from transformers import AutoTokenizer
@@ -162,7 +165,7 @@ class QwenToolTokenIds:
     eos: int
 
     @classmethod
-    def from_tokenizer(cls, tokenizer: Any) -> "QwenToolTokenIds":
+    def from_tokenizer(cls, tokenizer: Any) -> QwenToolTokenIds:
         return cls(
             tool_call=single_token_id_for_text(tokenizer, TOOL_CALL_START, GLM_TOOL_CALL_TOKEN_ID),
             tool_close=single_token_id_for_text(tokenizer, TOOL_CALL_END, GLM_TOOL_CLOSE_TOKEN_ID),
@@ -171,10 +174,14 @@ class QwenToolTokenIds:
 
 
 def _tool_token_ids(tokenizer: Any | None = None) -> QwenToolTokenIds:
-    return QwenToolTokenIds.from_tokenizer(tokenizer) if tokenizer is not None else QwenToolTokenIds(
-        tool_call=GLM_TOOL_CALL_TOKEN_ID,
-        tool_close=GLM_TOOL_CLOSE_TOKEN_ID,
-        eos=GLM_EOS_TOKEN_ID,
+    return (
+        QwenToolTokenIds.from_tokenizer(tokenizer)
+        if tokenizer is not None
+        else QwenToolTokenIds(
+            tool_call=GLM_TOOL_CALL_TOKEN_ID,
+            tool_close=GLM_TOOL_CLOSE_TOKEN_ID,
+            eos=GLM_EOS_TOKEN_ID,
+        )
     )
 
 
@@ -188,10 +195,7 @@ def glm_stop_strings_from_token_ids(token_ids: list[int], tokenizer: Any | None 
         elif token_id in {GLM_EOS_TOKEN_ID, ids.eos}:
             stops.append(EOS_TEXT)
         else:
-            raise ValueError(
-                f"/v1/completions does not accept stop_token_ids; "
-                f"no GLM stop string mapping for token_id:{token_id}"
-            )
+            raise ValueError(f"/v1/completions does not accept stop_token_ids; no GLM stop string mapping for token_id:{token_id}")
     return stops
 
 
@@ -236,34 +240,6 @@ def _response_output_logprobs(data: dict[str, Any]) -> list[float]:
     return values
 
 
-def _read_uploaded_metadata(base_url: str, payload_format: str, retries: int = 5) -> dict[str, Any]:
-    from dynamo.common.storage import get_fs
-    import zstandard as zstd
-
-    filename = f"choice_0.{payload_format}.zst"
-    fs = get_fs(base_url)
-    last_error: Exception | None = None
-    for attempt in range(retries):
-        try:
-            raw = zstd.ZstdDecompressor().decompress(fs.cat(filename))
-            if payload_format == "json":
-                payload = json.loads(raw)
-            else:
-                import msgspec
-
-                payload = msgspec.msgpack.decode(raw)
-            metadata = payload.get("metadata") if isinstance(payload, dict) else None
-            if not isinstance(metadata, dict):
-                raise ValueError(f"invalid Dynamo metadata payload at {base_url}/{filename}")
-            return metadata
-        except Exception as exc:
-            last_error = exc
-            if attempt + 1 >= retries:
-                break
-            time.sleep(min(0.25 * (2**attempt), 2.0))
-    raise RuntimeError(f"failed to read Dynamo metadata upload {base_url}/{filename}: {last_error}")
-
-
 @dataclass
 class DirectCompletionsConfig:
     base_url: str
@@ -282,7 +258,7 @@ class DirectCompletionsConfig:
     metadata_upload_format: str = "msgpack"
 
     @classmethod
-    def from_env(cls) -> "DirectCompletionsConfig":
+    def from_env(cls) -> DirectCompletionsConfig:
         base_url = _env("SWEPRO_DYNAMO_FRONTEND_URL", _env("DYNAMO_FRONTEND_URL", _env("OPENAI_BASE_URL")))
         tokenizer_path = _env("SWEPRO_TOKENIZER_PATH", _env("HF_CHECKPOINT", _env("MODEL_PATH")))
         if not base_url:
@@ -292,7 +268,7 @@ class DirectCompletionsConfig:
         return cls(
             base_url=base_url.rstrip("/"),
             tokenizer_path=tokenizer_path,
-            api_mode=(_env("SWEPRO_DYNAMO_API_MODE", "completions") or "completions").strip().lower(),
+            api_mode=(_env("DYNAMO_API_MODE", _env("SWEPRO_DYNAMO_API_MODE", "completions")) or "completions").strip().lower(),
             model=_env("SWEPRO_MODEL", tokenizer_path) or "default",
             max_tokens=int(_env("SWEPRO_MAX_TOKENS", "4096") or "4096"),
             temperature=float(_env("SWEPRO_TEMPERATURE", "1.0") or "1.0"),
@@ -302,8 +278,17 @@ class DirectCompletionsConfig:
             retries=int(_env("SWEPRO_REQUEST_RETRIES", "5") or "5"),
             return_logprobs=_env_flag("SWEPRO_COMPLETIONS_RETURN_LOGPROBS", True),
             detokenize=_env_flag("SWEPRO_COMPLETIONS_DETOKENIZE", True),
-            metadata_upload_url=_env("SWEPRO_DYNAMO_METADATA_UPLOAD_URL"),
-            metadata_upload_format=_env("SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT", "msgpack") or "msgpack",
+            metadata_upload_url=_env(
+                "DYNAMO_METADATA_UPLOAD_URL",
+                _env("SWEPRO_DYNAMO_METADATA_UPLOAD_URL"),
+            ),
+            metadata_upload_format=(
+                _env(
+                    "DYNAMO_METADATA_UPLOAD_FORMAT",
+                    _env("SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT", "msgpack"),
+                )
+                or "msgpack"
+            ),
         )
 
 
@@ -339,29 +324,6 @@ class DirectCompletionsModel:
         return self._build_payload_from_ids(prompt_ids, **kwargs)
 
     def _build_payload_from_ids(self, prompt_ids: list[int], **kwargs) -> dict[str, Any]:
-        if self.config.api_mode == "responses":
-            return self._build_responses_payload_from_ids(prompt_ids, **kwargs)
-        payload = {
-            "model": kwargs.get("model", self.config.model),
-            "prompt": prompt_ids,
-            "max_tokens": int(kwargs.get("max_tokens", self.config.max_tokens)),
-            "temperature": float(kwargs.get("temperature", self.config.temperature)),
-            "top_p": float(kwargs.get("top_p", self.config.top_p)),
-            "stream": False,
-            "nvext": {"extra_fields": ["stop_reason", "completion_token_ids"]},
-        }
-        if not self.config.detokenize:
-            payload["detokenize"] = False
-        if self.config.return_logprobs:
-            payload["logprobs"] = 0
-            payload["return_tokens_as_token_ids"] = True
-        top_k = kwargs.get("top_k", self.config.top_k)
-        if top_k is not None and int(top_k) > 0:
-            payload["top_k"] = int(top_k)
-        if kwargs.get("ignore_eos") is not None:
-            payload["ignore_eos"] = bool(kwargs["ignore_eos"])
-        if kwargs.get("min_tokens") is not None:
-            payload["min_tokens"] = int(kwargs["min_tokens"])
         stop_token_ids = kwargs.get("stop_token_ids")
         stop = kwargs.get("stop")
         if stop_token_ids:
@@ -374,65 +336,34 @@ class DirectCompletionsModel:
                 if mapped_stop not in stop_list:
                     stop_list.append(mapped_stop)
             stop = stop_list
-        if stop:
-            payload["stop"] = stop
-        agent_context = kwargs.get("agent_context")
-        if agent_context:
-            payload["nvext"]["agent_context"] = dict(agent_context)
-        # The updated Dynamo OpenAI frontend rejects stop_token_ids as an unsupported
-        # top-level parameter, so we send GLM special stops as strings instead.
-        return payload
 
-    def _build_responses_payload_from_ids(self, prompt_ids: list[int], **kwargs) -> dict[str, Any]:
         response_input = kwargs.get("response_input")
-        if not response_input:
+        if self.config.api_mode == "responses" and not response_input:
             raise ValueError("stateful /v1/responses requests require response_input items")
-        payload = {
-            "model": kwargs.get("model", self.config.model),
-            "input": response_input,
-            "max_output_tokens": int(kwargs.get("max_tokens", self.config.max_tokens)),
-            "temperature": float(kwargs.get("temperature", self.config.temperature)),
-            "top_p": float(kwargs.get("top_p", self.config.top_p)),
-            "stream": False,
-            "store": True,
-            "nvext": {
-                "token_data": list(prompt_ids),
-                "extra_fields": [
-                    "stop_reason",
-                    "completion_token_ids",
-                    "completion_token_logprobs",
-                ],
-            },
-        }
-        if self.config.return_logprobs:
-            payload["include"] = ["message.output_text.logprobs"]
-        previous_response_id = kwargs.get("previous_response_id")
-        if previous_response_id:
-            payload["previous_response_id"] = str(previous_response_id)
-        top_k = kwargs.get("top_k", self.config.top_k)
-        if top_k is not None and int(top_k) > 0:
-            payload["top_k"] = int(top_k)
-        if kwargs.get("ignore_eos") is not None:
-            payload["ignore_eos"] = bool(kwargs["ignore_eos"])
-        if kwargs.get("min_tokens") is not None:
-            payload["min_tokens"] = int(kwargs["min_tokens"])
-        stop_token_ids = kwargs.get("stop_token_ids")
-        stop = kwargs.get("stop")
-        if stop_token_ids:
-            mapped_stops = glm_stop_strings_from_token_ids(
-                [int(token_id) for token_id in stop_token_ids],
-                getattr(self, "tokenizer", None),
-            )
-            stop_list = list(stop or []) if isinstance(stop, list) else ([stop] if stop else [])
-            for mapped_stop in mapped_stops:
-                if mapped_stop not in stop_list:
-                    stop_list.append(mapped_stop)
-            stop = stop_list
-        if stop:
-            payload["stop"] = stop
-        agent_context = kwargs.get("agent_context")
-        if agent_context:
-            payload["nvext"]["agent_context"] = dict(agent_context)
+        payload = build_dynamo_payload(
+            api_mode=self.config.api_mode,
+            model=kwargs.get("model", self.config.model),
+            prompt_token_ids=prompt_ids,
+            response_input=response_input,
+            previous_response_id=kwargs.get("previous_response_id"),
+            store=self.config.api_mode == "responses",
+            max_tokens=int(kwargs.get("max_tokens", self.config.max_tokens)),
+            temperature=float(kwargs.get("temperature", self.config.temperature)),
+            top_p=float(kwargs.get("top_p", self.config.top_p)),
+            top_k=kwargs.get("top_k", self.config.top_k),
+            stop=stop,
+            min_tokens=kwargs.get("min_tokens"),
+            ignore_eos=kwargs.get("ignore_eos"),
+            seed=kwargs.get("seed"),
+            skip_special_tokens=kwargs.get("skip_special_tokens"),
+            no_stop_trim=kwargs.get("no_stop_trim"),
+            spaces_between_special_tokens=kwargs.get("spaces_between_special_tokens"),
+            stream=False,
+            return_logprobs=self.config.return_logprobs,
+            agent_context=kwargs.get("agent_context"),
+        )
+        if self.config.api_mode == "completions" and not self.config.detokenize:
+            payload["detokenize"] = False
         return payload
 
     def complete_prompt_ids(
@@ -452,9 +383,7 @@ class DirectCompletionsModel:
         return self._post_payload(payload, trace_messages or [], x_request_id=x_request_id)
 
     def delete_response(self, response_id: str) -> None:
-        response = requests.delete(
-            f"{self.config.base_url}/v1/responses/{response_id}", timeout=self.config.timeout
-        )
+        response = requests.delete(f"{self.config.base_url}/v1/responses/{response_id}", timeout=self.config.timeout)
         if response.status_code not in {200, 404}:
             response.raise_for_status()
 
@@ -483,11 +412,9 @@ class DirectCompletionsModel:
                 request_id = f"{x_request_id}:try:{attempt}" if x_request_id else None
                 metadata_upload_url = None
                 if self.config.metadata_upload_url:
-                    metadata_request_id = request_id or f"anonymous:{uuid.uuid4().hex}"
-                    readable_id = re.sub(r"[^A-Za-z0-9._-]+", "-", metadata_request_id).strip("-")[:120]
-                    request_hash = hashlib.sha256(metadata_request_id.encode("utf-8")).hexdigest()[:16]
-                    metadata_upload_url = (
-                        f"{self.config.metadata_upload_url.rstrip('/')}/{readable_id or 'request'}-{request_hash}"
+                    metadata_upload_url = build_metadata_upload_url(
+                        self.config.metadata_upload_url,
+                        request_id,
                     )
                     payload["nvext"]["metadata_upload"] = {
                         "url": metadata_upload_url,
@@ -546,15 +473,20 @@ class DirectCompletionsModel:
             completion_token_ids = response_nvext.get("completion_token_ids")
             generated_token_ids = [int(token_id) for token_id in completion_token_ids or []]
             generated_token_source = "completion_token_ids" if generated_token_ids else None
-            token_logprobs = [
-                float(value) for value in response_nvext.get("completion_token_logprobs") or []
-            ]
+            token_logprobs = [float(value) for value in response_nvext.get("completion_token_logprobs") or []]
             if not token_logprobs:
                 token_logprobs = _response_output_logprobs(data)
             content = _response_output_text(data)
             response_tool_calls = _response_tool_calls(data)
-            finish_reason = "length" if data.get("status") == "incomplete" else "stop"
-            stop_reason = response_nvext.get("stop_reason")
+            response_status = data.get("status")
+            incomplete_reason = (data.get("incomplete_details") or {}).get("reason")
+            if response_status == "incomplete":
+                finish_reason = "content_filter" if incomplete_reason == "content_filter" else "length"
+            elif response_status == "completed":
+                finish_reason = "stop"
+            else:
+                finish_reason = response_status
+            stop_reason = response_nvext.get("stop_reason") or incomplete_reason
             response_usage = data.get("usage") or {}
             usage = {
                 "prompt_tokens": response_usage.get("input_tokens"),
@@ -586,18 +518,21 @@ class DirectCompletionsModel:
             )
             uploaded_logprobs = uploaded_metadata.get("output_token_logprobs") or []
             uploaded_token_ids = [int(entry[1]) for entry in uploaded_logprobs]
-            if generated_token_ids and uploaded_token_ids and generated_token_ids != uploaded_token_ids:
-                raise RuntimeError(
-                    "Dynamo metadata output_token_logprobs token IDs do not match completion_token_ids"
-                )
+            if generated_token_ids and uploaded_token_ids:
+                streamed_token_count = len(generated_token_ids)
+                if uploaded_token_ids[:streamed_token_count] != generated_token_ids:
+                    raise RuntimeError("Dynamo metadata output_token_logprobs token IDs do not match completion_token_ids")
+                uploaded_logprobs = uploaded_logprobs[:streamed_token_count]
+                uploaded_token_ids = uploaded_token_ids[:streamed_token_count]
             if uploaded_token_ids:
-                generated_token_ids = uploaded_token_ids
-                generated_token_source = "metadata_upload"
+                if not generated_token_ids:
+                    generated_token_ids = uploaded_token_ids
+                    generated_token_source = "metadata_upload"
                 token_logprobs = [float(entry[0]) for entry in uploaded_logprobs]
             uploaded_finish_reason = uploaded_metadata.get("finish_reason")
             if isinstance(uploaded_finish_reason, dict):
                 uploaded_finish_reason = uploaded_finish_reason.get("type")
-            if uploaded_finish_reason:
+            if uploaded_finish_reason and not finish_reason:
                 finish_reason = str(uploaded_finish_reason)
 
         if not generated_token_ids:
@@ -613,31 +548,19 @@ class DirectCompletionsModel:
                     generated_token_ids = generated_token_ids[:requested_max_tokens]
         if generated_token_ids and self.config.api_mode == "responses":
             content = _decode_token_ids(self.tokenizer, generated_token_ids)
-            if (
-                finish_reason == "stop"
-                and stop_reason is None
-                and len(generated_token_ids) >= requested_max_tokens
-            ):
+            if finish_reason == "stop" and stop_reason is None and len(generated_token_ids) >= requested_max_tokens:
                 finish_reason = "length"
 
         raw_parsed_generated_tokens = len(generated_token_ids)
         raw_token_logprob_count = len(token_logprobs)
         usage_completion_tokens = usage.get("completion_tokens")
-        backend_generated_tokens = (
-            len(generated_token_ids)
-            if generated_token_source == "completion_token_ids"
-            else raw_token_logprob_count or len(generated_token_ids)
-        )
+        backend_generated_tokens = len(generated_token_ids) if generated_token_source == "completion_token_ids" else raw_token_logprob_count or len(generated_token_ids)
 
         # Dynamo/SGLang can return an inflated logprobs.tokens array on
         # completions requests even when token_logprobs has the true generated
         # length. Keep token IDs aligned to the authoritative logprob cardinality.
         tokens_array_overcount = False
-        if (
-            generated_token_source == "logprobs_tokens"
-            and raw_token_logprob_count
-            and len(generated_token_ids) > raw_token_logprob_count
-        ):
+        if generated_token_source == "logprobs_tokens" and raw_token_logprob_count and len(generated_token_ids) > raw_token_logprob_count:
             generated_token_ids = generated_token_ids[:raw_token_logprob_count]
             content = _decode_token_ids(self.tokenizer, generated_token_ids)
             tokens_array_overcount = True
@@ -651,15 +574,8 @@ class DirectCompletionsModel:
             stop_reason = None
             locally_truncated_to_max_tokens = True
 
-        if (
-            self.config.api_mode == "responses"
-            and self.config.return_logprobs
-            and generated_token_ids
-            and not token_logprobs
-        ):
-            raise RuntimeError(
-                "Dynamo /v1/responses returned completion token IDs without token logprobs"
-            )
+        if self.config.api_mode == "responses" and self.config.return_logprobs and generated_token_ids and not token_logprobs:
+            raise RuntimeError("Dynamo /v1/responses returned completion token IDs without token logprobs")
         if len(token_logprobs) > len(generated_token_ids):
             token_logprobs = token_logprobs[: len(generated_token_ids)]
         elif len(token_logprobs) < len(generated_token_ids):
@@ -798,13 +714,7 @@ def encode_qwen_tool_observation_delta(tokenizer: Any, observation: str) -> list
 
     return token_ids_for_text(
         tokenizer,
-        (
-            "<|im_end|>\n"
-            "<|im_start|>user\n"
-            f"<tool_response>\n{observation}\n</tool_response>"
-            "<|im_end|>\n"
-            "<|im_start|>assistant\n<think>\n"
-        ),
+        (f"<|im_end|>\n<|im_start|>user\n<tool_response>\n{observation}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"),
     )
 
 
