@@ -1,7 +1,9 @@
 import asyncio
 import copy
 import inspect
+import json
 import logging
+import os
 import time
 import uuid
 from argparse import Namespace
@@ -16,7 +18,15 @@ from packaging.version import parse
 from tqdm import tqdm
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from slime.rollout.dynamo_client import (
+    DynamoGeneration,
+    apply_uploaded_metadata_to_sample,
+    build_dynamo_payload,
+    build_metadata_upload_url,
+    read_uploaded_metadata_async,
+)
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from slime.utils import http_utils
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
@@ -43,17 +53,13 @@ _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
     raw_multimodal_inputs = sample.multimodal_inputs or {}
     has_multimodal_inputs = any(value is not None for value in raw_multimodal_inputs.values())
-    reuse_existing_input_ids = bool(sample.tokens) and (
-        sample.multimodal_train_inputs is not None or not has_multimodal_inputs
-    )
+    reuse_existing_input_ids = bool(sample.tokens) and (sample.multimodal_train_inputs is not None or not has_multimodal_inputs)
 
     if processor and has_multimodal_inputs and not reuse_existing_input_ids:
         processor_output = processor(text=sample.prompt, **build_processor_kwargs(raw_multimodal_inputs))
         prompt_ids = processor_output["input_ids"][0]
         if sample.multimodal_train_inputs is None:
-            sample.multimodal_train_inputs = {
-                k: v for k, v in processor_output.items() if k not in _PROCESSOR_PROMPT_KEYS
-            } or None
+            sample.multimodal_train_inputs = {k: v for k, v in processor_output.items() if k not in _PROCESSOR_PROMPT_KEYS} or None
         return prompt_ids
 
     if reuse_existing_input_ids:
@@ -130,6 +136,7 @@ class GenerateState(metaclass=SingletonMeta):
     def reset(self) -> None:
         self.remaining_batch_size = 0
         self.pendings = set()
+        self.active_dynamo_tasks: set[asyncio.Task] = set()
         self.aborted = False
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
@@ -159,15 +166,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
-    assert (
-        sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
-    ), f"Sample status is {sample.status}"
+    assert sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED, f"Sample status is {sample.status}"
 
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
 
-    assert (
-        sampling_params["max_new_tokens"] >= 0
-    ), f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
+    assert sampling_params["max_new_tokens"] >= 0, f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
     if sampling_params["max_new_tokens"] == 0:
         sample.status = Sample.Status.TRUNCATED
         return sample
@@ -200,6 +203,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             headers = {"X-SMG-Routing-Key": sample.session_id}
 
     import time as _time
+
     _req_t0 = _time.time()
     with trace_span(sample, "sglang_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
         output = await post(url, payload, headers=headers)
@@ -209,14 +213,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     _output_len = output["meta_info"].get("completion_tokens", 0)
     _cached_tokens = output["meta_info"].get("cached_tokens", 0)
     _tok_per_sec = _output_len / _req_elapsed if _req_elapsed > 0 else 0
-    logger.info(
-        f"[SGLANG REQUEST] prompt_tokens={_prompt_len} | "
-        f"output_tokens={_output_len} | "
-        f"cached_tokens={_cached_tokens} | "
-        f"latency={_req_elapsed:.3f}s | "
-        f"tok/s={_tok_per_sec:.1f} | "
-        f"finish={output['meta_info'].get('finish_reason', {}).get('type', 'unknown')}"
-    )
+    logger.info(f"[SGLANG REQUEST] prompt_tokens={_prompt_len} | output_tokens={_output_len} | cached_tokens={_cached_tokens} | latency={_req_elapsed:.3f}s | tok/s={_tok_per_sec:.1f} | finish={output['meta_info'].get('finish_reason', {}).get('type', 'unknown')}")
 
     if "output_token_logprobs" in output["meta_info"]:
         new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -253,117 +250,277 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     return sample
 
 
-async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
-    """Generate using Dynamo frontend with OpenAI-compatible completions API."""
-    import time as _time
+def _dynamo_metadata_settings(args: Namespace) -> tuple[str | None, str]:
+    upload_url = getattr(args, "dynamo_metadata_upload_url", None) or os.getenv("DYNAMO_METADATA_UPLOAD_URL") or os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_URL")
+    upload_format = getattr(args, "dynamo_metadata_upload_format", None) or os.getenv("DYNAMO_METADATA_UPLOAD_FORMAT") or os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT") or "msgpack"
+    return upload_url, upload_format
 
+
+def _update_sample_from_dynamo_generation(
+    args: Namespace,
+    sample: Sample,
+    generation: DynamoGeneration,
+    *,
+    tokenizer: Any,
+    base_tokens: list[int],
+    base_response: str,
+    base_response_length: int,
+    base_log_probs: list[float],
+    base_loss_mask: list[int] | None,
+) -> None:
+    generated_text = tokenizer.decode(generation.token_ids, skip_special_tokens=False) if generation.token_ids else generation.text
+    sample.tokens = base_tokens + generation.token_ids
+    sample.response = base_response + generated_text
+    sample.response_length = base_response_length + len(generation.token_ids)
+    sample.rollout_log_probs = base_log_probs + generation.token_logprobs
+    if base_loss_mask is not None:
+        assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
+        sample.loss_mask = base_loss_mask + [1] * len(generation.token_ids)
+
+
+async def _read_dynamo_metadata(
+    metadata_upload_url: str | None,
+    metadata_upload_format: str,
+    *,
+    required: bool,
+) -> dict[str, Any] | None:
+    if not metadata_upload_url:
+        return None
+    try:
+        return await asyncio.shield(read_uploaded_metadata_async(metadata_upload_url, metadata_upload_format))
+    except Exception:
+        if required:
+            raise
+        logger.exception("Failed to read Dynamo metadata upload at %s", metadata_upload_url)
+        return None
+
+
+def _record_dynamo_response_state(
+    sample: Sample,
+    generation: DynamoGeneration,
+    *,
+    reusable: bool,
+) -> None:
+    if generation.response_id:
+        sample.metadata["dynamo_response_id"] = generation.response_id
+    if reusable and generation.response_id:
+        sample.metadata["dynamo_previous_response_id"] = generation.response_id
+    else:
+        sample.metadata.pop("dynamo_previous_response_id", None)
+
+
+def _clear_task_cancellation(task: asyncio.Task) -> None:
+    cancelling = getattr(task, "cancelling", None)
+    uncancel = getattr(task, "uncancel", None)
+    if cancelling is None or uncancel is None:
+        return
+    while cancelling():
+        uncancel()
+
+
+async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
+    """Generate through Dynamo while retaining exact incremental token state."""
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/completions"
+    api_mode = getattr(args, "dynamo_api_mode", "completions")
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/{api_mode}"
 
     assert sample.status in (Sample.Status.PENDING, Sample.Status.ABORTED), f"Sample status is {sample.status}"
-
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
-
-    assert sampling_params["max_new_tokens"] >= 0
-    if sampling_params["max_new_tokens"] == 0:
+    max_tokens = sampling_params["max_new_tokens"]
+    assert max_tokens >= 0
+    if max_tokens == 0:
         sample.status = Sample.Status.TRUNCATED
         return sample
 
     if not sample.tokens:
         sample.tokens = prompt_ids
-
-    # Send token IDs directly and get token IDs + logprobs back.
-    # With return_tokens_as_token_ids, logprob tokens come as "token_id:<id>".
-    model_name = getattr(args, "hf_checkpoint", None) or "default"
-    token_ids = sample.tokens if sample.response else prompt_ids
+    token_ids = list(sample.tokens if sample.response else prompt_ids)
     assert token_ids, "Empty prompt token IDs"
-    payload = {
-        "model": model_name,
-        "prompt": token_ids,
-        "max_tokens": sampling_params["max_new_tokens"],
-        "temperature": sampling_params.get("temperature", 1.0),
-        "top_p": sampling_params.get("top_p", 1.0),
-        "logprobs": 0,
-        "return_tokens_as_token_ids": True,
-        "stream": False,
-        "nvext": {"extra_fields": ["stop_reason"]},
-    }
-    top_k = sampling_params.get("top_k", -1)
-    if top_k > 0:
-        payload["top_k"] = top_k
-    stop = sampling_params.get("stop")
-    if stop:
-        payload["stop"] = stop
-    stop_token_ids = sampling_params.get("stop_token_ids")
-    if stop_token_ids:
-        payload["stop_token_ids"] = [int(token_id) for token_id in stop_token_ids]
 
-    _req_t0 = _time.time()
-    with trace_span(sample, "dynamo_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"], "prompt_len": len(token_ids)}) as span:
-        output = await post(url, payload)
-    _req_elapsed = _time.time() - _req_t0
+    base_tokens = list(sample.tokens)
+    base_response = sample.response or ""
+    base_response_length = sample.response_length
+    base_log_probs = list(sample.rollout_log_probs or [])
+    base_loss_mask = list(sample.loss_mask) if sample.loss_mask is not None else None
 
-    choice = output["choices"][0]
-    response_nvext = output.get("nvext") or {}
-    response_text = choice["text"]
+    client = http_utils._http_client
+    assert client is not None, "http client not initialized; call init_http_client first"
 
-    # Extract token IDs and logprobs directly — no re-tokenization needed.
-    new_response_tokens = []
-    new_response_log_probs = []
-    _had_fallback_tokenize = False
-    if choice.get("logprobs") and choice["logprobs"].get("token_logprobs"):
-        new_response_log_probs = choice["logprobs"]["token_logprobs"]
-        for tok in choice["logprobs"].get("tokens", []):
-            if isinstance(tok, str) and tok.startswith("token_id:"):
-                new_response_tokens.append(int(tok[len("token_id:"):]))
-            else:
-                _had_fallback_tokenize = True
-                ids = state.tokenizer.encode(tok, add_special_tokens=False)
-                new_response_tokens.append(ids[0] if ids else 0)
+    request_task = asyncio.current_task()
+    assert request_task is not None
+    state.active_dynamo_tasks.add(request_task)
 
-    if not new_response_tokens and response_text:
-        _had_fallback_tokenize = True
-        new_response_tokens = state.tokenizer.encode(response_text, add_special_tokens=False)
+    request_base_id = sample.session_id or f"rollout-{sample.group_index}-{sample.index}-{uuid.uuid4().hex}"
+    metadata_root, metadata_format = _dynamo_metadata_settings(args)
+    retries = max(1, int(getattr(args, "dynamo_request_retries", 3)))
+    store_response = api_mode == "responses" and bool(getattr(args, "dynamo_responses_store", False) or sample.metadata.get("dynamo_previous_response_id"))
+    generation = DynamoGeneration(api_mode=api_mode)
+    metadata_upload_url: str | None = None
+    cancelled = False
+    request_started_at = time.monotonic()
 
-    # Align logprobs length with token count
-    _logprob_mismatch = len(new_response_log_probs) != len(new_response_tokens)
-    if _logprob_mismatch:
-        if len(new_response_log_probs) > len(new_response_tokens):
-            new_response_log_probs = new_response_log_probs[: len(new_response_tokens)]
+    try:
+        for attempt in range(retries):
+            request_id = f"{request_base_id}:try:{attempt}"
+            metadata_upload_url = build_metadata_upload_url(metadata_root, request_id) if metadata_root else None
+            payload = build_dynamo_payload(
+                api_mode=api_mode,
+                model=getattr(args, "hf_checkpoint", None) or "default",
+                prompt_token_ids=token_ids,
+                response_input=sample.prompt if api_mode == "responses" else None,
+                previous_response_id=sample.metadata.get("dynamo_previous_response_id"),
+                store=store_response,
+                max_tokens=max_tokens,
+                temperature=sampling_params.get("temperature", 1.0),
+                top_p=sampling_params.get("top_p", 1.0),
+                top_k=sampling_params.get("top_k"),
+                stop=sampling_params.get("stop"),
+                stop_token_ids=sampling_params.get("stop_token_ids"),
+                min_tokens=sampling_params.get("min_tokens"),
+                ignore_eos=sampling_params.get("ignore_eos"),
+                seed=sampling_params.get("sampling_seed"),
+                skip_special_tokens=sampling_params.get("skip_special_tokens"),
+                no_stop_trim=sampling_params.get("no_stop_trim"),
+                spaces_between_special_tokens=sampling_params.get("spaces_between_special_tokens"),
+                stream=True,
+                return_logprobs=True,
+                metadata_upload_url=metadata_upload_url,
+                metadata_upload_format=metadata_format,
+            )
+            headers = {"x-request-id": request_id}
+            saw_output = False
+            event_type: str | None = None
+            try:
+                with trace_span(
+                    sample,
+                    "dynamo_generate",
+                    attrs={
+                        "api_mode": api_mode,
+                        "max_new_tokens": max_tokens,
+                        "prompt_len": len(token_ids),
+                    },
+                ):
+                    async with client.stream("POST", url, json=payload, headers=headers) as response:
+                        response.raise_for_status()
+                        async for raw_line in response.aiter_lines():
+                            if not raw_line:
+                                continue
+                            if raw_line.startswith("event:"):
+                                event_type = raw_line[len("event:") :].strip()
+                                continue
+                            if not raw_line.startswith("data:"):
+                                continue
+                            data_str = raw_line[len("data:") :].strip()
+                            if not data_str or data_str == "[DONE]":
+                                continue
+                            generation.consume_sse(event_type, json.loads(data_str))
+                            saw_output = saw_output or bool(generation.token_ids or generation.text)
+                            _update_sample_from_dynamo_generation(
+                                args,
+                                sample,
+                                generation,
+                                tokenizer=state.tokenizer,
+                                base_tokens=base_tokens,
+                                base_response=base_response,
+                                base_response_length=base_response_length,
+                                base_log_probs=base_log_probs,
+                                base_loss_mask=base_loss_mask,
+                            )
+                            if state.aborted and generation.finish_reason is None:
+                                raise asyncio.CancelledError
+                break
+            except asyncio.CancelledError:
+                if generation.terminal_event_received:
+                    _clear_task_cancellation(request_task)
+                    break
+                cancelled = True
+                break
+            except Exception:
+                if saw_output or attempt + 1 >= retries:
+                    raise
+                logger.exception(
+                    "Dynamo request failed before stream output; retrying attempt %d/%d",
+                    attempt + 1,
+                    retries,
+                )
+                await asyncio.sleep(min(2**attempt, 30))
+
+        state.active_dynamo_tasks.discard(request_task)
+        uploaded_metadata = None
+        if not cancelled:
+            if generation.terminal_event_received:
+                _clear_task_cancellation(request_task)
+            try:
+                uploaded_metadata = await _read_dynamo_metadata(
+                    metadata_upload_url,
+                    metadata_format,
+                    required=bool(metadata_upload_url),
+                )
+            except asyncio.CancelledError:
+                if not generation.terminal_event_received:
+                    raise
+                _clear_task_cancellation(request_task)
+                uploaded_metadata = await _read_dynamo_metadata(
+                    metadata_upload_url,
+                    metadata_format,
+                    required=bool(metadata_upload_url),
+                )
+        if uploaded_metadata is not None:
+            generation.apply_metadata(uploaded_metadata)
+        if cancelled:
+            paired_prefix_len = min(len(generation.token_ids), len(generation.token_logprobs))
+            generation.token_ids = generation.token_ids[:paired_prefix_len]
+            generation.token_logprobs = generation.token_logprobs[:paired_prefix_len]
+            generation.text = ""
         else:
-            new_response_log_probs.extend([0.0] * (len(new_response_tokens) - len(new_response_log_probs)))
+            generation.align_logprobs(required=bool(generation.token_ids))
+        _update_sample_from_dynamo_generation(
+            args,
+            sample,
+            generation,
+            tokenizer=state.tokenizer,
+            base_tokens=base_tokens,
+            base_response=base_response,
+            base_response_length=base_response_length,
+            base_log_probs=base_log_probs,
+            base_loss_mask=base_loss_mask,
+        )
 
-    _tok_per_sec = len(new_response_tokens) / _req_elapsed if _req_elapsed > 0 else 0
-    logger.info(
-        f"[DYNAMO REQUEST] prompt_tokens={len(token_ids)} | "
-        f"output_tokens={len(new_response_tokens)} | "
-        f"latency={_req_elapsed:.3f}s | "
-        f"tok/s={_tok_per_sec:.1f} | "
-        f"finish={choice.get('finish_reason', 'unknown')} | "
-        f"stop_reason={response_nvext.get('stop_reason', choice.get('stop_reason'))} | "
-        f"fallback_tokenize={_had_fallback_tokenize} | "
-        f"logprob_mismatch={_logprob_mismatch}"
-    )
+        apply_uploaded_metadata_to_sample(sample, args, uploaded_metadata)
 
-    sample.tokens = sample.tokens + new_response_tokens
-    sample.response_length += len(new_response_tokens)
-    sample.response += response_text
+        _record_dynamo_response_state(
+            sample,
+            generation,
+            reusable=(store_response and not cancelled and generation.terminal_event_received and generation.finish_reason in {"stop", "length"}),
+        )
+        if cancelled:
+            sample.status = Sample.Status.ABORTED
+        elif generation.finish_reason == "stop":
+            sample.status = Sample.Status.COMPLETED
+        elif generation.finish_reason == "length":
+            sample.status = Sample.Status.TRUNCATED
+        elif generation.finish_reason == "content_filter":
+            sample.status = Sample.Status.FAILED
+        elif generation.finish_reason in {"abort", "cancelled", "failed"}:
+            sample.status = Sample.Status.ABORTED
+        else:
+            raise RuntimeError(f"Dynamo stream ended without a finish reason: {generation.finish_reason}")
 
-    if sample.loss_mask is not None:
-        assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
-        sample.loss_mask += [1] * len(new_response_tokens)
-
-    if sample.rollout_log_probs is None:
-        sample.rollout_log_probs = []
-    sample.rollout_log_probs += new_response_log_probs
-
-    finish_reason = choice.get("finish_reason", "length")
-    if finish_reason == "stop":
-        sample.status = Sample.Status.COMPLETED
-    elif finish_reason == "length":
-        sample.status = Sample.Status.TRUNCATED
-
-    return sample
+        elapsed = time.monotonic() - request_started_at
+        logger.info(
+            "[DYNAMO REQUEST] api=%s prompt_tokens=%d output_tokens=%d latency=%.3fs tok/s=%.1f finish=%s stop_reason=%s metadata_upload=%s",
+            api_mode,
+            len(token_ids),
+            len(generation.token_ids),
+            elapsed,
+            len(generation.token_ids) / elapsed if elapsed > 0 else 0.0,
+            generation.finish_reason,
+            generation.stop_reason,
+            bool(uploaded_metadata),
+        )
+        return sample
+    finally:
+        state.active_dynamo_tasks.discard(request_task)
 
 
 @trace_function("generate_and_rm", target="sample")
@@ -373,16 +530,16 @@ async def generate_and_rm(
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
-    # mask previous off-policy generation for partial rollout
-    if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
-        sample.loss_mask = [0] * sample.response_length
-
     # For samples with existing response, check if they're complete
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
         assert sample.response is not None
         if not args.group_rm:
             assert sample.reward is not None
         return sample
+
+    # mask previous off-policy generation for resumed partial rollout
+    if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.status == Sample.Status.ABORTED and sample.response_length > 0:
+        sample.loss_mask = [0] * sample.response_length
 
     state = GenerateState(args)
 
@@ -446,9 +603,7 @@ async def generate_and_rm(
     target="group",
     attrs_getter=lambda args, group, sampling_params, evaluation=False: {"group_size": len(group)},
 )
-async def generate_and_rm_group(
-    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
-) -> list[Sample] | list[list[Sample]]:
+async def generate_and_rm_group(args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False) -> list[Sample] | list[list[Sample]]:
     # ``generate_and_rm`` may return either a ``Sample`` or a ``list[Sample]``
     # depending on whether the ``--custom-generate-function-path`` callable
     # emits one trainable sample or several (e.g. multi-turn agent rollouts
@@ -473,9 +628,7 @@ async def generate_and_rm_group(
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
-        )
+        tasks.append(asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation)))
         if sibling_stagger > 0 and idx < len(group) - 1:
             await asyncio.sleep(sibling_stagger)
 
@@ -498,9 +651,13 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    # Dynamo frontend doesn't expose /workers — skip worker-level abort.
     if getattr(args, "rollout_backend", None) == "dynamo":
-        logger.info("Dynamo backend: skipping per-worker abort (no /workers endpoint)")
+        active_dynamo_tasks = list(state.active_dynamo_tasks)
+        logger.info("Cancelling %d in-flight Dynamo requests", len(active_dynamo_tasks))
+        for task in active_dynamo_tasks:
+            task.cancel()
+        if active_dynamo_tasks:
+            await asyncio.sleep(0)
     else:
         if parse(sglang_router.__version__) <= parse("0.2.1"):
             response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
@@ -526,12 +683,21 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
 
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
-            group = task.result()
-            for sample in group:
+            try:
+                group = task.result()
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                logger.exception("Dynamo rollout task failed while collecting aborted samples")
+                continue
+            samples = [nested_sample for item in group for nested_sample in (item if isinstance(item, list) else [item])]
+            if not samples or any(sample.status != Sample.Status.ABORTED for sample in samples) or not any(sample.response_length > 0 for sample in samples):
+                continue
+            for sample in samples:
                 if sample.response and "start_rollout_id" not in sample.metadata:
                     sample.metadata["start_rollout_id"] = rollout_id
             aborted_samples.append(group)
-            count += len(group)
+            count += len(samples)
 
     if args.partial_rollout:
         logger.info(f"Collected {count} partial samples into the data buffer")
@@ -539,9 +705,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     return aborted_samples
 
 
-async def generate_rollout_async(
-    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
-) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -559,9 +723,7 @@ async def generate_rollout_async(
     state = GenerateState(args)
 
     # instantiate data filters
-    dynamic_filter = (
-        load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
-    )
+    dynamic_filter = load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
 
     metric_gatherer = MetricGatherer()
 
@@ -598,10 +760,7 @@ async def generate_rollout_async(
             all_data.append(group)
 
             # Track per-group completion stats
-            _group_total_tokens = sum(
-                (s.response_length if not isinstance(s, list) else sum(ss.response_length for ss in s))
-                for s in group
-            )
+            _group_total_tokens = sum((s.response_length if not isinstance(s, list) else sum(ss.response_length for ss in s)) for s in group)
             _group_latencies.append(_batch_done_t - _gen_start)
             _group_token_counts.append(_group_total_tokens)
 
@@ -626,15 +785,7 @@ async def generate_rollout_async(
         _last_group_t = max(_group_latencies)
         _total_tokens = sum(_group_token_counts)
         _median_lat = sorted(_group_latencies)[len(_group_latencies) // 2]
-        logger.info(
-            f"[ROLLOUT GEN] total={_gen_elapsed:.2f}s | "
-            f"groups_completed={len(_group_latencies)} | "
-            f"total_output_tokens={_total_tokens} | "
-            f"first_group_done={_first_group_t:.2f}s | "
-            f"median_group_done={_median_lat:.2f}s | "
-            f"last_group_done={_last_group_t:.2f}s | "
-            f"overall_tok/s={_total_tokens / _gen_elapsed:.1f}"
-        )
+        logger.info(f"[ROLLOUT GEN] total={_gen_elapsed:.2f}s | groups_completed={len(_group_latencies)} | total_output_tokens={_total_tokens} | first_group_done={_first_group_t:.2f}s | median_group_done={_median_lat:.2f}s | last_group_done={_last_group_t:.2f}s | overall_tok/s={_total_tokens / _gen_elapsed:.1f}")
 
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
@@ -646,9 +797,7 @@ async def generate_rollout_async(
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
-    all_samples = sorted(
-        all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
-    )
+    all_samples = sorted(all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
 
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()
@@ -680,9 +829,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     return RolloutFnEvalOutput(data=results), []
 
 
-async def eval_rollout_single_dataset(
-    args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
-) -> dict[str, dict[str, list[Any]]]:
+async def eval_rollout_single_dataset(args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig) -> dict[str, dict[str, list[Any]]]:
     """An example to implement the eval_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -758,11 +905,7 @@ async def eval_rollout_single_dataset(
         sample = await coro
         if do_print:
             logged_sample = sample[0] if isinstance(sample, list) else sample
-            logger.info(
-                "eval_rollout_single_dataset example data: "
-                f"{[str(logged_sample.prompt) + logged_sample.response]} "
-                f"reward={logged_sample.reward}"
-            )
+            logger.info(f"eval_rollout_single_dataset example data: {[str(logged_sample.prompt) + logged_sample.response]} reward={logged_sample.reward}")
             do_print = False
         if isinstance(sample, list):
             data.extend(sample)
@@ -783,9 +926,7 @@ async def eval_rollout_single_dataset(
     }
 
 
-def generate_rollout(
-    args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
-) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
+def generate_rollout(args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:

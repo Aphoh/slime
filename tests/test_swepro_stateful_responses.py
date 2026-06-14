@@ -5,6 +5,9 @@ from pathlib import Path
 import pytest
 
 
+NUM_GPUS = 0
+
+
 EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "swebench-pro"
 sys.path.insert(0, str(EXAMPLE_DIR))
 
@@ -16,7 +19,10 @@ from completions_direct_model import (  # noqa: E402
 )
 
 
-def _responses_model(tokenizer=object()):
+_DEFAULT_TOKENIZER = object()
+
+
+def _responses_model(tokenizer=_DEFAULT_TOKENIZER):
     model = DirectCompletionsModel.__new__(DirectCompletionsModel)
     model.config = DirectCompletionsConfig(
         base_url="http://dynamo",
@@ -45,6 +51,10 @@ def test_direct_responses_payload_carries_exact_tokens_and_state():
         max_tokens=4,
         ignore_eos=True,
         min_tokens=4,
+        seed=123,
+        skip_special_tokens=False,
+        no_stop_trim=True,
+        spaces_between_special_tokens=False,
         stop_token_ids=[GLM_TOOL_CLOSE_TOKEN_ID],
     )
 
@@ -53,6 +63,10 @@ def test_direct_responses_payload_carries_exact_tokens_and_state():
     assert payload["max_output_tokens"] == 4
     assert payload["ignore_eos"] is True
     assert payload["min_tokens"] == 4
+    assert payload["seed"] == 123
+    assert payload["skip_special_tokens"] is False
+    assert payload["no_stop_trim"] is True
+    assert payload["spaces_between_special_tokens"] is False
     assert payload["top_k"] == 20
     assert payload["stop"] == ["</tool_call>"]
     assert payload["include"] == ["message.output_text.logprobs"]
@@ -126,6 +140,94 @@ def test_direct_responses_returns_exact_tokens_logprobs_and_server_call_id(monke
     assert result["extra"]["response_tool_calls"][0]["id"] == "call_server_1"
 
 
+def test_direct_responses_uses_streamed_prefix_with_longer_uploaded_metadata(monkeypatch):
+    class _Tokenizer:
+        @staticmethod
+        def decode(token_ids, skip_special_tokens=False):
+            return "".join(f"<{token_id}>" for token_id in token_ids)
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "id": "resp_next",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4},
+                "nvext": {
+                    "completion_token_ids": [11, 12],
+                    "completion_token_logprobs": [-9.0, -9.0],
+                    "stop_reason": " ",
+                },
+            }
+
+    monkeypatch.setattr(completions_direct_model.requests, "post", lambda *_args, **_kwargs: _Response())
+    monkeypatch.setattr(
+        completions_direct_model,
+        "_read_uploaded_metadata",
+        lambda *_args, **_kwargs: {
+            "output_token_logprobs": [[-0.1, 11], [-0.2, 12], [-0.3, 13]],
+            "finish_reason": {"type": "abort"},
+        },
+    )
+    model = _responses_model(_Tokenizer())
+    model.config.metadata_upload_url = "s3://rollout-metadata/test"
+
+    result = model.complete_prompt_ids(
+        [1, 2],
+        response_input=[{"role": "user", "content": "hello"}],
+        max_tokens=4,
+    )
+
+    assert result["content"] == "<11><12>"
+    assert result["extra"]["generated_token_ids"] == [11, 12]
+    assert result["extra"]["token_logprobs"] == [-0.1, -0.2]
+    assert result["extra"]["generated_token_source"] == "completion_token_ids"
+    assert result["extra"]["finish_reason"] == "stop"
+    assert result["extra"]["stop_reason"] == " "
+
+
+def test_direct_responses_preserves_content_filter_reason(monkeypatch):
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "id": "resp_filtered",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"},
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                "nvext": {
+                    "completion_token_ids": [11],
+                    "completion_token_logprobs": [-0.1],
+                },
+            }
+
+    monkeypatch.setattr(completions_direct_model.requests, "post", lambda *_args, **_kwargs: _Response())
+    model = _responses_model()
+
+    result = model.complete_prompt_ids(
+        [1, 2],
+        response_input=[{"role": "user", "content": "hello"}],
+        max_tokens=4,
+    )
+
+    assert result["extra"]["finish_reason"] == "content_filter"
+    assert result["extra"]["stop_reason"] == "content_filter"
+
+
 def test_direct_responses_rejects_missing_token_logprobs(monkeypatch):
     class _Response:
         status_code = 200
@@ -152,3 +254,7 @@ def test_direct_responses_rejects_missing_token_logprobs(monkeypatch):
             response_input=[{"role": "user", "content": "hello"}],
             max_tokens=2,
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

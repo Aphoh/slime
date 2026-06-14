@@ -874,6 +874,7 @@ spec:
             --host 0.0.0.0 \
             --trust-remote-code \
             --enable-rl \
+            --enable-return-routed-experts \
             --enable-metrics \
             "${KV_EVENTS_ARGS[@]}" \
             "${engine_args[@]}" \

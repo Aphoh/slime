@@ -18,6 +18,11 @@ from typing import Any
 
 import yaml
 
+from slime.rollout.dynamo_client import (
+    apply_uploaded_metadata_sequence_to_sample,
+    apply_uploaded_metadata_to_sample,
+)
+
 from completions_direct_model import (
     GLM_TOOL_STOPS,
     GLM_TOOL_STOP_TOKEN_IDS,
@@ -379,10 +384,7 @@ def _assistant_content_for_history(content: str, tool_calls: list[dict[str, Any]
 
 def _local_patch_trace_fields(submission: str) -> dict[str, Any]:
     patch_bytes = submission.encode("utf-8", errors="backslashreplace")
-    files = [
-        match.group(2)
-        for match in re.finditer(r"^diff --git a/(.*?) b/(.*?)$", submission, flags=re.MULTILINE)
-    ]
+    files = [match.group(2) for match in re.finditer(r"^diff --git a/(.*?) b/(.*?)$", submission, flags=re.MULTILINE)]
     return {
         "patch_chars": len(submission),
         "patch_sha256": hashlib.sha256(patch_bytes).hexdigest()[:16] if submission else "",
@@ -406,13 +408,7 @@ def _tool_observation_delta_ids(model: DirectCompletionsModel, observation: str)
 
 def _padding_token_id(model: DirectCompletionsModel) -> int:
     tokenizer = model.tokenizer
-    return int(
-        tokenizer.eos_token_id
-        if tokenizer.eos_token_id is not None
-        else tokenizer.pad_token_id
-        if tokenizer.pad_token_id is not None
-        else 0
-    )
+    return int(tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
 
 
 def _resize_prompt_token_ids(prompt_token_ids: list[int], target_length: int, pad_token_id: int) -> None:
@@ -630,11 +626,7 @@ def _mark_untrainable_sample(
 
     fallback_token = 0
     if model is not None:
-        fallback_token = (
-            model.tokenizer.eos_token_id
-            if model.tokenizer.eos_token_id is not None
-            else model.tokenizer.pad_token_id or 0
-        )
+        fallback_token = model.tokenizer.eos_token_id if model.tokenizer.eos_token_id is not None else model.tokenizer.pad_token_id or 0
 
     prompt_token_ids = _trim_prompt_for_untrainable(prompt_token_ids, max_context_len)
     metadata["session_error"] = repr(error)
@@ -648,6 +640,16 @@ def _mark_untrainable_sample(
     sample.remove_sample = True
     sample.metadata = metadata
     return sample
+
+
+def _sample_status_for_finish_reason(finish_reason: str) -> Sample.Status:
+    if finish_reason == "length":
+        return Sample.Status.TRUNCATED
+    if finish_reason in {"content_filter", "failed"}:
+        return Sample.Status.FAILED
+    if finish_reason in {"abort", "cancelled"}:
+        return Sample.Status.ABORTED
+    return Sample.Status.COMPLETED
 
 
 def _finalize_sweagent_session_sample(
@@ -703,7 +705,7 @@ def _finalize_sweagent_session_sample(
     sample.loss_mask = loss_mask
     sample.rollout_log_probs = rollout_log_probs
     sample.metadata = metadata
-    sample.status = status or (Sample.Status.TRUNCATED if finish_reason == "length" else Sample.Status.COMPLETED)
+    sample.status = status or _sample_status_for_finish_reason(finish_reason)
     return sample
 
 
@@ -725,11 +727,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
     model = _get_model(args)
     trace_replay_store = _get_trace_replay_store()
     trace_replay_plan = trace_replay_store.claim(str(instance_id)) if trace_replay_store else None
-    client = (
-        TraceReplaySessionClient(trace_replay_plan, sleep_scale=_mock_sleep_scale())
-        if trace_replay_plan is not None
-        else SweAgentSessionClient.from_env(args)
-    )
+    client = TraceReplaySessionClient(trace_replay_plan, sleep_scale=_mock_sleep_scale()) if trace_replay_plan is not None else SweAgentSessionClient.from_env(args)
     if trace_replay_plan is not None:
         metadata["trace_replay"] = True
         metadata["trace_replay_trajectory_id"] = trace_replay_plan.trajectory_id
@@ -816,9 +814,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 prompt_token_ids=prompt_token_ids,
                 model=model,
                 metadata=metadata,
-                error=RuntimeError(
-                    f"initial SWE-agent prompt length {len(prompt_token_ids)} exceeds rollout_max_context_len={max_context}"
-                ),
+                error=RuntimeError(f"initial SWE-agent prompt length {len(prompt_token_ids)} exceeds rollout_max_context_len={max_context}"),
                 max_context_len=max_context,
             )
 
@@ -877,11 +873,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 min_tokens=request_min_tokens,
                 ignore_eos=request_ignore_eos,
                 stop_count=len(request_stop) if isinstance(request_stop, list) else (1 if request_stop else 0),
-                stop_token_id_count=(
-                    len(request_stop_token_ids)
-                    if isinstance(request_stop_token_ids, list)
-                    else (1 if request_stop_token_ids else 0)
-                ),
+                stop_token_id_count=(len(request_stop_token_ids) if isinstance(request_stop_token_ids, list) else (1 if request_stop_token_ids else 0)),
                 stop_token_ids=request_stop_token_ids,
                 response_tokens_so_far=len(response_token_ids),
                 remaining_context=remaining_context,
@@ -908,12 +900,18 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                     stop_token_ids=request_stop_token_ids,
                     ignore_eos=request_ignore_eos,
                     min_tokens=request_min_tokens,
+                    seed=sampling_params.get("sampling_seed"),
+                    skip_special_tokens=sampling_params.get("skip_special_tokens"),
+                    no_stop_trim=sampling_params.get("no_stop_trim"),
+                    spaces_between_special_tokens=sampling_params.get("spaces_between_special_tokens"),
                 ),
                 timeout=_model_call_timeout_s(),
                 label=f"model completion for {instance_id} turn {turn}",
             )
             content = result["content"]
             extra = result["extra"]
+            if extra.get("uploaded_metadata") is not None:
+                metadata.setdefault("_dynamo_uploaded_metadata", []).append(extra["uploaded_metadata"])
             response_id = extra.get("response_id")
             if response_id:
                 previous_response_id = str(response_id)
@@ -929,11 +927,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 target_generated_len = max(0, replay_turn.generated_tokens)
                 if len(generated_ids) > target_generated_len:
                     if _trace_replay_force_fixed_decode():
-                        raise RuntimeError(
-                            "Trace replay fixed-decode request over-generated: "
-                            f"got {len(generated_ids)} tokens, expected {target_generated_len} "
-                            f"for {instance_id} turn {turn}"
-                        )
+                        raise RuntimeError(f"Trace replay fixed-decode request over-generated: got {len(generated_ids)} tokens, expected {target_generated_len} for {instance_id} turn {turn}")
                     generated_ids = generated_ids[:target_generated_len]
                     generated_logprobs = generated_logprobs[:target_generated_len]
                     generated_loss_mask = generated_loss_mask[:target_generated_len]
@@ -941,11 +935,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 elif len(generated_ids) < target_generated_len:
                     missing = target_generated_len - len(generated_ids)
                     if _trace_replay_force_fixed_decode():
-                        raise RuntimeError(
-                            "Trace replay fixed-decode request under-generated: "
-                            f"got {len(generated_ids)} tokens, expected {target_generated_len} "
-                            f"for {instance_id} turn {turn}"
-                        )
+                        raise RuntimeError(f"Trace replay fixed-decode request under-generated: got {len(generated_ids)} tokens, expected {target_generated_len} for {instance_id} turn {turn}")
                     generated_ids.extend([pad_token_id] * missing)
                     generated_logprobs.extend([0.0] * missing)
                     generated_loss_mask.extend([0] * missing)
@@ -1030,6 +1020,9 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 break
 
             if finish_reason == "length":
+                break
+            if finish_reason in {"content_filter", "failed", "abort", "cancelled"}:
+                metadata["dynamo_finish_reason"] = finish_reason
                 break
             if finish_reason == "stop" and not tool_calls:
                 _agent_trace_log(
@@ -1320,7 +1313,7 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
         instance_id=instance_id,
         session_id=session_id,
         finish_reason=finish_reason,
-        status=final_status or (Sample.Status.TRUNCATED if finish_reason == "length" else Sample.Status.COMPLETED),
+        status=final_status or _sample_status_for_finish_reason(finish_reason),
         response_tokens=len(response_token_ids),
         trainable_tokens=sum(loss_mask),
         **_submission_trace_fields(submission),
@@ -1361,6 +1354,8 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         for attempt in range(retries + 1):
             attempt_sample = sample if attempt == 0 else copy.deepcopy(original_sample)
             result = await _generate_sweagent_session(args, attempt_sample, sampling_params)
+            uploaded_metadata = result.metadata.pop("_dynamo_uploaded_metadata", None)
+            apply_uploaded_metadata_sequence_to_sample(result, args, uploaded_metadata)
             result.metadata["session_attempt"] = attempt + 1
             last_result = result
             retryable_error = _metadata(result).get("retryable_session_error")
@@ -1464,9 +1459,8 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     sample.loss_mask = response_loss_mask
     sample.rollout_log_probs = rollout_log_probs
     sample.metadata = metadata
-    sample.status = (
-        Sample.Status.TRUNCATED if context_truncated or extra.get("finish_reason") == "length" else Sample.Status.COMPLETED
-    )
+    sample.status = Sample.Status.TRUNCATED if context_truncated else _sample_status_for_finish_reason(extra.get("finish_reason") or "stop")
+    apply_uploaded_metadata_to_sample(sample, args, extra.get("uploaded_metadata"))
     return sample
 
 
