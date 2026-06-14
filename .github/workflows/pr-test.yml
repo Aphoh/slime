@@ -627,11 +627,19 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_dynamo_rollout_client.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_swepro_stateful_responses.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_swepro_experiment_interface.py"
             },
             {
               "num_gpus": 0,
-              "test_file": "test_agent_trajectory.py"
+              "test_file": "test_swepro_experiment_interface.py"
             },
             {
               "num_gpus": 0,
