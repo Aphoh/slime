@@ -2,6 +2,8 @@ import asyncio
 import contextlib
 import importlib.util
 import json
+
+import pytest
 import sys
 import types
 from pathlib import Path
@@ -160,3 +162,10 @@ def test_stop_global_worker_keeps_handle_when_thread_does_not_stop():
     assert rollout._global_worker is worker
 
     rollout._global_worker = None
+
+
+NUM_GPUS = 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

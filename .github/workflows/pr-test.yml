@@ -627,11 +627,47 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_fully_async_rollout_mock_trainer.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_microbatch_partitions.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_policy_loss_masking.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_speedscope_trace.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_swepro_completion_stop_tokens.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_swepro_dynamo_agent_trace.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_swepro_generation_limits.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_swepro_session_runner.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_swepro_trace_replay.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_swepro_stateful_responses.py"
             },
             {
               "num_gpus": 0,
-              "test_file": "test_swepro_experiment_interface.py"
+              "test_file": "test_swepro_run_experiment.py"
             },
             {
               "num_gpus": 0,

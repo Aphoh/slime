@@ -14,7 +14,7 @@ from sweagent_session import SweAgentSessionClient
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--nats-url", default=os.getenv("SWEPRO_NATS_URL", "nats://warnold-swepro-nats:4222"))
+    parser.add_argument("--nats-url", default=os.getenv("SWEPRO_NATS_URL", "nats://nats:4222"))
     parser.add_argument("--instance-id", required=True)
     parser.add_argument("--image-name", required=True)
     parser.add_argument("--base-commit", required=True)

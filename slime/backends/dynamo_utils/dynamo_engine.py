@@ -465,6 +465,7 @@ class DynamoEngine(RayActor):
         flush_cache=False,
         weight_version: str | None = None,
         load_format: str | None = None,
+        delta=None,
     ):
         body = {
             "names": names,
@@ -477,12 +478,32 @@ class DynamoEngine(RayActor):
             body["weight_version"] = weight_version
         if load_format is not None:
             body["load_format"] = load_format
+        if delta is not None:
+            import json
+            from dataclasses import asdict
+
+            body["delta"] = json.dumps(
+                {
+                    "encoding": delta.encoding.value,
+                    "params": [asdict(param) for param in delta.params],
+                }
+            )
         return self._call_engine_route("update_weights_from_distributed", body)
 
-    def update_weights_from_disk(self, model_path, load_format=None):
+    def update_weights_from_disk(
+        self,
+        model_path: str,
+        load_format: str | None = None,
+        weight_version: str | None = None,
+        files: list[str] | None = None,
+    ):
         body = {"model_path": model_path}
-        if load_format:
+        if load_format is not None:
             body["load_format"] = load_format
+        if weight_version is not None:
+            body["weight_version"] = weight_version
+        if files is not None:
+            body["files"] = files
         return self._call_engine_route("update_weights_from_disk", body)
 
     def init_weights_update_group(

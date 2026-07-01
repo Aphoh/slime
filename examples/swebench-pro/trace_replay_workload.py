@@ -9,7 +9,7 @@ import json
 import random
 from pathlib import Path
 from statistics import median
-from typing import Iterable
+from collections.abc import Iterable
 
 from trace_replay import TraceReplayPlan, TraceReplayStore
 
@@ -304,7 +304,6 @@ def _scatter_svg(metrics: list[dict[str, float | int | str]], *, width: int = 56
 
 def _write_html(path: Path, source_plans: list[TraceReplayPlan], selected_plans: list[TraceReplayPlan], summary: dict) -> None:
     selected_metrics = [_plan_metrics(plan) for plan in selected_plans]
-    source_metrics = [_plan_metrics(plan) for plan in source_plans]
     token_values = [float(item["sum_generated_tokens"]) for item in selected_metrics]
     duration_values = [float(item["total_duration_s"]) for item in selected_metrics]
     max_turn_values = [float(item["max_generated_tokens"]) for item in selected_metrics]

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from slime.utils.speedscope_trace import record_span, trace_span, write_perfetto_file, write_speedscope_file
 
 
@@ -159,3 +161,10 @@ def test_perfetto_export_surfaces_inference_token_counts(monkeypatch, tmp_path):
     assert span_events[0]["args"]["prompt_tokens"] == 123
     assert span_events[0]["args"]["completion_tokens"] == 45
     assert span_events[0]["args"]["max_tokens"] == 8192
+
+
+NUM_GPUS = 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -228,8 +228,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.loss_mask = []
 
     state = GenerateState(args)
-    use_dynamo = getattr(args, "rollout_backend", "sglang") == "dynamo"
-    base_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
@@ -241,7 +240,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     response_token_ids = []
     loss_masks = sample.loss_mask
     tool_call_count = 0  # Track actual tool call rounds
-    finish_reason = "length"
 
     if args.rollout_max_context_len is not None:
         max_context_length = args.rollout_max_context_len
@@ -271,87 +269,54 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         # Use token IDs instead of text
         current_token_ids = prompt_tokens_ids + response_token_ids
-
-        if use_dynamo:
-            model_name = getattr(args, "hf_checkpoint", None) or "default"
-            payload = {
-                "model": model_name,
-                "prompt": current_token_ids,
-                "max_tokens": per_turn_sampling_params["max_new_tokens"],
-                "temperature": sampling_params.get("temperature", 1.0),
-                "top_p": sampling_params.get("top_p", 1.0),
-                "logprobs": 0,
-                "return_tokens_as_token_ids": True,
-                "stream": False,
-            }
-            stop = sampling_params.get("stop")
-            if stop:
-                payload["stop"] = stop
-            output = await post(f"{base_url}/v1/completions", payload)
-        else:
-            payload = {
-                "input_ids": current_token_ids,
-                "sampling_params": per_turn_sampling_params,
-                "return_logprob": True,
-            }
-            output = await post(f"{base_url}/generate", payload)
+        payload = {
+            "input_ids": current_token_ids,
+            "sampling_params": per_turn_sampling_params,
+            "return_logprob": True,  # Request log probabilities for training
+        }
 
         # Log payload to wandb for debugging
         try:
             import wandb
 
             if wandb.run is not None:
+                # Count available tools (from tool_specs)
+                available_tools = len(tool_specs)
+                # Count tools used in the current response
+                tools_used = response.count("<interpreter>")
+
                 wandb.log(
                     {
                         "debug/payload_length": len(prompt + response),
-                        "debug/available_tools": len(tool_specs),
-                        "debug/tools_used": response.count("<interpreter>"),
+                        "debug/available_tools": available_tools,
+                        "debug/tools_used": tools_used,
                         "debug/turn": turn,
                     }
                 )
         except ImportError:
-            pass
+            pass  # wandb not available
 
-        # Parse response based on backend.
-        if use_dynamo:
-            choice = output["choices"][0]
-            cur_response = choice["text"]
-            # Extract token IDs directly from logprobs — no re-tokenization.
-            cur_response_token_ids = []
-            cur_log_probs = []
-            if choice.get("logprobs") and choice["logprobs"].get("token_logprobs"):
-                cur_log_probs = choice["logprobs"]["token_logprobs"]
-                for tok in choice["logprobs"].get("tokens", []):
-                    if isinstance(tok, str) and tok.startswith("token_id:"):
-                        cur_response_token_ids.append(int(tok[len("token_id:"):]))
-                    else:
-                        ids = state.tokenizer.encode(tok, add_special_tokens=False)
-                        cur_response_token_ids.append(ids[0] if ids else 0)
-            if not cur_response_token_ids and cur_response:
-                cur_response_token_ids = state.tokenizer.encode(cur_response, add_special_tokens=False)
-            # Align lengths
+        output = await post(url, payload)
 
-            if len(cur_log_probs) > len(cur_response_token_ids):
-                cur_log_probs = cur_log_probs[: len(cur_response_token_ids)]
-            elif len(cur_log_probs) < len(cur_response_token_ids):
-                cur_log_probs.extend([0.0] * (len(cur_response_token_ids) - len(cur_log_probs)))
-            finish_reason = choice.get("finish_reason") or "length"
+        # Handle abort
+        if output["meta_info"]["finish_reason"]["type"] == "abort":
+            sample.status = Sample.Status.ABORTED
+            return sample
+
+        if "output_token_logprobs" in output["meta_info"]:
+            cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+            cur_response = state.tokenizer.decode(cur_response_token_ids)
+            cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+
         else:
-            # Handle abort
-            if output["meta_info"]["finish_reason"]["type"] == "abort":
-                sample.status = Sample.Status.ABORTED
-                return sample
-
-            if "output_token_logprobs" in output["meta_info"]:
-                cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-                cur_response = state.tokenizer.decode(cur_response_token_ids)
-                cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-            else:
-                # SGLang returned text but no output_token_logprobs. Continuing
-                # would desync tokens and logprobs and poison the trainer.
-                sample.status = Sample.Status.ABORTED
-                return sample
-            finish_reason = output["meta_info"]["finish_reason"]["type"]
+            # sglang returned text but no output_token_logprobs — we cannot
+            # recover per-token logprobs for this turn, which would desync
+            # rollout_log_probs from response_token_ids and blow up
+            # `slice_log_prob_with_cp` downstream. Abort the sample so the
+            # fully_async rollout manager returns the whole group to the
+            # buffer for retry instead of poisoning the trainer.
+            sample.status = Sample.Status.ABORTED
+            return sample
 
         response += cur_response
         response_token_ids += cur_response_token_ids
@@ -360,11 +325,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             tokens=cur_response_token_ids,
             log_probs=cur_log_probs,
             trainable=True,
-            meta_info=None if use_dynamo else output["meta_info"],
+            meta_info=output["meta_info"],
         )
 
         # Check length limit
-        if finish_reason == "length":
+        if output["meta_info"]["finish_reason"]["type"] == "length":
             break
 
         next_obs, done = await execute_predictions(cur_response)
@@ -428,14 +393,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     # Set status
     if sample.status is Sample.Status.PENDING:
-        match finish_reason:
+        match output["meta_info"]["finish_reason"]["type"]:
             case "length":
                 sample.status = Sample.Status.TRUNCATED
             case "abort":
                 sample.status = Sample.Status.ABORTED
             case "stop":
                 sample.status = Sample.Status.COMPLETED
-
 
     return sample
 

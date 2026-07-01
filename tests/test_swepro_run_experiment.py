@@ -7,13 +7,13 @@ import pytest
 NUM_GPUS = 0
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-INTERFACE_PATH = REPO_ROOT / "examples" / "swebench-pro" / "experiment_interface.py"
+INTERFACE_PATH = REPO_ROOT / "examples" / "swebench-pro" / "run_experiment.py"
 CLUSTER_PATH = REPO_ROOT / "examples" / "swebench-pro" / "reproducible" / "cluster.yaml"
 EXPERIMENT_PATH = REPO_ROOT / "examples" / "swebench-pro" / "reproducible" / "experiment_config.yaml"
 
 
 def _load_interface_module():
-    spec = importlib.util.spec_from_file_location("swepro_experiment_interface", INTERFACE_PATH)
+    spec = importlib.util.spec_from_file_location("swepro_run_experiment", INTERFACE_PATH)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -40,15 +40,23 @@ def test_reproducible_run_mode_builds_stock_train_async_command():
     assert plan.train_command[plan.train_command.index("--pipeline-model-parallel-size") + 1] == "8"
     assert plan.train_command[plan.train_command.index("--context-parallel-size") + 1] == "1"
     assert plan.train_command[plan.train_command.index("--dynamo-frontend-url") + 1] == (
-        "http://warnold-swepro-frontend:3000"
+        "http://dynamo-frontend:3000"
     )
+    assert plan.train_command[plan.train_command.index("--dynamo-api-mode") + 1] == "responses"
+    assert plan.train_command[plan.train_command.index("--dynamo-metadata-upload-format") + 1] == "msgpack"
+    assert plan.train_command[plan.train_command.index("--dynamo-metadata-upload-url") + 1] == (
+        "s3://YOUR_S3_BUCKET/slynamo/rollout-metadata"
+    )
+    assert "--use-rollout-routing-replay" in plan.train_command
     assert plan.train_command[plan.train_command.index("--rollout-function-path") + 1] == (
         "slime.rollout.sglang_rollout.generate_rollout"
     )
     assert plan.train_command[plan.train_command.index("--advantage-estimator") + 1] == "grpo"
     assert "--debug-rollout-only" not in plan.train_command
     assert not any(token.startswith("SWEPRO_") for token in plan.train_command)
-    assert plan.runtime_env["env_vars"]["DYNAMO_FRONTEND_URL"] == "http://warnold-swepro-frontend:3000"
+    assert plan.runtime_env["env_vars"]["DYNAMO_FRONTEND_URL"] == "http://dynamo-frontend:3000"
+    assert plan.runtime_env["env_vars"]["SWEPRO_DYNAMO_API_MODE"] == "responses"
+    assert plan.runtime_env["env_vars"]["SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT"] == "msgpack"
     assert plan.runtime_env["env_vars"]["PYTHONPATH"] == "/root/Megatron-LM/:.:examples/swebench-pro"
     assert "SWEPRO_TRACE_REPLAY_PATH" not in plan.runtime_env["env_vars"]
     assert "--no-wait" not in plan.ray_command
@@ -66,9 +74,16 @@ def test_perf_mode_uses_trace_replay_and_mock_trainer_without_changing_entrypoin
     assert plan.train_command[plan.train_command.index("--mock-trainer-tokens-per-second") + 1] == "15000"
     assert plan.runtime_env["env_vars"]["SWEPRO_TRACE_REPLAY_FORCE_FIXED_DECODE"] == "1"
     assert plan.runtime_env["env_vars"]["SWEPRO_TRACE_REPLAY_PATH"].endswith(
-        "trace-replay-sample-qwen35-v1-8192gen-tool120-20260605.jsonl"
+        "YOUR_TRACE_REPLAY_JSONL"
     )
     assert plan.runtime_env["env_vars"]["SWEPRO_ASYNC_MAX_STARTED_GROUPS"] == "160"
+
+
+def test_execution_rejects_unresolved_customer_placeholders():
+    interface, plan = _load_example_plan()
+
+    with pytest.raises(interface.ConfigError, match="YOUR_HF_CHECKPOINT"):
+        interface.validate_plan_for_execution(plan)
 
 
 def test_schema_rejects_unknown_keys_and_duplicate_cluster_owned_flags():
@@ -107,6 +122,20 @@ def test_schema_rejects_invalid_versions_boolean_strings_and_topology():
 
     with pytest.raises(interface.ConfigError, match="cluster.dynamo.enabled must be a boolean"):
         interface.validate_cluster({"version": 1, "dynamo": {"enabled": "false"}})
+
+    with pytest.raises(interface.ConfigError, match="api_mode must be completions or responses"):
+        interface.validate_experiment({
+            "version": 1,
+            "argument_groups": {"train": []},
+            "swepro": {"api_mode": "chat"},
+        })
+
+    with pytest.raises(interface.ConfigError, match="metadata_upload_format must be msgpack"):
+        interface.validate_experiment({
+            "version": 1,
+            "argument_groups": {"train": []},
+            "swepro": {"metadata_upload_format": "json"},
+        })
 
     cluster = interface.LoadedConfig(
         path=CLUSTER_PATH,

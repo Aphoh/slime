@@ -1,39 +1,21 @@
-import logging
-import os
-
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
-from slime.utils.speedscope_trace import trace_span
-
-logger = logging.getLogger(__name__)
 
 
 def _run_rollout_only_loop(args, rollout_manager, num_rollout_per_epoch):
-    if args.start_rollout_id is None:
-        args.start_rollout_id = 0
-
-    logger.info(
-        "Running rollout-only async loop from rollout_id=%s to %s",
-        args.start_rollout_id,
-        args.num_rollout - 1,
-    )
-
-    with trace_span("driver", "rollout.submit", rollout_id=args.start_rollout_id):
-        rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
-
-    for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        if rollout_data_next_future is not None:
-            with trace_span("driver", "rollout.wait", rollout_id=rollout_id):
-                ray.get(rollout_data_next_future)
-
-        if rollout_id + 1 < args.num_rollout:
-            with trace_span("driver", "rollout.submit", rollout_id=rollout_id + 1):
-                rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
-
+    start_rollout_id = args.start_rollout_id or 0
+    next_rollout = rollout_manager.generate.remote(start_rollout_id)
+    for rollout_id in range(start_rollout_id, args.num_rollout):
+        ray.get(next_rollout)
+        next_rollout = (
+            rollout_manager.generate.remote(rollout_id + 1)
+            if rollout_id + 1 < args.num_rollout
+            else None
+        )
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
@@ -60,43 +42,31 @@ def train(args):
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
     # Always push actor weights to rollout once weights are loaded.
-    with trace_span("driver", "weights.initial_update"):
-        actor_model.update_weights()
+    actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
     # async train loop.
-    allow_stale_rollouts = os.getenv("SLIME_ASYNC_ALLOW_STALE_ROLLOUTS", "0") == "1"
-    if allow_stale_rollouts:
-        logger.info("SLIME_ASYNC_ALLOW_STALE_ROLLOUTS=1: weight updates will not wait for prefetched rollout data.")
-
-    with trace_span("driver", "rollout.submit", rollout_id=args.start_rollout_id):
-        rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
+    rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # Sync the last generation
         if rollout_data_next_future is not None:
-            with trace_span("driver", "rollout.wait", rollout_id=rollout_id):
-                rollout_data_curr_ref = ray.get(rollout_data_next_future)
+            rollout_data_curr_ref = ray.get(rollout_data_next_future)
 
         # Start the next rollout early.
         if rollout_id + 1 < args.num_rollout:
-            with trace_span("driver", "rollout.submit", rollout_id=rollout_id + 1):
-                rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+            rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
         if args.use_critic:
             actor_trains_this_step = rollout_id >= args.num_critic_only_steps
-            with trace_span("driver", "trainer.critic.submit", rollout_id=rollout_id):
-                value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
+            value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
             if actor_trains_this_step:
-                with trace_span("driver", "trainer.actor.wait", rollout_id=rollout_id):
-                    ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
+                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
             else:
-                with trace_span("driver", "trainer.critic.wait", rollout_id=rollout_id):
-                    ray.get(value_refs)
+                ray.get(value_refs)
         else:
-            with trace_span("driver", "trainer.actor.wait", rollout_id=rollout_id):
-                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+            ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
@@ -113,18 +83,10 @@ def train(args):
                 ray.get(rollout_manager.save.remote(rollout_id))
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
-            if allow_stale_rollouts:
-                logger.info(
-                    "Updating weights without draining prefetched rollout future at rollout_id=%s. "
-                    "In-flight rollouts may train with stale-policy samples.",
-                    rollout_id,
-                )
-            else:
-                # sync generate before update weights to prevent update weight in the middle of generation
-                rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
-                rollout_data_next_future = None
-            with trace_span("driver", "weights.update", rollout_id=rollout_id):
-                actor_model.update_weights()
+            # sync generate before update weights to prevent update weight in the middle of generation
+            rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
+            rollout_data_next_future = None
+            actor_model.update_weights()
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))

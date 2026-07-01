@@ -1,8 +1,7 @@
 version: 1
-name: swepro-dynamo-gcp02
+name: swepro-dynamo
 
-# Resolve relative to this file. Inside the mounted pod checkout this still
-# points at /code/slime if the command is run from this repository checkout.
+# Resolve relative to this file so the runner finds the repository root.
 repo_root: ../../..
 
 ray:
@@ -20,8 +19,8 @@ resources:
 
 dynamo:
   enabled: true
-  frontend_url: http://warnold-swepro-frontend:3000
-  nats_url: nats://warnold-swepro-nats:4222
+  frontend_url: http://dynamo-frontend:3000
+  nats_url: nats://nats:4222
   worker_system_port: 30001
   frontend_wait_timeout: 600
   tool_events_zmq_port: 20390
@@ -40,5 +39,5 @@ runtime_env:
     PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
 
 artifacts:
-  root_dir: ../../../.context/swepro-runs
+  root_dir: ../../../.artifacts/swepro-runs
   durable_logs: true

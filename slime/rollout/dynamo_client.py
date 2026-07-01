@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import torch
 
 
 DYNAMO_API_MODES = {"completions", "responses"}
@@ -245,7 +246,7 @@ def apply_uploaded_metadata_to_sample(
             num_experts=getattr(args, "num_experts", None),
         )
         if routed_experts is not None:
-            sample.rollout_routed_experts = routed_experts
+            sample.rollout_routed_experts = torch.tensor(routed_experts, dtype=torch.int32)
 
     weight_version = metadata.get("weight_version")
     if weight_version is not None and (not sample.weight_versions or sample.weight_versions[-1] != str(weight_version)):

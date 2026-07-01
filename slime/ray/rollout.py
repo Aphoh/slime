@@ -18,13 +18,6 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 from slime.backends.sglang_utils.external import start_external_rollout_servers
 from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
-
-def _get_engine_cls(args):
-    """Return the engine class based on --rollout-backend."""
-    if getattr(args, "rollout_backend", "sglang") == "dynamo":
-        from slime.backends.dynamo_utils.dynamo_engine import DynamoEngine
-        return DynamoEngine
-    return SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.dp_schedule import build_dp_schedule
@@ -173,7 +166,13 @@ class ServerGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
-        RolloutRayActor = ray.remote(_get_engine_cls(self.args))
+        if getattr(self.args, "rollout_backend", "sglang") == "dynamo":
+            from slime.backends.dynamo_utils.dynamo_engine import DynamoEngine
+
+            engine_cls = DynamoEngine
+        else:
+            engine_cls = SGLangEngine
+        RolloutRayActor = ray.remote(engine_cls)
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -610,29 +609,14 @@ class RolloutManager:
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
 
-        gen_t0 = time.time()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
-        gen_elapsed = time.time() - gen_t0
-
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
-        rollout_time = time.time() - start_time
-        _log_rollout_data(rollout_id, self.args, data, metrics, rollout_time)
+        _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
             return
-
-        convert_t0 = time.time()
         data = self._convert_samples_to_train_data(data)
-        result = self._split_train_data_by_dp(data)
-        convert_elapsed = time.time() - convert_t0
-
-        logger.info(
-            f"[ROLLOUT BREAKDOWN] step={rollout_id} | "
-            f"generation={gen_elapsed:.2f}s | "
-            f"convert+split={convert_elapsed:.2f}s | "
-            f"total={time.time() - start_time:.2f}s"
-        )
-        return result
+        return self._split_train_data_by_dp(data)
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -1173,16 +1157,26 @@ def _start_rollout_servers_external(args) -> tuple[dict[str, RolloutServer], lis
     """
     from urllib.parse import urlparse
 
-    from slime.backends.dynamo_utils.external_discovery import topology_fingerprint, wait_for_workers
+    from slime.backends.dynamo_utils.external_discovery import validate_external_workers, wait_for_workers
 
     if args.offload_rollout:
         raise ValueError(
             "--offload-rollout is incompatible with --dynamo-frontend-url "
             "(the DGD owns memory lifecycle)."
         )
+    if getattr(args, "use_fault_tolerance", False):
+        raise ValueError(
+            "--use-fault-tolerance is not yet supported with externally managed Dynamo workers"
+        )
 
     gpus_per_engine = args.rollout_num_gpus_per_engine
-    expected_count = args.rollout_num_gpus // gpus_per_engine
+    rollout_num_gpus = args.rollout_num_gpus
+    if not rollout_num_gpus or gpus_per_engine <= 0 or rollout_num_gpus % gpus_per_engine:
+        raise ValueError(
+            "External Dynamo attachment requires a positive --rollout-num-gpus that is divisible by "
+            "--rollout-num-gpus-per-engine"
+        )
+    expected_count = rollout_num_gpus // gpus_per_engine
 
     workers = wait_for_workers(
         frontend_url=args.dynamo_frontend_url,
@@ -1191,9 +1185,11 @@ def _start_rollout_servers_external(args) -> tuple[dict[str, RolloutServer], lis
         timeout=args.dynamo_frontend_wait_timeout,
     )
 
+    model_name = validate_external_workers(workers)
+
     parsed = urlparse(args.dynamo_frontend_url)
     router_ip = parsed.hostname
-    router_port = parsed.port
+    router_port = parsed.port or (443 if parsed.scheme == "https" else 80)
     args.sglang_router_ip = router_ip
     args.sglang_router_port = router_port
 
@@ -1229,7 +1225,7 @@ def _start_rollout_servers_external(args) -> tuple[dict[str, RolloutServer], lis
         gpu_offset += per_engine_gpus * len(group_workers)
         server_groups.append(group)
 
-    model_name = workers[0].served_model_name or "default"
+    args.dynamo_served_model_name = model_name
     servers = {
         model_name: RolloutServer(
             server_groups=server_groups,
@@ -1240,8 +1236,6 @@ def _start_rollout_servers_external(args) -> tuple[dict[str, RolloutServer], lis
         )
     }
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
-
-    args._dynamo_topology_fingerprint = topology_fingerprint(workers)
 
     return servers, pending_init_handles
 

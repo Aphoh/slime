@@ -4,6 +4,8 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "swebench-pro"
 sys.path.insert(0, str(EXAMPLE_DIR))
@@ -64,6 +66,61 @@ for module_name, stub in (
 ):
     if sys.modules.get(module_name) is stub:
         sys.modules.pop(module_name)
+
+
+def test_swepro_model_uses_cli_dynamo_configuration(monkeypatch):
+    for name in (
+        "SWEPRO_DYNAMO_FRONTEND_URL",
+        "DYNAMO_FRONTEND_URL",
+        "SWEPRO_DYNAMO_API_MODE",
+        "SWEPRO_MODEL",
+        "SWEPRO_DYNAMO_METADATA_UPLOAD_URL",
+        "SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setattr(generate_with_swebench_pro, "_MODEL", None)
+    monkeypatch.setattr(
+        generate_with_swebench_pro,
+        "DirectCompletionsModel",
+        lambda config: config,
+    )
+    args = SimpleNamespace(
+        dynamo_frontend_url="https://dynamo.example/proxy",
+        dynamo_api_mode="responses",
+        dynamo_served_model_name="served-model",
+        dynamo_metadata_upload_url="s3://rollouts/metadata",
+        dynamo_metadata_upload_format="msgpack",
+        hf_checkpoint="checkpoint-name",
+        rollout_max_response_len=4096,
+        rollout_temperature=0.7,
+        rollout_top_p=0.9,
+        rollout_top_k=20,
+    )
+
+    config = generate_with_swebench_pro._get_model(args)
+
+    assert config.base_url == "https://dynamo.example/proxy"
+    assert config.api_mode == "responses"
+    assert config.model == "served-model"
+    assert config.metadata_upload_url == "s3://rollouts/metadata"
+
+
+def test_missing_sweagent_config_reports_required_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(generate_with_swebench_pro, "_SWEAGENT_TEMPLATES", None)
+    monkeypatch.setenv("SWE_AGENT_CONFIG_ROOT", str(tmp_path / "missing"))
+
+    with pytest.raises(FileNotFoundError, match="SWE_AGENT_CONFIG_ROOT"):
+        generate_with_swebench_pro._load_sweagent_templates()
+
+
+def test_missing_image_name_requires_explicit_registry_owner(monkeypatch, tmp_path):
+    (tmp_path / "helper_code").mkdir()
+    monkeypatch.setenv("SWEPRO_EVAL_ROOT", str(tmp_path))
+    monkeypatch.delenv("SWEPRO_DOCKERHUB_USERNAME", raising=False)
+
+    with pytest.raises(ValueError, match="SWEPRO_DOCKERHUB_USERNAME"):
+        generate_with_swebench_pro._metadata_image_name({"instance_id": "case-1", "repo": "org/repo"})
 
 
 def test_turn_max_tokens_defaults_to_8192(monkeypatch):
@@ -229,7 +286,14 @@ def test_sweagent_session_stops_and_fails_on_content_filter(monkeypatch):
 
     assert _Model.calls == 1
     assert client.step_calls == 0
-    assert result.status == _SampleStub.Status.FAILED
+    assert result.status == generate_with_swebench_pro.Sample.Status.FAILED
     assert result.metadata["dynamo_finish_reason"] == "content_filter"
     assert result.response_length == 1
     assert result.rollout_log_probs == [-0.1]
+
+
+NUM_GPUS = 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

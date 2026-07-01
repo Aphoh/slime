@@ -319,8 +319,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--dynamo-metadata-upload-format",
                 type=str,
                 default="msgpack",
-                choices=["json", "msgpack"],
-                help="Serialization format for Dynamo rollout metadata uploads.",
+                choices=["msgpack"],
+                help="Dynamo metadata uploads use msgpack with zstd compression.",
             )
             parser.add_argument(
                 "--dynamo-request-retries",
@@ -1924,6 +1924,30 @@ def _resolve_update_weight_disk_dir(args) -> None:
         args.update_weight_delta_dir = disk_dir
 
 
+def _validate_dynamo_args(args) -> None:
+    rollout_backend = getattr(args, "rollout_backend", "sglang")
+    frontend_url = getattr(args, "dynamo_frontend_url", None)
+    if frontend_url and rollout_backend != "dynamo":
+        raise ValueError("--dynamo-frontend-url requires --rollout-backend=dynamo")
+    if rollout_backend != "dynamo":
+        return
+
+    metadata_format = getattr(args, "dynamo_metadata_upload_format", "msgpack")
+    if metadata_format != "msgpack":
+        raise ValueError("Dynamo metadata uploads currently support only msgpack")
+
+    if getattr(args, "use_rollout_routing_replay", False):
+        metadata_url = (
+            getattr(args, "dynamo_metadata_upload_url", None)
+            or os.getenv("DYNAMO_METADATA_UPLOAD_URL")
+            or os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_URL")
+        )
+        if not metadata_url:
+            raise ValueError(
+                "--use-rollout-routing-replay with Dynamo requires --dynamo-metadata-upload-url"
+            )
+
+
 def _validate_update_weight_args(args) -> None:
     _resolve_update_weight_disk_dir(args)
 
@@ -2211,4 +2235,5 @@ def slime_validate_args(args):
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
 
+    _validate_dynamo_args(args)
     _validate_update_weight_args(args)

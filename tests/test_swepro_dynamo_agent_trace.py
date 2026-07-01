@@ -24,15 +24,15 @@ def test_derive_tool_events_zmq_endpoint_from_dynamo_url(monkeypatch):
     monkeypatch.delenv("SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT", raising=False)
     monkeypatch.delenv("SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_PORT", raising=False)
 
-    assert derive_tool_events_zmq_endpoint("http://warnold-swepro-frontend:3000") == (
-        "tcp://warnold-swepro-frontend:20390"
+    assert derive_tool_events_zmq_endpoint("http://dynamo-frontend:3000") == (
+        "tcp://dynamo-frontend:20390"
     )
 
 
 def test_derive_tool_events_zmq_endpoint_honors_override(monkeypatch):
     monkeypatch.setenv("SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT", "tcp://trace-relay:20400")
 
-    assert derive_tool_events_zmq_endpoint("http://warnold-swepro-frontend:3000") == "tcp://trace-relay:20400"
+    assert derive_tool_events_zmq_endpoint("http://dynamo-frontend:3000") == "tcp://trace-relay:20400"
 
 
 def test_build_agent_context_and_tool_record_match_dynamo_schema(monkeypatch):
@@ -162,3 +162,10 @@ def test_tool_event_publisher_sends_zmq_msgpack_frames():
     finally:
         publisher.close()
         pull.close(0)
+
+
+NUM_GPUS = 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

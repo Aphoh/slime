@@ -38,3 +38,10 @@ def test_policy_loss_zero_advantage_does_not_form_zero_times_inf():
     assert torch.isfinite(pg_loss).all()
     assert torch.isfinite(clipfrac).all()
     assert pg_loss.tolist() == [0.0, 0.0, 0.0]
+
+
+NUM_GPUS = 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

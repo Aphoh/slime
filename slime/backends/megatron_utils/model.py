@@ -30,8 +30,6 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
-from slime.utils.profile_utils import profile_iterable
-from slime.utils.speedscope_trace import trace_span
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
@@ -41,11 +39,6 @@ from .model_provider import get_model_provider_func
 from .stateless_adam import StatelessAdam
 
 logger = logging.getLogger(__name__)
-
-
-def _maybe_defer_fp32_logits(args: Namespace, forward_kwargs: dict) -> None:
-    if getattr(args, "defer_fp32_logits", False):
-        forward_kwargs["fp32_output"] = False
 
 
 def _disable_tqdm_for_non_main_rank() -> bool:
@@ -184,12 +177,6 @@ def _reinitialize_critic_output_layer(args: Namespace, model: Sequence[DDP]) -> 
         output_layer.weight.data.normal_(mean=0.0, std=init_method_std)
         if output_layer.bias is not None:
             output_layer.bias.data.zero_()
-
-
-def _trainer_trace_profile(role: str = "actor") -> str:
-    if torch.distributed.is_initialized():
-        return f"trainer/{role}/rank{torch.distributed.get_rank()}"
-    return f"trainer/{role}/pid{os.getpid()}"
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -400,12 +387,9 @@ def forward_only(
         "multimodal_train_inputs",
         "total_lengths",
         "response_lengths",
-        "max_seq_lens",
     ]
     if use_rollout_top_p_replay:
         batch_keys = _with_rollout_top_p_token_keys(args, batch_keys)
-    microbatch_counter = 0
-
 
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
@@ -423,39 +407,32 @@ def forward_only(
         """
 
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
-        nonlocal microbatch_counter
-        microbatch_id = microbatch_counter
-        microbatch_counter += 1
 
-        with trace_span(
-            _trainer_trace_profile("logprob"),
-            "trainer.microbatch.logprob",
-            microbatch_id=microbatch_id,
-            store_prefix=store_prefix,
-        ):
-            batch = get_batch(
-                data_iterator,
-                batch_keys,
-                args.data_pad_size_multiplier,
-                args.allgather_cp,
-            )
-            unconcat_tokens = batch["unconcat_tokens"]
-            tokens = batch["tokens"]
-            packed_seq_params = batch["packed_seq_params"]
-            total_lengths = batch["total_lengths"]
-            response_lengths = batch["response_lengths"]
-            forward_kwargs = {
-                "input_ids": tokens,
-                "position_ids": None,
-                "attention_mask": None,
-                "labels": None,
-                "packed_seq_params": packed_seq_params,
-                "loss_mask": batch["full_loss_masks"],
-            }
-            if batch["multimodal_train_inputs"] is not None:
-                forward_kwargs.update(batch["multimodal_train_inputs"])
-            _maybe_defer_fp32_logits(args, forward_kwargs)
-            output_tensor = model(**forward_kwargs)
+        # Get the batch.
+        batch = get_batch(
+            data_iterator,
+            batch_keys,
+            args.data_pad_size_multiplier,
+            args.allgather_cp,
+        )
+        unconcat_tokens = batch["unconcat_tokens"]
+        tokens = batch["tokens"]
+        packed_seq_params = batch["packed_seq_params"]
+        total_lengths = batch["total_lengths"]
+        response_lengths = batch["response_lengths"]
+        forward_kwargs = {
+            "input_ids": tokens,
+            "position_ids": None,
+            "attention_mask": None,
+            "labels": None,
+            "packed_seq_params": packed_seq_params,
+            "loss_mask": batch["full_loss_masks"],
+        }
+        if batch["multimodal_train_inputs"] is not None:
+            forward_kwargs.update(batch["multimodal_train_inputs"])
+        if args.defer_fp32_logits:
+            forward_kwargs["fp32_output"] = False
+        output_tensor = model(**forward_kwargs)
 
         output_kwargs = {
             "args": args,
@@ -493,7 +470,7 @@ def forward_only(
         disable=_disable_tqdm_for_non_main_rank(),
     )
     forward_step_with_progress = _wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar)
-    for step_id in profile_iterable(range(num_steps_per_rollout), args, "train_log_probs"):
+    for step_id in range(num_steps_per_rollout):
         forward_data_store += forward_backward_func(
             forward_step_func=forward_step_with_progress,
             data_iterator=data_iterator,
@@ -582,8 +559,6 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
-    microbatch_counter = 0
-
     def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
         torch.Tensor,
         Callable[[torch.Tensor], tuple[torch.Tensor, int, dict[str, torch.Tensor | list[str]]]],
@@ -600,102 +575,85 @@ def train_one_step(
             (loss, num_elems, {"keys": list[str], "values": torch.Tensor}).
         """
 
-        nonlocal microbatch_counter
-        microbatch_id = microbatch_counter
-        microbatch_counter += 1
-        batch_keys = _with_rollout_top_p_token_keys(
-            args,
-            [
-                "tokens",
-                "multimodal_train_inputs",
-                "packed_seq_params",
-                "total_lengths",
-                "response_lengths",
-                "loss_masks",
-                "log_probs",
-                "ref_log_probs",
-                "values",
-                "advantages",
-                "returns",
-                "rollout_log_probs",
-                "max_seq_lens",
-                "teacher_log_probs",
-                "rollout_mask_sums",
-            ],
+        # Get the batch.
+        batch = get_batch(
+            data_iterator,
+            _with_rollout_top_p_token_keys(
+                args,
+                [
+                    "tokens",
+                    "multimodal_train_inputs",
+                    "packed_seq_params",
+                    "total_lengths",
+                    "response_lengths",
+                    "loss_masks",
+                    "log_probs",
+                    "ref_log_probs",
+                    "values",
+                    "advantages",
+                    "returns",
+                    "rollout_log_probs",
+                    "teacher_log_probs",
+                    "rollout_mask_sums",
+                ],
+            ),
+            args.data_pad_size_multiplier,
+            args.allgather_cp,
         )
 
-        with trace_span(
-            _trainer_trace_profile(getattr(model, "role", "actor")),
-            "trainer.microbatch.forward_backward",
-            rollout_id=rollout_id,
-            step_id=step_id,
-            microbatch_id=microbatch_id,
-        ):
-            batch = get_batch(
-                data_iterator,
-                batch_keys,
-                args.data_pad_size_multiplier,
-                args.allgather_cp,
+        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+            old_stage = os.environ["ROUTING_REPLAY_STAGE"]
+            os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+
+        if return_schedule_plan:
+            assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
+            position_ids = None
+            output_tensor = model.build_schedule_plan(
+                input_ids=batch["tokens"],
+                position_ids=position_ids,
+                attention_mask=None,
+                labels=None,
+                packed_seq_params=batch["packed_seq_params"],
+                loss_mask=batch["full_loss_masks"],
             )
+        else:
+            forward_kwargs = {
+                "input_ids": batch["tokens"],
+                "position_ids": None,
+                "attention_mask": None,
+                "labels": None,
+                "packed_seq_params": batch["packed_seq_params"],
+                "loss_mask": batch["full_loss_masks"],
+            }
 
-            if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
-                old_stage = os.environ["ROUTING_REPLAY_STAGE"]
-                os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+            if batch["multimodal_train_inputs"] is not None:
+                forward_kwargs.update(batch["multimodal_train_inputs"])
 
-            if return_schedule_plan:
-                assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
-                position_ids = None
-                output_tensor = model.build_schedule_plan(
-                    input_ids=batch["tokens"],
-                    position_ids=position_ids,
-                    attention_mask=None,
-                    labels=None,
-                    packed_seq_params=batch["packed_seq_params"],
-                    loss_mask=batch["full_loss_masks"],
-                )
-            else:
-                forward_kwargs = {
-                    "input_ids": batch["tokens"],
-                    "position_ids": None,
-                    "attention_mask": None,
-                    "labels": None,
-                    "packed_seq_params": batch["packed_seq_params"],
-                    "loss_mask": batch["full_loss_masks"],
-                }
+            if args.enable_mtp_training:
+                forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
-                if batch["multimodal_train_inputs"] is not None:
-                    forward_kwargs.update(batch["multimodal_train_inputs"])
+            if args.defer_fp32_logits:
+                forward_kwargs["fp32_output"] = False
 
-                if args.enable_mtp_training:
-                    forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
+            output_tensor = model(**forward_kwargs)
 
-                _maybe_defer_fp32_logits(args, forward_kwargs)
-                output_tensor = model(**forward_kwargs)
-
-            if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
-                os.environ["ROUTING_REPLAY_STAGE"] = old_stage
+        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+            os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
         return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
-    with trace_span(
-        _trainer_trace_profile(getattr(model[0], "role", "actor")),
-        "trainer.step.forward_backward",
-        rollout_id=rollout_id,
-        step_id=step_id,
+    losses_reduced = forward_backward_func(
+        forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
+        data_iterator=data_iterator,
+        model=model,
         num_microbatches=num_microbatches,
-    ):
-        losses_reduced = forward_backward_func(
-            forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_microbatches,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-        )
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        decoder_seq_length=args.decoder_seq_length,
+        forward_only=False,
+    )
 
     valid_step = True
     grad_norm = float("nan")
@@ -719,13 +677,7 @@ def train_one_step(
 
     if valid_step:
         # Update parameters.
-        with trace_span(
-            _trainer_trace_profile(getattr(model[0], "role", "actor")),
-            "trainer.step.optimizer",
-            rollout_id=rollout_id,
-            step_id=step_id,
-        ):
-            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
         # Update learning rate. Use the per-step global_batch_size when dynamic
         # batching is on so the scheduler's samples-seen counter tracks reality.
@@ -871,7 +823,7 @@ def train(
     )
 
     # Run training iterations till done.
-    for step_id in profile_iterable(range(num_steps_per_rollout), args, "train_actor"):
+    for step_id in range(num_steps_per_rollout):
 
         # Run training step.
         loss_dict, grad_norm = train_one_step(

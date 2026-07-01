@@ -88,13 +88,15 @@ def _eval_result_summary(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def evaluate_request(request: dict[str, Any], *, eval_root: Path, work_root: Path, output_root: Path, timeout: int) -> dict[str, Any]:
+    dockerhub_username = os.getenv("SWEPRO_DOCKERHUB_USERNAME")
+    if not dockerhub_username:
+        raise RuntimeError("SWEPRO_DOCKERHUB_USERNAME is required by the evaluation worker")
     eval_mod, get_dockerhub_image_uri = _ensure_eval_import(eval_root)
 
     request_id = request.get("request_id") or f"req-{int(time.time())}"
     instance_id = request["instance_id"]
     sample = _normalize_sample(request.get("sample") or {}, request)
     patch = request.get("patch") or ""
-    dockerhub_username = os.getenv("SWEPRO_DOCKERHUB_USERNAME", "jefzda")
     scripts_dir = Path(os.getenv("SWEPRO_RUN_SCRIPTS_DIR", str(eval_root / "run_scripts")))
 
     workspace_dir = work_root / request_id / "workspace"
@@ -125,7 +127,7 @@ def evaluate_request(request: dict[str, Any], *, eval_root: Path, work_root: Pat
             entrypoint="/bin/bash",
             command=["-c", "bash /workspace/entryscript.sh"],
             volumes={str(workspace_dir.resolve()): {"bind": "/workspace", "mode": "rw"}},
-            labels={"owner": "warnold", "app": "swepro-eval", "request_id": request_id},
+            labels={"owner": "slynamo", "app": "swepro-eval", "request_id": request_id},
         )
         result = container.wait(timeout=timeout)
         status_code = result.get("StatusCode", 1) if isinstance(result, dict) else 1
@@ -188,7 +190,7 @@ def evaluate_request(request: dict[str, Any], *, eval_root: Path, work_root: Pat
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--nats-url", default=os.getenv("SWEPRO_NATS_URL", "nats://warnold-swepro-nats:4222"))
+    parser.add_argument("--nats-url", default=os.getenv("SWEPRO_NATS_URL", "nats://nats:4222"))
     parser.add_argument("--subject", default=os.getenv("SWEPRO_NATS_SUBJECT", "swepro.evals"))
     parser.add_argument("--queue", default=os.getenv("SWEPRO_EVAL_QUEUE_GROUP", "swepro-eval-workers"))
     parser.add_argument("--eval-root", type=Path, default=Path(os.getenv("SWEPRO_EVAL_ROOT", "/opt/SWE-bench_Pro-os")))

@@ -9,7 +9,8 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 _LOCK = threading.Lock()
 _HOST = socket.gethostname()

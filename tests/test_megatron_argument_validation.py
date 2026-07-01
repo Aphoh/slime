@@ -248,6 +248,7 @@ def make_slime_validate_args(**overrides):
         save=None,
         kl_loss_coef=0,
         advantage_estimator="grpo",
+        critic_train_only=False,
         normalize_advantages=False,
         use_rollout_logprobs=False,
         use_tis=False,
@@ -350,6 +351,32 @@ def test_slime_validate_args_preserves_zero_rollout_gpus_without_colocate(monkey
     assert args.offload_train is False
     assert args.offload_rollout is False
 
+
+def test_dynamo_frontend_requires_dynamo_backend(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        rollout_backend="sglang",
+        dynamo_frontend_url="https://dynamo.example",
+    )
+
+    with pytest.raises(ValueError, match="requires --rollout-backend=dynamo"):
+        module._validate_dynamo_args(args)
+
+
+def test_dynamo_routing_replay_requires_metadata_upload(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    monkeypatch.delenv("DYNAMO_METADATA_UPLOAD_URL", raising=False)
+    monkeypatch.delenv("SWEPRO_DYNAMO_METADATA_UPLOAD_URL", raising=False)
+    args = types.SimpleNamespace(
+        rollout_backend="dynamo",
+        dynamo_frontend_url=None,
+        dynamo_metadata_upload_format="msgpack",
+        dynamo_metadata_upload_url=None,
+        use_rollout_routing_replay=True,
+    )
+
+    with pytest.raises(ValueError, match="requires --dynamo-metadata-upload-url"):
+        module._validate_dynamo_args(args)
 
 @pytest.mark.unit
 def test_update_weight_delta_rejects_colocate(monkeypatch):

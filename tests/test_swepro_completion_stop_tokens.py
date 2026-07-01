@@ -122,8 +122,8 @@ def test_direct_completions_injects_retry_specific_metadata_upload_urls(monkeypa
 
     first = posted_payloads[0]["nvext"]["metadata_upload"]
     second = posted_payloads[1]["nvext"]["metadata_upload"]
-    assert first["format"] == "msgpack"
-    assert second["format"] == "msgpack"
+    assert set(first) == {"url"}
+    assert set(second) == {"url"}
     assert first["url"].startswith("s3://rollout-metadata/run-1/session-sample-turn-0-try-0-")
     assert second["url"].startswith("s3://rollout-metadata/run-1/session-sample-turn-0-try-1-")
     assert first["url"] != second["url"]
@@ -544,3 +544,10 @@ def test_direct_completions_debug_logs_request_and_response(monkeypatch, caplog)
     assert debug_records[1]["backend_generated_tokens"] == 2
     assert debug_records[1]["generated_tokens"] == 2
     assert result["extra"]["generated_token_ids"] == [11, 12]
+
+
+NUM_GPUS = 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

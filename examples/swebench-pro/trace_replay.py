@@ -12,7 +12,6 @@ import gzip
 import json
 import re
 import threading
-import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -474,7 +473,7 @@ class TraceReplayStore:
         self._lock = threading.Lock()
 
     @classmethod
-    def from_path(cls, path: str | Path, *, sleep_scale: float = 1.0) -> "TraceReplayStore":
+    def from_path(cls, path: str | Path, *, sleep_scale: float = 1.0) -> TraceReplayStore:
         groups: dict[tuple[str, str], list[tuple[int, float | None, dict[str, Any]]]] = defaultdict(list)
         path = Path(path)
         opener = gzip.open if path.suffix == ".gz" else open

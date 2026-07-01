@@ -8,6 +8,9 @@ entrypoint: train_async.py
 model_args_script: scripts/models/qwen3.5-122B-A10B.sh
 
 swepro:
+  api_mode: responses
+  metadata_upload_url: s3://YOUR_S3_BUCKET/slynamo/rollout-metadata
+  metadata_upload_format: msgpack
   agent_mode: sweagent_session
   max_tool_calls: 0
   episode_wall_timeout: 0
@@ -28,6 +31,7 @@ argument_groups:
     - 131072
     - --qkv-format
     - thd
+    - --use-rollout-routing-replay
     - --distributed-backend
     - cpu:gloo,cuda:nccl
     - --tensor-model-parallel-size
@@ -41,14 +45,12 @@ argument_groups:
     - 2
     - --expert-tensor-parallel-size
     - 1
-    - --moe-token-dispatcher-type
-    - alltoall
 
   checkpoints:
     - --hf-checkpoint
-    - /shared/Qwen3.5-122B-A10B
+    - /shared/YOUR_HF_CHECKPOINT
     - --ref-load
-    - /shared/Qwen3.5-122B-A10B_torch_dist
+    - /shared/YOUR_TORCH_DIST_CHECKPOINT
 
   swepro_real_rollout:
     - --rollout-function-path
@@ -58,7 +60,7 @@ argument_groups:
     - --custom-rm-path
     - generate_with_swebench_pro.reward_func
     - --prompt-data
-    - /data/swebench-pro/swebench_pro_train_cached_images.jsonl
+    - /data/YOUR_SWEBENCH_PRO_TRAIN_JSONL
     - --input-key
     - prompt
     - --label-key
@@ -91,7 +93,7 @@ argument_groups:
     - --custom-rm-path
     - generate_with_swebench_pro.reward_func
     - --prompt-data
-    - /data/swebench-pro/swebench_pro_train_cached_images.jsonl
+    - /data/YOUR_SWEBENCH_PRO_TRAIN_JSONL
     - --input-key
     - prompt
     - --label-key
@@ -190,7 +192,7 @@ modes:
       - perf
       - stability
     swepro:
-      trace_replay_path: /data/swebench-pro/traces/trace-replay-sample-qwen35-v1-8192gen-tool120-20260605.jsonl
+      trace_replay_path: /data/YOUR_TRACE_REPLAY_JSONL
       trace_replay_force_fixed_decode: true
       mock_env_scale: 1.0
       mock_env_reward: 0.0

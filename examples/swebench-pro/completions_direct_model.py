@@ -257,6 +257,10 @@ class DirectCompletionsConfig:
     metadata_upload_url: str | None = None
     metadata_upload_format: str = "msgpack"
 
+    def __post_init__(self) -> None:
+        if self.metadata_upload_format != "msgpack":
+            raise ValueError("Dynamo metadata uploads currently support only msgpack")
+
     @classmethod
     def from_env(cls) -> DirectCompletionsConfig:
         base_url = _env("SWEPRO_DYNAMO_FRONTEND_URL", _env("DYNAMO_FRONTEND_URL", _env("OPENAI_BASE_URL")))
@@ -416,10 +420,7 @@ class DirectCompletionsModel:
                         self.config.metadata_upload_url,
                         request_id,
                     )
-                    payload["nvext"]["metadata_upload"] = {
-                        "url": metadata_upload_url,
-                        "format": self.config.metadata_upload_format,
-                    }
+                    payload["nvext"]["metadata_upload"] = {"url": metadata_upload_url}
                 headers = {"x-request-id": request_id} if request_id else None
                 _completion_debug_log(
                     "completion_request",

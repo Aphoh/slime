@@ -229,7 +229,11 @@ def _metadata(sample: Sample) -> dict[str, Any]:
 
 
 def _dynamo_frontend_url(args) -> str | None:
-    base_url = os.getenv("SWEPRO_DYNAMO_FRONTEND_URL") or os.getenv("DYNAMO_FRONTEND_URL")
+    base_url = (
+        os.getenv("SWEPRO_DYNAMO_FRONTEND_URL")
+        or os.getenv("DYNAMO_FRONTEND_URL")
+        or getattr(args, "dynamo_frontend_url", None)
+    )
     if base_url:
         return base_url.rstrip("/")
     router_ip = getattr(args, "sglang_router_ip", None)
@@ -264,16 +268,30 @@ def _get_model(args) -> DirectCompletionsModel:
         config = DirectCompletionsConfig(
             base_url=base_url.rstrip("/"),
             tokenizer_path=args.hf_checkpoint,
-            api_mode=os.getenv("SWEPRO_DYNAMO_API_MODE", "completions").strip().lower(),
-            model=os.getenv("SWEPRO_MODEL", getattr(args, "hf_checkpoint", None) or "default"),
+            api_mode=(
+                os.getenv("SWEPRO_DYNAMO_API_MODE")
+                or getattr(args, "dynamo_api_mode", "completions")
+            ).strip().lower(),
+            model=(
+                os.getenv("SWEPRO_MODEL")
+                or getattr(args, "dynamo_served_model_name", None)
+                or getattr(args, "hf_checkpoint", None)
+                or "default"
+            ),
             max_tokens=_turn_max_tokens(args),
             temperature=float(getattr(args, "rollout_temperature", 1.0)),
             top_p=float(getattr(args, "rollout_top_p", 1.0)),
             top_k=getattr(args, "rollout_top_k", None),
             timeout=float(os.getenv("SWEPRO_REQUEST_TIMEOUT", "1800")),
             retries=int(os.getenv("SWEPRO_REQUEST_RETRIES", "5")),
-            metadata_upload_url=os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_URL"),
-            metadata_upload_format=os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT", "msgpack"),
+            metadata_upload_url=(
+                os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_URL")
+                or getattr(args, "dynamo_metadata_upload_url", None)
+            ),
+            metadata_upload_format=(
+                os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT")
+                or getattr(args, "dynamo_metadata_upload_format", "msgpack")
+            ),
         )
         _MODEL = DirectCompletionsModel(config)
     return _MODEL
@@ -481,10 +499,12 @@ def _load_sweagent_templates() -> dict[str, str]:
     global _SWEAGENT_TEMPLATES
     if _SWEAGENT_TEMPLATES is None:
         root = Path(os.getenv("SWE_AGENT_CONFIG_ROOT", "/code/SWE-bench_Pro-os/SWE-agent"))
-        local_root = Path("~/proj/SWE-bench_Pro-os/SWE-agent").expanduser()
-        if not (root / "config/tool_use.yaml").exists() and (local_root / "config/tool_use.yaml").exists():
-            root = local_root
-        data = yaml.safe_load((root / "config/tool_use.yaml").read_text())
+        config_path = root / "config/tool_use.yaml"
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"SWE-agent tool config not found at {config_path}; set SWE_AGENT_CONFIG_ROOT"
+            )
+        data = yaml.safe_load(config_path.read_text())
         _SWEAGENT_TEMPLATES = dict(data["agent"]["templates"])
     return _SWEAGENT_TEMPLATES
 
@@ -534,6 +554,13 @@ def _metadata_image_name(metadata: dict[str, Any]) -> str:
     source_root = Path(metadata.get("source_root") or os.getenv("SWEPRO_EVAL_ROOT", "/code/SWE-bench_Pro-os"))
     helper_dir = source_root / "helper_code"
     if helper_dir.exists():
+        dockerhub_username = os.getenv("SWEPRO_DOCKERHUB_USERNAME")
+        if not dockerhub_username:
+            raise ValueError(
+                "SWE-bench Pro sample is missing image_name; set SWEPRO_DOCKERHUB_USERNAME "
+                "to derive the benchmark image URI"
+            )
+
         import sys
 
         sys.path.insert(0, str(helper_dir))
@@ -541,7 +568,7 @@ def _metadata_image_name(metadata: dict[str, Any]) -> str:
 
         return get_dockerhub_image_uri(
             metadata.get("instance_id"),
-            os.getenv("SWEPRO_DOCKERHUB_USERNAME", "jefzda"),
+            dockerhub_username,
             metadata.get("repo") or "",
         )
     raise ValueError("SWE-bench Pro sample is missing image_name and image_uri helper is unavailable")
@@ -1495,7 +1522,7 @@ async def _reward_one(args, sample: Sample) -> float:
     except Exception as exc:
         raise ImportError("nats-py is required for SWE-bench Pro reward evaluation") from exc
 
-    nats_url = os.getenv("SWEPRO_NATS_URL", getattr(args, "swepro_nats_url", "nats://warnold-swepro-nats:4222"))
+    nats_url = os.getenv("SWEPRO_NATS_URL", getattr(args, "swepro_nats_url", "nats://nats:4222"))
     timeout = float(os.getenv("SWEPRO_EVAL_TIMEOUT", getattr(args, "swepro_eval_timeout", 3600)))
     request = {
         "request_id": str(uuid.uuid4()),

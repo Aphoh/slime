@@ -11,10 +11,6 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_INPUT = Path("~/proj/SWE-bench_Pro-os/helper_code/sweap_eval_full_v2.jsonl").expanduser()
-DEFAULT_OUTPUT = Path("/data/swebench-pro/swebench_pro_train.jsonl")
-
-
 def _load_jsonish(value: Any) -> Any:
     if value is None:
         return None
@@ -71,23 +67,25 @@ def _sweagent_problem_statement(row: dict[str, Any], source_root: Path | None) -
     return _prompt_from_row(row)
 
 
-def _sweagent_image_name(row: dict[str, Any], source_root: Path | None, dockerhub_username: str) -> str | None:
+def _sweagent_image_name(row: dict[str, Any], source_root: Path | None, dockerhub_username: str | None) -> str | None:
+    image_name = row.get("image_name")
+    if image_name:
+        return str(image_name)
     if source_root is None or not row.get("repo"):
-        return row.get("image_name")
+        return None
     helper_dir = source_root / "helper_code"
-    if helper_dir.exists():
-        sys.path.insert(0, str(helper_dir))
-        try:
-            from image_uri import get_dockerhub_image_uri  # type: ignore
+    if not helper_dir.exists():
+        raise FileNotFoundError(f"SWE-bench Pro helper directory not found: {helper_dir}")
+    if not dockerhub_username:
+        raise ValueError("dockerhub_username is required when a row does not provide image_name")
+    sys.path.insert(0, str(helper_dir))
+    from image_uri import get_dockerhub_image_uri  # type: ignore
 
-            return get_dockerhub_image_uri(row["instance_id"], dockerhub_username, row["repo"])
-        except Exception:
-            return row.get("image_name")
-    return row.get("image_name")
+    return get_dockerhub_image_uri(row["instance_id"], dockerhub_username, row["repo"])
 
 
 def normalize_row(
-    row: dict[str, Any], *, source_root: Path | None = None, dockerhub_username: str = "jefzda"
+    row: dict[str, Any], *, source_root: Path | None = None, dockerhub_username: str | None = None
 ) -> dict[str, Any]:
     instance_id = row["instance_id"]
     fail_to_pass = _as_list(row.get("fail_to_pass", row.get("FAIL_TO_PASS")))
@@ -148,7 +146,7 @@ def convert(
     *,
     limit: int | None = None,
     source_root: Path | None = None,
-    dockerhub_username: str = "jefzda",
+    dockerhub_username: str | None = None,
 ) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
@@ -172,10 +170,10 @@ def convert(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--source-root", type=Path, default=Path("~/proj/SWE-bench_Pro-os").expanduser())
-    parser.add_argument("--dockerhub-username", default="jefzda")
+    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--dockerhub-username", required=True)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 

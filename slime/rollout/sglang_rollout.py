@@ -307,7 +307,11 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
     """Generate through Dynamo while retaining exact incremental token state."""
     state = GenerateState(args)
     api_mode = getattr(args, "dynamo_api_mode", "completions")
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/{api_mode}"
+    frontend_url = getattr(args, "dynamo_frontend_url", None)
+    if frontend_url:
+        url = f"{frontend_url.rstrip('/')}/v1/{api_mode}"
+    else:
+        url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/{api_mode}"
 
     assert sample.status in (Sample.Status.PENDING, Sample.Status.ABORTED), f"Sample status is {sample.status}"
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
@@ -351,7 +355,11 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
             metadata_upload_url = build_metadata_upload_url(metadata_root, request_id) if metadata_root else None
             payload = build_dynamo_payload(
                 api_mode=api_mode,
-                model=getattr(args, "hf_checkpoint", None) or "default",
+                model=(
+                    getattr(args, "dynamo_served_model_name", None)
+                    or getattr(args, "hf_checkpoint", None)
+                    or "default"
+                ),
                 prompt_token_ids=token_ids,
                 response_input=sample.prompt if api_mode == "responses" else None,
                 previous_response_id=sample.metadata.get("dynamo_previous_response_id"),

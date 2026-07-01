@@ -302,7 +302,7 @@ index 1dde86d7d..270ab22c2 100644
 +                )
 +                gate = gate[:, :, idx * size : (idx + 1) * size, :]
              return query, key, value, gate
- 
+
          return query, key, value
 diff --git a/megatron/core/fusions/fused_mla_yarn_rope_apply.py b/megatron/core/fusions/fused_mla_yarn_rope_apply.py
 index 1fd5dcfae..75e1072d5 100644

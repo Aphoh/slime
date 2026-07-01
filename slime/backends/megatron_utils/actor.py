@@ -21,7 +21,6 @@ from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.routing_replay import RoutingReplay
-from slime.utils.speedscope_trace import trace_span
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
 
@@ -42,12 +41,6 @@ from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
-
-
-def _trainer_trace_profile(role: str = "actor") -> str:
-    if dist.is_initialized():
-        return f"trainer/{role}/rank{dist.get_rank()}"
-    return f"trainer/{role}/pid{os.getpid()}"
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -181,7 +174,6 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
 
         self.rollout_engines = None
-        self._cached_rollout_update_state = None
 
         self.rollout_data_postprocess = None
         if self.args.rollout_data_postprocess_path is not None:
@@ -372,22 +364,16 @@ class MegatronTrainRayActor(TrainRayActor):
         store_prefix: str = "",
     ) -> dict[str, list[torch.Tensor]]:
 
-        with trace_span(
-            _trainer_trace_profile("actor"),
-            f"trainer.batch.{store_prefix}log_probs",
-            store_prefix=store_prefix,
-        ):
-            with timer(f"{store_prefix}log_probs"):
-                return forward_only(
-                    get_log_probs_and_entropy,
-                    self.args,
-                    self.model,
-                    data_iterator,
-                    num_microbatches,
-                    store_prefix=store_prefix,
-                    use_rollout_top_p_replay=True,
-                )
-
+        with timer(f"{store_prefix}log_probs"):
+            return forward_only(
+                get_log_probs_and_entropy,
+                self.args,
+                self.model,
+                data_iterator,
+                num_microbatches,
+                store_prefix=store_prefix,
+                use_rollout_top_p_replay=True,
+            )
 
     def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
         if self.args.debug_rollout_only:
@@ -396,9 +382,8 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             self.wake_up()
 
-        with trace_span(_trainer_trace_profile(self.role), "trainer.data_preprocess", rollout_id=rollout_id):
-            with timer("data_preprocess"):
-                rollout_data = self._get_rollout_data(rollout_data_ref)
+        with timer("data_preprocess"):
+            rollout_data = self._get_rollout_data(rollout_data_ref)
 
         if self.role == "critic":
             result = self.train_critic(rollout_id, rollout_data)
@@ -414,8 +399,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch):
         """Train critic and return CPU values (used as old-values for the next actor train)."""
-        with trace_span(_trainer_trace_profile("critic"), "trainer.batch.build_iterator", rollout_id=rollout_id):
-            data_iterator = get_data_iterator(rollout_data)
+        data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
 
@@ -520,8 +504,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
-                with trace_span(_trainer_trace_profile("actor"), "trainer.batch.advantages", rollout_id=rollout_id):
-                    compute_advantages_and_returns(self.args, rollout_data)
+                compute_advantages_and_returns(self.args, rollout_data)
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
@@ -535,17 +518,16 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
-            with trace_span(_trainer_trace_profile("actor"), "trainer.batch.train", rollout_id=rollout_id):
-                with timer("actor_train"):
-                    train(
-                        rollout_id,
-                        self.model,
-                        self.optimizer,
-                        self.opt_param_scheduler,
-                        data_iterator,
-                        num_microbatches,
-                        global_batch_sizes,
-                    )
+            with timer("actor_train"):
+                train(
+                    rollout_id,
+                    self.model,
+                    self.optimizer,
+                    self.opt_param_scheduler,
+                    data_iterator,
+                    num_microbatches,
+                    global_batch_sizes,
+                )
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -597,38 +579,17 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @timer
     def update_weights(self) -> None:
-        import time as _time
-
-        if os.getenv("SLIME_SKIP_WEIGHT_UPDATES", "0") == "1":
-            if dist.get_rank() == 0:
-                logger.info("SLIME_SKIP_WEIGHT_UPDATES=1: skipping rollout weight update.")
-            return
-
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
-        _t0 = _time.time()
-        allow_stale_rollouts = os.getenv("SLIME_ASYNC_ALLOW_STALE_ROLLOUTS", "0") == "1"
-        can_use_cached_rollout_state = (
-            allow_stale_rollouts
-            and not self.args.use_fault_tolerance
-            and self._cached_rollout_update_state is not None
-        )
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.recover_updatable_engines.remote())
             dist.barrier(group=get_gloo_group())
 
-        if can_use_cached_rollout_state:
-            rollout_engines, rollout_engine_lock, engine_gpu_counts, engine_gpu_offsets = self._cached_rollout_update_state
-            num_new_engines = 0
-            _get_engines_elapsed = 0.0
-        else:
-            _get_engines_t0 = _time.time()
-            rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
-                self.rollout_manager.get_updatable_engines_and_lock.remote()
-            )
-            _get_engines_elapsed = _time.time() - _get_engines_t0
+        rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
+            self.rollout_manager.get_updatable_engines_and_lock.remote()
+        )
 
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
 
@@ -642,31 +603,20 @@ class MegatronTrainRayActor(TrainRayActor):
         elif self.args.offload_train:
             reload_process_groups()
 
-        _connect_elapsed = 0.0
         if num_new_engines > 0 or reconnect_rollout_engines:
-            _connect_t0 = _time.time()
             self.weight_updater.connect_rollout_engines(
                 rollout_engines,
                 rollout_engine_lock,
                 engine_gpu_counts=engine_gpu_counts,
                 engine_gpu_offsets=engine_gpu_offsets,
             )
-            self._cached_rollout_update_state = (
-                rollout_engines,
-                rollout_engine_lock,
-                engine_gpu_counts,
-                engine_gpu_offsets,
-            )
             dist.barrier(group=get_gloo_group())
-            _connect_elapsed = _time.time() - _connect_t0
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
-            _sync_t0 = _time.time()
             self.weight_updater.update_weights()
-            _sync_elapsed = _time.time() - _sync_t0
             print_memory("after update_weights")
 
             if self.args.ci_test and len(rollout_engines) > 0 and self.weight_updater.weight_version > 0:
@@ -687,17 +637,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
-
-        _total_elapsed = _time.time() - _t0
-        if dist.get_rank() == 0:
-            logger.info(
-                f"[WEIGHT UPDATE OUTER] get_engines={_get_engines_elapsed:.3f}s | "
-                f"connect={_connect_elapsed:.3f}s | "
-                f"sync={_sync_elapsed:.3f}s | "
-                f"total={_total_elapsed:.3f}s | "
-                f"num_engines={len(rollout_engines)} | "
-                f"num_new={num_new_engines}"
-            )
 
         if reconnect_rollout_engines:
             self.sleep()

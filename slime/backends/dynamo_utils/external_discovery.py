@@ -6,9 +6,9 @@ from each instance's ``transport.tcp`` field, and calls
 each worker's system-status port (DYN_SYSTEM_PORT) to read topology
 (tp_size, pp_size, disaggregation_mode, node_rank, ...).
 
-Multi-node TP workers expose one system-port endpoint per node, but only
-node_rank=0 carries the tokenizer_manager and is addressable for
-weight-update calls. We filter the rest.
+Discovery records multi-node and pipeline topology so unsupported layouts fail
+with an explicit error. External attachment currently accepts single-node TP
+workers with pipeline and data parallel sizes of one.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from __future__ import annotations
 import dataclasses
 import logging
 import time
-from typing import Iterable
 
 import requests
 
@@ -38,10 +37,6 @@ class DiscoveredWorker:
     served_model_name: str | None
 
     @property
-    def http_url(self) -> str:
-        return f"http://{self.host}:{self.system_port}"
-
-    @property
     def worker_type(self) -> str:
         """Map disaggregation_mode to slime's ServerGroup worker_type."""
         if self.disaggregation_mode in ("prefill", "decode"):
@@ -53,6 +48,40 @@ def _parse_tcp_host(transport_tcp: str) -> str:
     """Extract host from ``host:port/token/endpoint`` form."""
     host_port = transport_tcp.split("/", 1)[0]
     return host_port.rsplit(":", 1)[0]
+
+
+def validate_external_workers(workers: list[DiscoveredWorker]) -> str:
+    if not workers:
+        raise ValueError("External Dynamo attachment requires at least one worker")
+
+    unsupported = [
+        worker
+        for worker in workers
+        if worker.pp_size != 1 or worker.dp_size != 1 or worker.nnodes != 1
+    ]
+    if unsupported:
+        topologies = [
+            {
+                "instance_id": worker.instance_id,
+                "tp_size": worker.tp_size,
+                "pp_size": worker.pp_size,
+                "dp_size": worker.dp_size,
+                "nnodes": worker.nnodes,
+            }
+            for worker in unsupported
+        ]
+        raise ValueError(
+            "External Dynamo attachment currently supports single-node TP workers with "
+            f"pp_size=1 and dp_size=1; got {topologies}"
+        )
+
+    served_model_names = {worker.served_model_name for worker in workers if worker.served_model_name}
+    if len(served_model_names) > 1:
+        raise ValueError(
+            "External Dynamo workers must advertise one served model name; "
+            f"got {sorted(served_model_names)}"
+        )
+    return next(iter(served_model_names), "default")
 
 
 def _fetch_health(frontend_url: str, timeout: float = 5.0) -> dict | None:
@@ -183,18 +212,3 @@ def wait_for_workers(
         f"External Dynamo frontend at {frontend_url} did not report {expected_count} "
         f"node_rank=0 workers within {timeout}s"
     )
-
-
-def topology_fingerprint(workers: Iterable[DiscoveredWorker]) -> str:
-    """Deterministic hash of the topology-relevant subset of worker state.
-
-    Used by the weight-update path to detect churn: if this hash changes
-    between updates, tear down the NCCL group and reform.
-    """
-    import hashlib
-
-    key = sorted(
-        (w.instance_id, w.host, w.system_port, w.tp_size, w.pp_size, w.dp_size, w.ep_size, w.worker_type)
-        for w in workers
-    )
-    return hashlib.sha256(repr(key).encode()).hexdigest()

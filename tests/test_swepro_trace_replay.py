@@ -38,8 +38,10 @@ class _SampleStub:
 def _import_generate_hook(monkeypatch):
     for name in [
         "generate_with_swebench_pro",
+        "sweagent_session",
         "slime",
         "slime.rollout",
+        "slime.rollout.dynamo_client",
         "slime.rollout.sglang_rollout",
         "slime.utils",
         "slime.utils.mask_utils",
@@ -51,6 +53,12 @@ def _import_generate_hook(monkeypatch):
     slime_mod.__path__ = []
     rollout_mod = types.ModuleType("slime.rollout")
     rollout_mod.__path__ = []
+    dynamo_client_mod = types.ModuleType("slime.rollout.dynamo_client")
+    dynamo_client_mod.apply_uploaded_metadata_sequence_to_sample = lambda *_args, **_kwargs: None
+    dynamo_client_mod.apply_uploaded_metadata_to_sample = lambda *_args, **_kwargs: None
+    dynamo_client_mod.build_dynamo_payload = lambda **_kwargs: {}
+    dynamo_client_mod.build_metadata_upload_url = lambda root, _request_id: root
+    dynamo_client_mod.read_uploaded_metadata = lambda *_args, **_kwargs: {}
     sglang_rollout_mod = types.ModuleType("slime.rollout.sglang_rollout")
     sglang_rollout_mod.GenerateState = object
     utils_mod = types.ModuleType("slime.utils")
@@ -59,9 +67,13 @@ def _import_generate_hook(monkeypatch):
     mask_utils_mod.MultiTurnLossMaskGenerator = object
     types_mod = types.ModuleType("slime.utils.types")
     types_mod.Sample = _SampleStub
+    sweagent_session_mod = types.ModuleType("sweagent_session")
+    sweagent_session_mod.SweAgentSessionClient = object
 
+    monkeypatch.setitem(sys.modules, "sweagent_session", sweagent_session_mod)
     monkeypatch.setitem(sys.modules, "slime", slime_mod)
     monkeypatch.setitem(sys.modules, "slime.rollout", rollout_mod)
+    monkeypatch.setitem(sys.modules, "slime.rollout.dynamo_client", dynamo_client_mod)
     monkeypatch.setitem(sys.modules, "slime.rollout.sglang_rollout", sglang_rollout_mod)
     monkeypatch.setitem(sys.modules, "slime.utils", utils_mod)
     monkeypatch.setitem(sys.modules, "slime.utils.mask_utils", mask_utils_mod)
@@ -437,3 +449,10 @@ def test_trace_replay_reward_bypasses_nats(monkeypatch):
         "mock_trace_replay": True,
         "reason": "trace replay reward bypass",
     }
+
+
+NUM_GPUS = 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

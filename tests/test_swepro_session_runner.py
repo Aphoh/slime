@@ -6,6 +6,8 @@ import threading
 import types
 from pathlib import Path
 
+import pytest
+
 
 def _load_session_runner():
     nats_module = types.ModuleType("nats")
@@ -228,7 +230,7 @@ def test_step_emits_dynamo_tool_start_and_end(capsys):
     assert publisher.records[0]["tool"]["status"] == "running"
     assert publisher.records[1]["tool"]["status"] == "succeeded"
     assert publisher.records[1]["tool"]["tool_call_id"] == "call-1"
-    assert publisher.records[1]["tool"]["output_bytes"] == len("hello\n".encode("utf-8"))
+    assert publisher.records[1]["tool"]["output_bytes"] == len(b"hello\n")
     trace_events = _session_trace_events(capsys.readouterr().out)
     assert [event["event"] for event in trace_events] == [
         "tool_step_request",
@@ -309,3 +311,10 @@ async def _health_completes_while_step_is_blocked(*, shared_semaphore: bool) -> 
 def test_session_health_uses_control_semaphore_when_step_workers_are_saturated():
     assert not asyncio.run(_health_completes_while_step_is_blocked(shared_semaphore=True))
     assert asyncio.run(_health_completes_while_step_is_blocked(shared_semaphore=False))
+
+
+NUM_GPUS = 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

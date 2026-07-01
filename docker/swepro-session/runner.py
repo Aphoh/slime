@@ -58,7 +58,7 @@ def _trace_context_value(agent_context: dict[str, Any] | None, key: str) -> str 
     return str(value) if value is not None else None
 
 
-def _session_trace_base(session: "Session", worker_id: str) -> dict[str, Any]:
+def _session_trace_base(session: Session, worker_id: str) -> dict[str, Any]:
     return {
         "worker_id": worker_id,
         "session_id": session.session_id,
@@ -500,7 +500,7 @@ class SessionManager:
 
         docker_args = [
             "--label",
-            "owner=warnold",
+            "owner=slynamo",
             "--label",
             "app=swepro-session",
             "--label",
@@ -539,7 +539,7 @@ class SessionManager:
                     "TERM": "dumb",
                 }
             )
-        except Exception:
+        except Exception as exc:
             if env is not None:
                 try:
                     env.close()
@@ -1051,7 +1051,7 @@ def complete_background_task(background_tasks: set[asyncio.Task], task: asyncio.
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--nats-url", default=os.getenv("SWEPRO_NATS_URL", "nats://warnold-swepro-nats:4222"))
+    parser.add_argument("--nats-url", default=os.getenv("SWEPRO_NATS_URL", "nats://nats:4222"))
     parser.add_argument("--eval-root", type=Path, default=Path(os.getenv("SWEPRO_EVAL_ROOT", "/code/SWE-bench_Pro-os")))
     parser.add_argument("--max-sessions", type=int, default=int(os.getenv("SWEPRO_MAX_SESSIONS", "2")))
     parser.add_argument("--concurrency", type=int, default=int(os.getenv("SWEPRO_SESSION_CONCURRENCY", "2")))

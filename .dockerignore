@@ -1,9 +1,7 @@
 .git
 .worktrees
 .context/*
-!.context/tachometer-ci/
-.context/tachometer-ci/*
-!.context/tachometer-ci/scraper-aarch64-unknown-linux-gnu
+.artifacts/
 __pycache__
 *.py[cod]
 .pytest_cache

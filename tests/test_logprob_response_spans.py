@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from megatron.core import mpu
-from slime.backends.megatron_utils.loss import _build_topp_keep_mask
+from slime.backends.megatron_utils.loss import _build_topp_keep_mask, _get_local_response_loss_mask
 
 
 NUM_GPUS = 0
@@ -85,6 +85,26 @@ def test_top_p_mask_aligns_with_cp1_response_rows(monkeypatch):
 
     masked_rows = {row: _kept_ids(keep[row]) for row in range(keep.size(0)) if not keep[row].all()}
     assert masked_rows == {2: [13], 3: [14], 5: [21], 6: [22], 7: [23]}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("rank", "expected"),
+    [
+        (0, [40]),
+        (1, [10, 20, 30]),
+    ],
+)
+def test_policy_loss_mask_aligns_with_zigzag_cp_response_rows(monkeypatch, rank, expected):
+    _set_cp(monkeypatch, size=2, rank=rank)
+
+    result = _get_local_response_loss_mask(
+        total_lengths=[8],
+        response_lengths=[4],
+        loss_masks=[torch.tensor([10, 20, 30, 40])],
+    )
+
+    assert result.tolist() == expected
 
 
 if __name__ == "__main__":

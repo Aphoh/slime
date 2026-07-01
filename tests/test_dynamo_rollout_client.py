@@ -1,10 +1,32 @@
 import asyncio
+import importlib.machinery
 import json
+import sys
+import types
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
+
+_sglang_router = types.ModuleType("sglang_router")
+_sglang_router.__version__ = "0.3.0"
+_sglang = types.ModuleType("sglang")
+_sglang.__path__ = []
+_sglang.__spec__ = importlib.machinery.ModuleSpec("sglang", loader=None, is_package=True)
+_sglang_srt = types.ModuleType("sglang.srt")
+_sglang_srt.__path__ = []
+_sglang_utils = types.ModuleType("sglang.srt.utils")
+_sglang_utils.kill_process_tree = lambda _pid: None
+_sglang_engine = types.ModuleType("slime.backends.sglang_utils.sglang_engine")
+_sglang_engine.get_base_gpu_id = lambda _args, _rank: 0
+_sglang_engine._to_local_gpu_id = lambda gpu_id: gpu_id
+sys.modules.setdefault("sglang_router", _sglang_router)
+sys.modules.setdefault("sglang", _sglang)
+sys.modules.setdefault("sglang.srt", _sglang_srt)
+sys.modules.setdefault("sglang.srt.utils", _sglang_utils)
+sys.modules.setdefault("slime.backends.sglang_utils.sglang_engine", _sglang_engine)
 
 from slime.rollout.dynamo_client import (
     DynamoGeneration,
@@ -405,9 +427,10 @@ def test_short_routed_expert_suffix_is_padded_only_when_loss_masked():
         {"routed_experts": routed_experts},
     )
 
+    assert isinstance(sample.rollout_routed_experts, torch.Tensor)
     assert sample.rollout_routed_experts.shape == (4, 1, 2)
     np.testing.assert_array_equal(sample.rollout_routed_experts[:2], routed_experts)
-    assert np.all(sample.rollout_routed_experts[2:] < args.num_experts)
+    assert torch.all(sample.rollout_routed_experts[2:] < args.num_experts).item()
 
 
 def test_short_routed_expert_suffix_rejects_trainable_tokens():
@@ -494,6 +517,8 @@ def test_generate_dynamo_stream_cancellation_uses_s3_and_preserves_non_s3_fallba
 
     args = SimpleNamespace(
         dynamo_api_mode="responses",
+        dynamo_frontend_url="https://dynamo.example/proxy/",
+        dynamo_served_model_name="served-model",
         sglang_router_ip="dynamo",
         sglang_router_port=3000,
         hf_checkpoint="model",
@@ -537,7 +562,8 @@ def test_generate_dynamo_stream_cancellation_uses_s3_and_preserves_non_s3_fallba
     assert result.response == "".join(f"<{token_id}>" for token_id in expected_tokens[2:])
     assert result.metadata["dynamo_response_id"] == "resp_partial"
     assert "dynamo_previous_response_id" not in result.metadata
-    assert captured["url"].endswith("/v1/responses")
+    assert captured["url"] == "https://dynamo.example/proxy/v1/responses"
+    assert captured["payload"]["model"] == "served-model"
     assert captured["payload"]["stream"] is True
     assert captured["payload"]["seed"] == 9
     assert not state.active_dynamo_tasks
@@ -554,6 +580,84 @@ def test_generate_dynamo_stream_cancellation_uses_s3_and_preserves_non_s3_fallba
         assert "metadata_read" not in captured
         assert result.weight_versions == []
         assert result.rollout_routed_experts is None
+
+
+def test_external_dynamo_worker_validation():
+    from slime.backends.dynamo_utils.external_discovery import DiscoveredWorker, validate_external_workers
+
+    def worker(instance_id, *, model="served-model", pp=1, dp=1, nnodes=1):
+        return DiscoveredWorker(
+            instance_id=instance_id,
+            host=f"worker-{instance_id}",
+            system_port=30001,
+            tp_size=8,
+            pp_size=pp,
+            dp_size=dp,
+            ep_size=1,
+            nnodes=nnodes,
+            node_rank=0,
+            disaggregation_mode="null",
+            served_model_name=model,
+        )
+
+    assert validate_external_workers([worker(1), worker(2)]) == "served-model"
+    with pytest.raises(ValueError, match="single-node TP workers"):
+        validate_external_workers([worker(1, pp=2)])
+    with pytest.raises(ValueError, match="one served model name"):
+        validate_external_workers([worker(1), worker(2, model="other-model")])
+
+
+def test_dynamo_engine_forwards_upstream_weight_update_fields():
+    import json as json_module
+    from dataclasses import dataclass
+
+    from slime.backends.dynamo_utils.dynamo_engine import DynamoEngine
+
+    @dataclass
+    class DeltaParam:
+        name: str
+        scale: float
+
+    captured = []
+    engine = DynamoEngine.__new__(DynamoEngine)
+    engine._call_engine_route = lambda route, body: captured.append((route, body))
+
+    delta = SimpleNamespace(
+        encoding=SimpleNamespace(value="scaled"),
+        params=[DeltaParam(name="layer.weight", scale=0.5)],
+    )
+    engine.update_weights_from_distributed(
+        names=["layer.weight"],
+        dtypes=["torch.float16"],
+        shapes=[[2, 2]],
+        group_name="weights",
+        weight_version="7",
+        load_format="delta",
+        delta=delta,
+    )
+    engine.update_weights_from_disk(
+        model_path="/weights/v7",
+        load_format="delta",
+        weight_version="7",
+        files=["bucket-0.safetensors"],
+    )
+
+    distributed_route, distributed_body = captured[0]
+    assert distributed_route == "update_weights_from_distributed"
+    assert distributed_body["weight_version"] == "7"
+    assert json_module.loads(distributed_body["delta"]) == {
+        "encoding": "scaled",
+        "params": [{"name": "layer.weight", "scale": 0.5}],
+    }
+    assert captured[1] == (
+        "update_weights_from_disk",
+        {
+            "model_path": "/weights/v7",
+            "load_format": "delta",
+            "weight_version": "7",
+            "files": ["bucket-0.safetensors"],
+        },
+    )
 
 
 def test_dynamo_worker_streams_and_requests_routes_by_default(monkeypatch):

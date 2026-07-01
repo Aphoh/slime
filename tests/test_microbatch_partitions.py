@@ -29,3 +29,10 @@ def test_get_capped_partitions_allows_oversized_singleton():
 def test_get_capped_partitions_errors_when_partition_count_is_insufficient():
     with pytest.raises(AssertionError, match="Unable to create capped microbatch partitions"):
         get_capped_partitions([6000, 6000, 6000], num_partitions=2, max_tokens=8192)
+
+
+NUM_GPUS = 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

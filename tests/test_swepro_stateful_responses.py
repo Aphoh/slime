@@ -65,8 +65,9 @@ def test_direct_responses_payload_carries_exact_tokens_and_state():
     assert payload["min_tokens"] == 4
     assert payload["seed"] == 123
     assert payload["skip_special_tokens"] is False
-    assert payload["no_stop_trim"] is True
-    assert payload["spaces_between_special_tokens"] is False
+    assert "no_stop_trim" not in payload
+    assert payload["include_stop_str_in_output"] is True
+    assert "spaces_between_special_tokens" not in payload
     assert payload["top_k"] == 20
     assert payload["stop"] == ["</tool_call>"]
     assert payload["include"] == ["message.output_text.logprobs"]
@@ -167,7 +168,13 @@ def test_direct_responses_uses_streamed_prefix_with_longer_uploaded_metadata(mon
                 },
             }
 
-    monkeypatch.setattr(completions_direct_model.requests, "post", lambda *_args, **_kwargs: _Response())
+    captured = {}
+
+    def _post(*_args, **kwargs):
+        captured["payload"] = copy.deepcopy(kwargs["json"])
+        return _Response()
+
+    monkeypatch.setattr(completions_direct_model.requests, "post", _post)
     monkeypatch.setattr(
         completions_direct_model,
         "_read_uploaded_metadata",
@@ -191,6 +198,18 @@ def test_direct_responses_uses_streamed_prefix_with_longer_uploaded_metadata(mon
     assert result["extra"]["generated_token_source"] == "completion_token_ids"
     assert result["extra"]["finish_reason"] == "stop"
     assert result["extra"]["stop_reason"] == " "
+    metadata_upload = captured["payload"]["nvext"]["metadata_upload"]
+    assert set(metadata_upload) == {"url"}
+    assert metadata_upload["url"].startswith("s3://rollout-metadata/test/")
+
+
+def test_direct_responses_rejects_unsupported_metadata_format():
+    with pytest.raises(ValueError, match="only msgpack"):
+        DirectCompletionsConfig(
+            base_url="http://dynamo",
+            tokenizer_path="unused",
+            metadata_upload_format="json",
+        )
 
 
 def test_direct_responses_preserves_content_filter_reason(monkeypatch):

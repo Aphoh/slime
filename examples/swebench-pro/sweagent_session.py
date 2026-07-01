@@ -31,12 +31,12 @@ class SweAgentSessionClient:
     session_workers: dict[str, str] = field(default_factory=dict)
 
     @classmethod
-    def from_env(cls, args: Any | None = None) -> "SweAgentSessionClient":
+    def from_env(cls, args: Any | None = None) -> SweAgentSessionClient:
         nats_url = os.getenv("SWEPRO_NATS_URL")
         if not nats_url and args is not None:
             nats_url = getattr(args, "swepro_nats_url", None)
         return cls(
-            nats_url=nats_url or "nats://warnold-swepro-nats:4222",
+            nats_url=nats_url or "nats://nats:4222",
             timeout=float(os.getenv("SWEPRO_SESSION_TIMEOUT", "1800")),
         )
 
