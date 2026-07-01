@@ -19,8 +19,8 @@ resources:
 
 dynamo:
   enabled: true
-  frontend_url: http://dynamo-frontend:3000
-  nats_url: nats://nats:4222
+  frontend_url: http://YOUR_DYNAMO_FRONTEND_HOST:3000
+  nats_url: nats://YOUR_NATS_HOST:4222
   worker_system_port: 30001
   frontend_wait_timeout: 600
   tool_events_zmq_port: 20390

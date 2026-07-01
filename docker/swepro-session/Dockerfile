@@ -4,7 +4,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates docker.io docker-cli \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir nats-py==2.15.0 docker==7.1.0 pyyaml==6.0.3 pyzmq==27.1.0 msgpack==1.2.1
+COPY docker/swepro-session/requirements.lock /tmp/swepro-session-requirements.lock
+RUN pip install --no-cache-dir -r /tmp/swepro-session-requirements.lock && \
+    rm /tmp/swepro-session-requirements.lock
 
 COPY docker/swepro-session/runner.py /opt/swepro-session/runner.py
 COPY examples/swebench-pro/dynamo_agent_trace.py /opt/swepro-session/dynamo_agent_trace.py

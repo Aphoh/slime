@@ -866,7 +866,7 @@ def _connect_weight_update_group(
         ]
         model_update_groups = init_process_group(
             backend="nccl",
-            init_method=f"tcp://{master_address}:{master_port}",
+            init_method=f"tcp://{_wrap_ipv6(master_address)}:{master_port}",
             world_size=world_size,
             rank=0,
             group_name=group_name,

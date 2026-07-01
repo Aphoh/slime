@@ -4,7 +4,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates docker.io \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir docker==7.1.0 nats-py==2.15.0 pandas==3.0.3 tqdm==4.68.3
+COPY docker/swepro-eval/requirements.lock /tmp/swepro-eval-requirements.lock
+RUN pip install --no-cache-dir -r /tmp/swepro-eval-requirements.lock && \
+    rm /tmp/swepro-eval-requirements.lock
 
 COPY docker/swepro-eval/runner.py /opt/swepro-eval/runner.py
 

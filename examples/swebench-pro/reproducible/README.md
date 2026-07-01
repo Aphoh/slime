@@ -23,16 +23,22 @@ The included launch configuration expects:
 - an S3 bucket reachable from both Dynamo workers and Ray workers
 - an externally managed Ray cluster with the resources declared in `cluster.yaml`
 
-Set these host-side values before following the commands below:
+Check out the tested benchmark revision and its pinned submodules, then set
+the remaining host-side values:
 
 ```bash
 export SWEPRO_SOURCE_ROOT=/absolute/path/to/SWE-bench_Pro-os
+git clone https://github.com/scaleapi/SWE-bench_Pro-os.git "$SWEPRO_SOURCE_ROOT"
+git -C "$SWEPRO_SOURCE_ROOT" checkout ca10a60a5fcae51e6948ffe1485d4153d421e6c5
+git -C "$SWEPRO_SOURCE_ROOT" submodule update --init --recursive
+
 export SWEPRO_DOCKER_SOCKET=/var/run/docker.sock
 export SWEPRO_DOCKERHUB_USERNAME=YOUR_DOCKERHUB_USERNAME
 ```
 
-Use a pinned revision of the benchmark checkout. The session and evaluation
-workers execute benchmark-owned helpers and Dockerfiles from that checkout.
+The session image pins the matching SWE-agent submodule revision
+`402a7b8fdac8193f3f255bb53859ba274234f596`. The session and evaluation
+workers execute benchmark-owned helpers and Dockerfiles from this checkout.
 
 ## Build
 
@@ -45,9 +51,10 @@ docker build -f docker/swepro-session/Dockerfile -t slynamo-swepro-session:3.0 .
 docker build -f docker/swepro-eval/Dockerfile -t slynamo-swepro-eval:3.0 .
 ```
 
-The image pins the Slime base digest, combined Dynamo revision, Rust toolchain,
-and direct Python dependencies. It installs the `fsspec`, `s3fs`, `zstandard`,
-and `msgspec` dependencies used by rollout metadata.
+The images pin the Slime base digest, combined Dynamo revision, SWE-agent
+revision, Rust toolchain, and Python dependency sets. The trainer image installs
+the `fsspec`, `s3fs`, `zstandard`, and `msgspec` dependencies used by rollout
+metadata.
 
 Prepare prompt data with explicit inputs:
 
@@ -59,13 +66,14 @@ python3 examples/swebench-pro/prepare_swebench_pro_data.py \
   --dockerhub-username "$SWEPRO_DOCKERHUB_USERNAME"
 ```
 
-Replace every `YOUR_*` value in `experiment_config.yaml`:
+Replace every `YOUR_*` value in `cluster.yaml` and `experiment_config.yaml`:
 
+- `YOUR_DYNAMO_FRONTEND_HOST`
+- `YOUR_NATS_HOST`
 - `YOUR_S3_BUCKET`
 - `YOUR_HF_CHECKPOINT`
 - `YOUR_TORCH_DIST_CHECKPOINT`
 - `YOUR_SWEBENCH_PRO_TRAIN_JSONL`
-- `YOUR_TRACE_REPLAY_JSONL` when using `perf-test`
 
 Dry runs preserve placeholders so the generated command can be inspected. A
 real submission rejects unresolved placeholders.
@@ -75,15 +83,18 @@ real submission rejects unresolved placeholders.
 SWE-Pro session rollouts require NATS, a session worker, and an evaluation
 worker. The Dynamo frontend and SGLang worker additionally require etcd. The
 following single-host recipe shows every required process; use equivalent
-services in Kubernetes and inject the same environment variables.
+services in Kubernetes and inject the same environment variables. It publishes
+the control ports so Ray workers outside the Docker network can reach them.
+These services are unauthenticated; expose the ports only on a trusted network
+and restrict ingress to the Ray and Dynamo nodes.
 
 ```bash
 docker network create slynamo
 
-docker run -d --name nats --network slynamo \
+docker run -d --name nats --network slynamo -p 4222:4222 \
   slynamo:3.0-dynamo nats-server -js
 
-docker run -d --name etcd --network slynamo \
+docker run -d --name etcd --network slynamo -p 2379:2379 \
   slynamo:3.0-dynamo etcd \
   --name etcd \
   --listen-client-urls http://0.0.0.0:2379 \
@@ -112,8 +123,9 @@ mount, S3 credentials or workload identity, `--enable-rl` for metadata uploads,
 and `--enable-return-routed-experts` for routing replay:
 
 ```bash
-docker run -d --name dynamo-frontend --network slynamo -p 3000:3000 \
+docker run -d --name dynamo-frontend --network slynamo -p 3000:3000 -p 20390:20390 \
   -e NATS_SERVER=nats://nats:4222 \
+  -e DYN_AGENT_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT=tcp://0.0.0.0:20390 \
   -e ETCD_ENDPOINTS=http://etcd:2379 \
   slynamo:3.0-dynamo python -m dynamo.frontend --http-port 3000
 
@@ -128,6 +140,10 @@ docker run -d --name dynamo-worker --network slynamo --gpus all \
   --enable-rl \
   --enable-return-routed-experts
 ```
+
+Set `YOUR_DYNAMO_FRONTEND_HOST` and `YOUR_NATS_HOST` in `cluster.yaml` to
+DNS names or IP addresses reachable from every Ray node. Do not use the Docker-only
+service names unless the Ray containers also join the `slynamo` network.
 
 For AWS S3, the credentials file uses the standard `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, and region variables.
@@ -150,16 +166,6 @@ python3 examples/swebench-pro/run_experiment.py \
   --dry-run
 ```
 
-For deterministic trace-replay performance tests:
-
-```bash
-python3 examples/swebench-pro/run_experiment.py \
-  --cluster examples/swebench-pro/reproducible/cluster.yaml \
-  --experiment examples/swebench-pro/reproducible/experiment_config.yaml \
-  --mode perf-test \
-  --dry-run
-```
-
 The dry-run output prints the resolved `train_async.py` command, the final Ray
 submission command, and the runtime env JSON that Ray will receive.
 
@@ -172,8 +178,6 @@ python3 examples/swebench-pro/run_experiment.py \
   --cluster examples/swebench-pro/reproducible/cluster.yaml \
   --experiment examples/swebench-pro/reproducible/experiment_config.yaml
 ```
-
-Run the performance-test mode with the same command plus `--mode perf-test`.
 
 Each submitted run snapshots both YAML files plus the generated commands under
 `.artifacts/swepro-runs/<run-id>/`.

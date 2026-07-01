@@ -40,7 +40,7 @@ def test_reproducible_run_mode_builds_stock_train_async_command():
     assert plan.train_command[plan.train_command.index("--pipeline-model-parallel-size") + 1] == "8"
     assert plan.train_command[plan.train_command.index("--context-parallel-size") + 1] == "1"
     assert plan.train_command[plan.train_command.index("--dynamo-frontend-url") + 1] == (
-        "http://dynamo-frontend:3000"
+        "http://YOUR_DYNAMO_FRONTEND_HOST:3000"
     )
     assert plan.train_command[plan.train_command.index("--dynamo-api-mode") + 1] == "responses"
     assert plan.train_command[plan.train_command.index("--dynamo-metadata-upload-format") + 1] == "msgpack"
@@ -54,29 +54,12 @@ def test_reproducible_run_mode_builds_stock_train_async_command():
     assert plan.train_command[plan.train_command.index("--advantage-estimator") + 1] == "grpo"
     assert "--debug-rollout-only" not in plan.train_command
     assert not any(token.startswith("SWEPRO_") for token in plan.train_command)
-    assert plan.runtime_env["env_vars"]["DYNAMO_FRONTEND_URL"] == "http://dynamo-frontend:3000"
+    assert plan.runtime_env["env_vars"]["DYNAMO_FRONTEND_URL"] == "http://YOUR_DYNAMO_FRONTEND_HOST:3000"
     assert plan.runtime_env["env_vars"]["SWEPRO_DYNAMO_API_MODE"] == "responses"
     assert plan.runtime_env["env_vars"]["SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT"] == "msgpack"
     assert plan.runtime_env["env_vars"]["PYTHONPATH"] == "/root/Megatron-LM/:.:examples/swebench-pro"
     assert "SWEPRO_TRACE_REPLAY_PATH" not in plan.runtime_env["env_vars"]
     assert "--no-wait" not in plan.ray_command
-
-
-def test_perf_mode_uses_trace_replay_and_mock_trainer_without_changing_entrypoint():
-    _interface, plan = _load_example_plan(mode="perf-test")
-
-    assert plan.mode == "perf-test"
-    assert plan.train_command[:2] == ["python3", "train_async.py"]
-    assert "--debug-rollout-only" in plan.train_command
-    assert plan.train_command[plan.train_command.index("--rollout-function-path") + 1] == (
-        "slime.rollout.fully_async_rollout.rollout_with_mock_trainer"
-    )
-    assert plan.train_command[plan.train_command.index("--mock-trainer-tokens-per-second") + 1] == "15000"
-    assert plan.runtime_env["env_vars"]["SWEPRO_TRACE_REPLAY_FORCE_FIXED_DECODE"] == "1"
-    assert plan.runtime_env["env_vars"]["SWEPRO_TRACE_REPLAY_PATH"].endswith(
-        "YOUR_TRACE_REPLAY_JSONL"
-    )
-    assert plan.runtime_env["env_vars"]["SWEPRO_ASYNC_MAX_STARTED_GROUPS"] == "160"
 
 
 def test_execution_rejects_unresolved_customer_placeholders():
