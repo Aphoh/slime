@@ -72,7 +72,6 @@ RUN_CONFIG_ENV_MAP: dict[tuple[str, ...], tuple[str, ...]] = {
     ("routing", "frontend_url"): ("DYNAMO_FRONTEND_URL",),
     ("routing", "dynamo_frontend_url"): ("DYNAMO_FRONTEND_URL",),
     ("routing", "swepro_dynamo_frontend_url"): ("SWEPRO_DYNAMO_FRONTEND_URL",),
-    ("routing", "api_mode"): ("SWEPRO_DYNAMO_API_MODE",),
     ("routing", "tool_events_zmq_endpoint"): ("SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT",),
     ("routing", "tool_events_zmq_port"): ("SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_PORT",),
     ("routing", "nats_url"): ("SWEPRO_NATS_URL",),
@@ -129,7 +128,6 @@ RUN_CONFIG_ENV_MAP: dict[tuple[str, ...], tuple[str, ...]] = {
     ("engine_warmup", "token_id"): ("SWEPRO_ENGINE_WARMUP_TOKEN_ID",),
     ("engine_warmup", "timeout"): ("SWEPRO_ENGINE_WARMUP_TIMEOUT",),
     ("engine_warmup", "discovery_timeout"): ("SWEPRO_ENGINE_WARMUP_DISCOVERY_TIMEOUT",),
-    ("engine_warmup", "model"): ("SWEPRO_ENGINE_WARMUP_MODEL",),
 }
 RUN_CONFIG_IGNORED_TOP_LEVEL = {"version", "description", "notes"}
 RUN_CONFIG_RUNTIME_EXCLUDED_KEYS = {
@@ -422,7 +420,6 @@ class EngineWarmupConfig:
     token_id: int
     timeout: float
     discovery_timeout: int
-    model: str
     required: bool
 
 
@@ -514,7 +511,6 @@ def engine_warmup_config(env: dict[str, str], tachometer: TachometerConfig) -> E
         token_id=env_int(env, "SWEPRO_ENGINE_WARMUP_TOKEN_ID", 100),
         timeout=float(env_str(env, "SWEPRO_ENGINE_WARMUP_TIMEOUT", "900")),
         discovery_timeout=env_int(env, "SWEPRO_ENGINE_WARMUP_DISCOVERY_TIMEOUT", 600),
-        model=env_str(env, "SWEPRO_ENGINE_WARMUP_MODEL", ""),
         required=env_flag(env, "SWEPRO_ENGINE_WARMUP_REQUIRED", True),
     )
 
@@ -602,7 +598,6 @@ def runtime_env(env: dict[str, str], repo_root: Path, has_nvlink: str) -> dict[s
         "SWEPRO_RUN_ID": env_str(env, "SWEPRO_RUN_ID", default_run_id()),
         "DYNAMO_FRONTEND_URL": env_str(env, "DYNAMO_FRONTEND_URL", "http://warnold-swepro-frontend:3000"),
         "SWEPRO_DYNAMO_FRONTEND_URL": env.get("SWEPRO_DYNAMO_FRONTEND_URL", ""),
-        "SWEPRO_DYNAMO_API_MODE": env_str(env, "SWEPRO_DYNAMO_API_MODE", "completions"),
         "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT": env.get("SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_ENDPOINT", ""),
         "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_PORT": env_str(env, "SWEPRO_DYNAMO_TOOL_EVENTS_ZMQ_PORT", "20390"),
         "SWEPRO_NATS_URL": env_str(env, "SWEPRO_NATS_URL", "nats://warnold-swepro-nats:4222"),
@@ -694,6 +689,31 @@ def _http_json(
     return json.loads(raw) if raw else {}
 
 
+def _http_sse(
+    url: str,
+    *,
+    payload: dict,
+    headers: dict[str, str] | None = None,
+    timeout: float = 30.0,
+) -> list[dict]:
+    data = json.dumps(payload).encode("utf-8")
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, data=data, headers=request_headers, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8")
+
+    events = []
+    for line in raw.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data_str = line[len("data:") :].strip()
+        if data_str and data_str != "[DONE]":
+            events.append(json.loads(data_str))
+    return events
+
+
 def _parse_transport_host(transport_tcp: str) -> str:
     return transport_tcp.split("/", 1)[0].rsplit(":", 1)[0]
 
@@ -726,19 +746,6 @@ def _discover_dynamo_generate_workers(config: EngineWarmupConfig) -> dict[str, s
     return last_workers
 
 
-def _warmup_model_name(config: EngineWarmupConfig) -> str:
-    if config.model:
-        return config.model
-    try:
-        models = _http_json(f"{config.frontend_url}/v1/models", timeout=10)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return "default"
-    data = models.get("data") or []
-    if data and isinstance(data[0], dict) and data[0].get("id"):
-        return str(data[0]["id"])
-    return "default"
-
-
 def warmup_dynamo_workers(
     config: EngineWarmupConfig,
     durable_logs: DurableLogConfig,
@@ -755,23 +762,24 @@ def warmup_dynamo_workers(
             raise RuntimeError(message)
         print(f"warning: {message}; warming discovered workers only")
 
-    model = _warmup_model_name(config)
     prompt = [config.token_id] * max(1, config.isl)
     results: list[dict[str, object]] = []
     print(
         "SWEPRO engine warmup: "
-        f"workers={len(workers)}, isl={len(prompt)}, osl={config.osl}, model={model}"
+        f"workers={len(workers)}, isl={len(prompt)}, osl={config.osl}"
     )
     for idx, worker_id in enumerate(workers):
         payload = {
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": config.osl,
-            "min_tokens": config.osl,
-            "ignore_eos": True,
-            "temperature": 0,
-            "stream": False,
-            "nvext": {"agent_hints": {"osl": config.osl}},
+            "rid": f"{run_id}:warmup:{idx}:{worker_id}",
+            "input_ids": prompt,
+            "sampling_params": {
+                "max_new_tokens": config.osl,
+                "min_new_tokens": config.osl,
+                "ignore_eos": True,
+                "temperature": 0,
+            },
+            "return_logprob": False,
+            "stream": True,
         }
         headers = {
             "x-worker-instance-id": worker_id,
@@ -786,27 +794,35 @@ def warmup_dynamo_workers(
             "osl": config.osl,
         }
         try:
-            response = _http_json(
-                f"{config.frontend_url}/v1/completions",
-                method="POST",
+            events = _http_sse(
+                f"{config.frontend_url}/generate",
                 payload=payload,
                 headers=headers,
                 timeout=config.timeout,
             )
+            if not events:
+                raise RuntimeError("Dynamo native Generate warmup stream returned no events")
             elapsed = time.time() - started
-            choice = (response.get("choices") or [{}])[0]
-            usage = response.get("usage") or {}
+            meta_info = events[-1].get("meta_info") or {}
+            finish_reason = meta_info.get("finish_reason")
+            if isinstance(finish_reason, dict):
+                finish_reason = finish_reason.get("type")
+            usage = {
+                key: meta_info[key]
+                for key in ("prompt_tokens", "completion_tokens", "cached_tokens")
+                if key in meta_info
+            }
             result.update(
                 {
                     "ok": True,
                     "elapsed_s": elapsed,
-                    "finish_reason": choice.get("finish_reason"),
+                    "finish_reason": finish_reason,
                     "usage": usage,
                 }
             )
             print(
                 "SWEPRO engine warmup: "
-                f"worker={worker_id} elapsed={elapsed:.3f}s finish={choice.get('finish_reason')} "
+                f"worker={worker_id} elapsed={elapsed:.3f}s finish={finish_reason} "
                 f"usage={usage}"
             )
         except Exception as exc:

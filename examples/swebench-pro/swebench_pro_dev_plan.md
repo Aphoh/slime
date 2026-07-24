@@ -6,7 +6,8 @@
 
 - **Model**: GLM-4.7-30B-A3B (30B total, 3B active, MoE with MLA). Model args: `scripts/models/glm4.7-30B-A3B.sh`. Conversion bridge: `slime/backends/megatron_utils/megatron_to_hf/glm4moe.py`. Existing code path exercises conversion — **do not re-implement**.
 - **Task**: SWE-bench Pro (731 instances; ~50% JS/TS, ~36% Python, ~10% Go). Upstream: `~/proj/SWE-bench_Pro-os` on the dev host; canonical eval runner is `swe_bench_pro_eval.py` (Modal-based — we'll replace Modal with an in-cluster runner).
-- **Agent scaffold**: SWE-agent (primary) or mini-swe-agent (fallback) with a small first-party completions model adapter that formats prompts locally and posts token IDs to slime's `/v1/completions` endpoint. **Do not use LiteLLM.** Use the saved SWE-agent `.traj` `history` or mini-swe-agent `messages` as the source of truth for training tokens.
+- **Agent scaffold**: SWE-agent (primary) or mini-swe-agent (fallback) with a small first-party Dynamo adapter that formats prompts locally and posts token IDs to Dynamo's native `/generate` endpoint. **Do not use LiteLLM.** Use the saved SWE-agent `.traj` `history` or mini-swe-agent `messages` as the source of truth for training tokens.
+- **Dynamo requirement**: the native SGLang `/generate` endpoint is stream-only and requires exactly one registered model; it returns token IDs, selected-token logprobs, and optional routed-expert metadata inline.
 - **Hardware**: 2× 8×B200 nscale nodes (~192 vCPU, ~2 TiB RAM each). 16 B200s total. x86_64. No separate CPU pool — eval workers steal spare CPU on the GPU nodes.
 - **Scale**: ramp from 4–8 instances × 1 sample for smoke, then 16 instances × 1 sample, then 32 instances × 2 samples for the dev run. Keep eval concurrency low until CPU, Docker cache, and NCCL jitter are measured.
 
@@ -61,7 +62,7 @@ All paths are relative to the repo root `/Users/warnold/conductor/workspaces/sli
 - `examples/tau-bench/generate_with_tau.py` — close analogue for `async def generate(args, sample, sampling_params) -> Sample`: call an external agent harness, convert result → slime `Sample`, return.
 - `examples/retool/generate_with_retool.py` — richer tool-loop example (402 LOC) if you need per-turn control.
 - `examples/fully_async/fully_async_rollout.py` and `train_async.py` — reference for async rollout/training overlap and delayed weight updates. For SWE-bench Pro, start with `train_async.py` plus `--update-weights-interval > 1`; do **not** enable fully-async background rollout initially.
-- `slime/rollout/sglang_rollout.py` and `examples/retool/generate_with_retool.py` — references for rollout logprob shape. Dynamo/OpenAI-compatible completions already sends token IDs to `/v1/completions`, requests `logprobs: 0` plus `return_tokens_as_token_ids: True`, and reads `choices[0].logprobs.token_logprobs`. The custom agent model adapter should mirror this path instead of using `/v1/chat/completions`.
+- `slime/rollout/sglang_rollout.py` and `examples/retool/generate_with_retool.py` — references for rollout logprob shape. Dynamo native SGLang Generate sends token IDs to `/generate`, requests `return_logprob: true`, and returns `output_ids` with `meta_info.output_token_logprobs`. The custom agent model adapter should mirror this token-in/token-out contract.
 - `slime/utils/mask_utils.py` and `slime/rollout/sft_rollout.py` — use `MultiTurnLossMaskGenerator` to convert SWE-agent `history`/mini-swe-agent `messages` into `tokens`, `response_length`, and assistant-only `loss_mask`.
 - `slime/rollout/sglang_rollout.py:288` — confirms `logprobs: 0` is the baseline (prevents the regression hit last month).
 - `slime/backends/dynamo_utils/dynamo_engine.py` — dynamo adapter; where `--dynamo-frontend-url` is consumed.
@@ -69,7 +70,7 @@ All paths are relative to the repo root `/Users/warnold/conductor/workspaces/sli
 **SWE-bench Pro runner** (`~/proj/SWE-bench_Pro-os/`):
 - `swe_bench_pro_eval.py` already has the local-Docker path we need: `assemble_workspace_files()`, `create_entryscript()`, `eval_with_docker()`, and final pass/fail logic over `FAIL_TO_PASS`/`PASS_TO_PASS`.
 - Local `helper_code/sweap_eval_full_v2.jsonl` uses uppercase `FAIL_TO_PASS` / `PASS_TO_PASS` and mixed list/string encodings. Normalize these before feeding slime/eval; do not assume lowercase `fail_to_pass` / `pass_to_pass` are present.
-- SWE-agent's default API model path is LiteLLM-based. Avoid it by adding a local custom model class or by using mini-swe-agent's `--model-class` hook with a direct `requests`/`aiohttp` OpenAI-compatible adapter.
+- SWE-agent's default API model path is LiteLLM-based. Avoid it by adding a local custom model class or by using mini-swe-agent's `--model-class` hook with a direct standard-library HTTP adapter for Dynamo native Generate.
 - SWE-agent `.traj` files include `history`, `trajectory`, and `info.submission`; use `history` for train tokens and `info.submission` for eval. If `history` is missing in an older trajectory format, fall back to reconstructing messages from `trajectory[*].response` and `trajectory[*].observation`, but treat that as a smoke-only fallback.
 
 **Model + conversion**:
@@ -195,21 +196,21 @@ Set `PYTHONPATH` in the Ray runtime env to include `/code/slime/examples/swebenc
    - Each line should include top-level `prompt` and `instance_id`, plus `metadata` containing the normalized raw row: `repo`, `base_commit`, `selected_test_files_to_run`, `fail_to_pass`, `pass_to_pass`, Docker image/tag inputs, and any path needed by the agent.
    - Normalize `FAIL_TO_PASS`/`PASS_TO_PASS` into Python lists regardless of whether upstream encoded them as JSON strings or lists. Use existing `problem_statement` directly for the prompt when `requirements`/`interface` fields are absent.
 
-2. **`examples/swebench-pro/completions_direct_model.py`** — direct `/v1/completions` model adapter, no LiteLLM dependency.
+2. **`examples/swebench-pro/completions_direct_model.py`** — direct native `/generate` model adapter, no LiteLLM dependency.
    - Implement the minimal interface required by the chosen scaffold:
      - mini-swe-agent: class with `query(messages, **kwargs) -> {"content": ..., "extra": ...}` and `get_template_vars()`.
      - SWE-agent: subclass/parallel implementation of `AbstractModel` compatible with `sweagent.agent.models.get_model`, or a small local patch that selects this adapter for `agent.model.name`.
-   - Load the same HF tokenizer used by slime, render chat locally with `tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)`, tokenize to `prompt_ids`, then POST to `<dynamo-frontend>/v1/completions`.
-   - Request `{"prompt": prompt_ids, "max_tokens": ..., "temperature": ..., "top_p": ..., "logprobs": 0, "return_tokens_as_token_ids": true, "stream": false}`. This mirrors `slime/rollout/sglang_rollout.py::_generate_dynamo`.
-   - Decode `choices[0].text` for the agent-facing message and preserve raw response metadata under `extra.response`, including generated token IDs from `choices[0].logprobs.tokens` and `choices[0].logprobs.token_logprobs`.
-   - Add stop strings only if they match the scaffold parser behavior. Avoid server-side chat formatting to prevent template drift.
+   - Load the same HF tokenizer used by slime, render chat locally with `tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)`, tokenize to `prompt_ids`, then POST to `<dynamo-frontend>/generate`.
+   - Request `{"rid": ..., "input_ids": prompt_ids, "sampling_params": {"max_new_tokens": ..., "temperature": ..., "top_p": ...}, "return_logprob": true, "logprob_start_len": -1, "stream": true}`. This mirrors `slime/rollout/sglang_rollout.py::_generate_dynamo`.
+   - Decode `output_ids` for the agent-facing message and preserve raw stream events under `extra.response`, including selected-token logprobs from `meta_info.output_token_logprobs`.
+   - Pass native stop strings or token IDs only when they match the scaffold parser behavior. Avoid server-side chat formatting to prevent template drift.
    - Keep retry/error handling small and explicit; no proxy/model-registry abstraction.
 
 3. **`examples/swebench-pro/generate_with_swebench_pro.py`** — custom generate + reward module.
    - `generate()`: per-sample, spawn SWE-agent or mini-swe-agent subprocess configured to use `completions_direct_model.py`; capture `.traj`, final patch, and exit status.
    - Convert SWE-agent `.traj` `history` into slime training data with `MultiTurnLossMaskGenerator(tokenizer, tokenizer_type=args.loss_mask_type)`. Set `sample.tokens`, `sample.response`, `sample.response_length`, `sample.loss_mask`, `sample.status`, and metadata (`instance_id`, `patch`, `traj_path`, `exit_status`, `repo`, eval fields). `loss_mask` must cover only assistant tokens from the first assistant token through the end; observations/user/tool output must be zero-masked.
    - If using mini-swe-agent fallback, convert saved `messages` the same way. This is likely the fastest P2 path because mini-swe-agent saves exact OpenAI-style messages.
-   - Rollout logprobs: use `completions_direct_model.py` so each assistant response stores generated token ids and token logprobs from `/v1/completions` (`choices[*].logprobs.token_logprobs`). When converting the trajectory, build `sample.rollout_log_probs` with length exactly `sample.response_length`: real logprobs for generated assistant content tokens; `0.0` for zero-masked user/observation/tool/template tokens. Assert alignment before returning the sample.
+   - Rollout logprobs: use `completions_direct_model.py` so each assistant response stores generated token IDs and selected-token logprobs from `/generate` (`output_ids` and `meta_info.output_token_logprobs`). When converting the trajectory, build `sample.rollout_log_probs` with length exactly `sample.response_length`: real logprobs for generated assistant content tokens; `0.0` for zero-masked user/observation/tool/template tokens. Assert alignment before returning the sample.
    - Keep `--max_turns 50` / per-instance call limit hard cap to bound trajectory length. Return `Sample.Status.TRUNCATED` if the agent exits due to turn/call/context limits.
    - `reward_func()` (async): accept either one `Sample` or a `list[Sample]`. For a list, `asyncio.gather` per-sample calls and return rewards in order. For one sample, publish `{request_id, instance_id, patch, repo, fail_to_pass, pass_to_pass, selected_test_files_to_run}` to NATS (`nats://<nats-service>:4222`, subject `swepro.evals`), await reply with a long timeout, attach raw eval JSON to `sample.metadata["eval"]`, and return scalar `1.0` or `0.0`.
 
@@ -243,8 +244,8 @@ Set `PYTHONPATH` in the Ray runtime env to include `/code/slime/examples/swebenc
 | **P0: Preflight** | Confirm kube context, pick 2 free B200 nodes, verify PVC mounts + image pull, verify privileged pods allowed. Pre-pull top-20 SWE-bench Pro images on both nodes. | 0.5 day | `kubectl apply --dry-run` passes; `docker pull` of top-20 images completes on both nodes |
 | **P0b: Data prep** | Normalize SWE-bench Pro JSONL into slime prompt-data with metadata. | 0.5 day | `/data/swebench-pro/swebench_pro_train.jsonl` loads through slime `Dataset`; metadata has list-valued `fail_to_pass` / `pass_to_pass` |
 | **P1: Eval infra** | Build `swepro-eval` image; apply dockerd DaemonSet + NATS + low-concurrency eval Deployments. Run 1 eval container end-to-end on a known-good gold patch. | 1–2 days | ≥5 green evals end-to-end via NATS round-trip; failed evals clean up containers/workspaces |
-| **P1b: Direct model bridge** | Add `completions_direct_model.py`, run one SWE-agent or mini-swe-agent trajectory without importing LiteLLM, and convert saved `history`/`messages` to slime `Sample` fields. | 0.5–1 day | No LiteLLM import; `/v1/completions` receives token-ID prompts; `len(sample.loss_mask) == sample.response_length`; at least one assistant token is unmasked; no user/observation tokens are unmasked |
-| **P1c: Logprob bridge** | Preserve generated token ids + token logprobs from the direct OpenAI-compatible response, then align them to slime `response_length`. | 0.5–1 day | `len(sample.rollout_log_probs) == sample.response_length`; TIS dry-run reaches loss computation without assertion |
+| **P1b: Direct model bridge** | Add `completions_direct_model.py`, run one SWE-agent or mini-swe-agent trajectory without importing LiteLLM, and convert saved `history`/`messages` to slime `Sample` fields. | 0.5–1 day | No LiteLLM import; native `/generate` receives token-ID prompts; `len(sample.loss_mask) == sample.response_length`; at least one assistant token is unmasked; no user/observation tokens are unmasked |
+| **P1c: Logprob bridge** | Preserve generated token ids + token logprobs from the direct native Generate stream, then align them to slime `response_length`. | 0.5–1 day | `len(sample.rollout_log_probs) == sample.response_length`; TIS dry-run reaches loss computation without assertion |
 | **P2: Rollout-only smoke** | Stand up trainer + 3 engines on 2 nodes using the new YAMLs. Run 4 instances × 1 sample via slime endpoint with `--debug-rollout-only`. **No training step.** | 1 day | trajectory → `Sample` → patch → eval → reward, full loop green |
 | **P3: 1-rollout async training** | 4–8 instances × 1 sample × 1–2 steps with `train_async.py`, `--update-weights-interval 2`, no partial rollout. Enable `--use-tis` only if P1c passed. | 1 day | non-zero loss, step completes, delayed weight-sync succeeds, eval queue stays bounded |
 | **P4: Scaled dev run** | 16 instances × 1 sample × 5 rollouts, then 32 instances × 2 samples × 5 rollouts if stable. | 1–2 days wall-clock | all steps complete, non-degenerate reward signal, no trainer starvation |
@@ -259,7 +260,7 @@ Total: ~1 week focused work, 2 weeks with debugging.
 | NCCL weight-sync hang (seen on retool reruns) | Worker-pod recreation runbook kept from retool debugging |
 | Docker image cold-pull tax (15+ GB for some JS/TS) | Pre-warm top-20 images on each node before P4 (P0 gate) |
 | LiteLLM supply-chain/dependency risk | Do not install or import LiteLLM in the SWE-bench Pro path; use `completions_direct_model.py` with direct HTTP calls |
-| Chat template drift between adapter and server | Do all prompt formatting locally with the training tokenizer and call `/v1/completions` with token IDs |
+| Chat template drift between adapter and server | Do all prompt formatting locally with the training tokenizer and call native `/generate` with token IDs |
 | SWE-agent trajectories blow past context (200+ turns) | Cap `--max_turns 50` / per-instance call limit; mark as `TRUNCATED`; do not rely on slime partial rollout initially |
 | SWE-agent trajectory does not contain exact model context | Prefer `.traj` `history`. If unavailable, use mini-swe-agent `messages` for P2 or patch SWE-agent save hooks before training |
 | Rollout logprobs misalign with chat-template tokens | Preserve token ids/logprobs at generation time and validate `len(rollout_log_probs) == response_length`; fill `0.0` only for zero-masked observation/template tokens |

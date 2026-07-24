@@ -165,9 +165,6 @@ def test_sweagent_session_stops_and_fails_on_content_filter(monkeypatch):
                 },
             }
 
-        @staticmethod
-        def delete_response(_response_id):
-            return None
 
     class _Client:
         step_calls = 0

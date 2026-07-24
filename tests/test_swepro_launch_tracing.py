@@ -348,8 +348,6 @@ def test_engine_warmup_uses_prefill_chunk_size_and_pins_each_worker(tmp_path):
                         ]
                     }
                 ).encode()
-            elif self.path == "/v1/models":
-                body = json.dumps({"data": [{"id": "/shared/model"}]}).encode()
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -364,18 +362,22 @@ def test_engine_warmup_uses_prefill_chunk_size_and_pins_each_worker(tmp_path):
             body = self.rfile.read(int(self.headers["Content-Length"]))
             payload = json.loads(body)
             requests.append({"headers": dict(self.headers), "payload": payload})
-            response = json.dumps(
-                {
-                    "choices": [{"text": "x", "finish_reason": "length"}],
-                    "usage": {
-                        "prompt_tokens": len(payload["prompt"]),
-                        "completion_tokens": payload["max_tokens"],
-                        "total_tokens": len(payload["prompt"]) + payload["max_tokens"],
-                    },
-                }
+            response = (
+                "data: "
+                + json.dumps(
+                    {
+                        "output_ids": [1],
+                        "meta_info": {
+                            "finish_reason": {"type": "length"},
+                            "prompt_tokens": len(payload["input_ids"]),
+                            "completion_tokens": payload["sampling_params"]["max_new_tokens"],
+                        },
+                    }
+                )
+                + "\n\ndata: [DONE]\n"
             ).encode()
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(response)))
             self.end_headers()
             self.wfile.write(response)
@@ -410,11 +412,11 @@ def test_engine_warmup_uses_prefill_chunk_size_and_pins_each_worker(tmp_path):
         assert len(results) == 2
         assert (tmp_path / "warmup.json").exists()
         assert [request["headers"]["X-Worker-Instance-Id"] for request in requests] == ["10", "11"]
-        assert [request["payload"]["model"] for request in requests] == ["/shared/model", "/shared/model"]
-        assert [len(request["payload"]["prompt"]) for request in requests] == [7, 7]
-        assert [request["payload"]["max_tokens"] for request in requests] == [1, 1]
-        assert [request["payload"]["min_tokens"] for request in requests] == [1, 1]
-        assert [request["payload"]["ignore_eos"] for request in requests] == [True, True]
+        assert [len(request["payload"]["input_ids"]) for request in requests] == [7, 7]
+        assert [request["payload"]["sampling_params"]["max_new_tokens"] for request in requests] == [1, 1]
+        assert [request["payload"]["sampling_params"]["min_new_tokens"] for request in requests] == [1, 1]
+        assert [request["payload"]["sampling_params"]["ignore_eos"] for request in requests] == [True, True]
+        assert [request["payload"]["stream"] for request in requests] == [True, True]
     finally:
         server.shutdown()
 

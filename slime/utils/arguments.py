@@ -323,39 +323,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default="sglang",
                 choices=["sglang", "dynamo"],
-                help="Rollout inference backend. 'dynamo' uses Dynamo's KV-aware router and RLMixin engine routes.",
-            )
-            parser.add_argument(
-                "--dynamo-api-mode",
-                type=str,
-                default="completions",
-                choices=["completions", "responses"],
-                help="OpenAI-compatible API used by the core Dynamo rollout client.",
-            )
-            parser.add_argument(
-                "--dynamo-metadata-upload-url",
-                type=str,
-                default=None,
-                help="Optional fsspec URL prefix for Dynamo rollout metadata uploads.",
-            )
-            parser.add_argument(
-                "--dynamo-metadata-upload-format",
-                type=str,
-                default="msgpack",
-                choices=["json", "msgpack"],
-                help="Serialization format for Dynamo rollout metadata uploads.",
+                help="Rollout inference backend. 'dynamo' uses Dynamo's native SGLang Generate endpoint (ai-dynamo/dynamo#11640) and requires a single registered model.",
             )
             parser.add_argument(
                 "--dynamo-request-retries",
                 type=int,
                 default=3,
                 help="Maximum attempts for a Dynamo rollout request before any stream output is received.",
-            )
-            parser.add_argument(
-                "--dynamo-responses-store",
-                action="store_true",
-                default=False,
-                help="Store /v1/responses objects so callers can chain previous_response_id.",
             )
             parser.add_argument(
                 "--dynamo-router-mode",

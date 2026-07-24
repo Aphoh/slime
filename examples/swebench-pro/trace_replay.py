@@ -1,7 +1,7 @@
 """Deterministic SWE-agent trace replay helpers.
 
 The replay path uses a recorded agent trace to keep router ablations honest:
-real `/v1/completions` requests still go to Dynamo/SGLang, but environment
+real `/generate` requests still go to Dynamo/SGLang, but environment
 steps are mocked with the same tool durations and token-shape progression.
 """
 

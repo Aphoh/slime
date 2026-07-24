@@ -3,7 +3,6 @@ import copy
 import inspect
 import json
 import logging
-import os
 import time
 import uuid
 from argparse import Namespace
@@ -20,10 +19,8 @@ from slime.backends.sglang_utils.server_control import abort_servers_until_idle
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.dynamo_client import (
     DynamoGeneration,
-    apply_uploaded_metadata_to_sample,
-    build_dynamo_payload,
-    build_metadata_upload_url,
-    read_uploaded_metadata_async,
+    apply_dynamo_metadata_sequence_to_sample,
+    build_dynamo_generate_payload,
 )
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from slime.utils import http_utils
@@ -235,12 +232,6 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     return sample
 
 
-def _dynamo_metadata_settings(args: Namespace) -> tuple[str | None, str]:
-    upload_url = getattr(args, "dynamo_metadata_upload_url", None) or os.getenv("DYNAMO_METADATA_UPLOAD_URL") or os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_URL")
-    upload_format = getattr(args, "dynamo_metadata_upload_format", None) or os.getenv("DYNAMO_METADATA_UPLOAD_FORMAT") or os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT") or "msgpack"
-    return upload_url, upload_format
-
-
 def _update_sample_from_dynamo_generation(
     args: Namespace,
     sample: Sample,
@@ -263,37 +254,6 @@ def _update_sample_from_dynamo_generation(
         sample.loss_mask = base_loss_mask + [1] * len(generation.token_ids)
 
 
-async def _read_dynamo_metadata(
-    metadata_upload_url: str | None,
-    metadata_upload_format: str,
-    *,
-    required: bool,
-) -> dict[str, Any] | None:
-    if not metadata_upload_url:
-        return None
-    try:
-        return await asyncio.shield(read_uploaded_metadata_async(metadata_upload_url, metadata_upload_format))
-    except Exception:
-        if required:
-            raise
-        logger.exception("Failed to read Dynamo metadata upload at %s", metadata_upload_url)
-        return None
-
-
-def _record_dynamo_response_state(
-    sample: Sample,
-    generation: DynamoGeneration,
-    *,
-    reusable: bool,
-) -> None:
-    if generation.response_id:
-        sample.metadata["dynamo_response_id"] = generation.response_id
-    if reusable and generation.response_id:
-        sample.metadata["dynamo_previous_response_id"] = generation.response_id
-    else:
-        sample.metadata.pop("dynamo_previous_response_id", None)
-
-
 def _clear_task_cancellation(task: asyncio.Task) -> None:
     cancelling = getattr(task, "cancelling", None)
     uncancel = getattr(task, "uncancel", None)
@@ -304,10 +264,9 @@ def _clear_task_cancellation(task: asyncio.Task) -> None:
 
 
 async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
-    """Generate through Dynamo while retaining exact incremental token state."""
+    """Generate through Dynamo native SGLang ``/generate``."""
     state = GenerateState(args)
-    api_mode = getattr(args, "dynamo_api_mode", "completions")
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/{api_mode}"
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert sample.status in (Sample.Status.PENDING, Sample.Status.ABORTED), f"Sample status is {sample.status}"
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
@@ -336,69 +295,36 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
     state.active_dynamo_tasks.add(request_task)
 
     request_base_id = sample.session_id or f"rollout-{sample.group_index}-{sample.index}-{uuid.uuid4().hex}"
-    metadata_root, metadata_format = _dynamo_metadata_settings(args)
     retries = max(1, int(getattr(args, "dynamo_request_retries", 3)))
-    store_response = api_mode == "responses" and bool(getattr(args, "dynamo_responses_store", False) or sample.metadata.get("dynamo_previous_response_id"))
-    generation = DynamoGeneration(api_mode=api_mode)
-    metadata_upload_url: str | None = None
+    generation = DynamoGeneration()
     cancelled = False
     request_started_at = time.monotonic()
 
     try:
         for attempt in range(retries):
             request_id = f"{request_base_id}:try:{attempt}"
-            metadata_upload_url = build_metadata_upload_url(metadata_root, request_id) if metadata_root else None
-            payload = build_dynamo_payload(
-                api_mode=api_mode,
-                model=getattr(args, "hf_checkpoint", None) or "default",
+            payload = build_dynamo_generate_payload(
                 prompt_token_ids=token_ids,
-                response_input=sample.prompt if api_mode == "responses" else None,
-                previous_response_id=sample.metadata.get("dynamo_previous_response_id"),
-                store=store_response,
-                max_tokens=max_tokens,
-                temperature=sampling_params.get("temperature", 1.0),
-                top_p=sampling_params.get("top_p", 1.0),
-                top_k=sampling_params.get("top_k"),
-                stop=sampling_params.get("stop"),
-                stop_token_ids=sampling_params.get("stop_token_ids"),
-                min_tokens=sampling_params.get("min_tokens"),
-                ignore_eos=sampling_params.get("ignore_eos"),
-                seed=sampling_params.get("sampling_seed"),
-                skip_special_tokens=sampling_params.get("skip_special_tokens"),
-                no_stop_trim=sampling_params.get("no_stop_trim"),
-                spaces_between_special_tokens=sampling_params.get("spaces_between_special_tokens"),
-                stream=True,
-                return_logprobs=True,
-                metadata_upload_url=metadata_upload_url,
-                metadata_upload_format=metadata_format,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                return_routed_experts=bool(getattr(args, "use_rollout_routing_replay", False)),
             )
-            headers = {"x-request-id": request_id}
             saw_output = False
-            event_type: str | None = None
             try:
                 with trace_span(
                     sample,
                     "dynamo_generate",
-                    attrs={
-                        "api_mode": api_mode,
-                        "max_new_tokens": max_tokens,
-                        "prompt_len": len(token_ids),
-                    },
+                    attrs={"api": "sglang_native", "max_new_tokens": max_tokens, "prompt_len": len(token_ids)},
                 ):
-                    async with client.stream("POST", url, json=payload, headers=headers) as response:
+                    async with client.stream("POST", url, json=payload, headers={"x-request-id": request_id}) as response:
                         response.raise_for_status()
                         async for raw_line in response.aiter_lines():
-                            if not raw_line:
-                                continue
-                            if raw_line.startswith("event:"):
-                                event_type = raw_line[len("event:") :].strip()
-                                continue
-                            if not raw_line.startswith("data:"):
+                            if not raw_line or not raw_line.startswith("data:"):
                                 continue
                             data_str = raw_line[len("data:") :].strip()
                             if not data_str or data_str == "[DONE]":
                                 continue
-                            generation.consume_sse(event_type, json.loads(data_str))
+                            generation.consume_sse(json.loads(data_str))
                             saw_output = saw_output or bool(generation.token_ids or generation.text)
                             _update_sample_from_dynamo_generation(
                                 args,
@@ -411,7 +337,7 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
                                 base_log_probs=base_log_probs,
                                 base_loss_mask=base_loss_mask,
                             )
-                            if state.aborted and generation.finish_reason is None:
+                            if state.aborted and not generation.terminal_event_received:
                                 raise asyncio.CancelledError
                 break
             except asyncio.CancelledError:
@@ -424,41 +350,23 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
                 if saw_output or attempt + 1 >= retries:
                     raise
                 logger.exception(
-                    "Dynamo request failed before stream output; retrying attempt %d/%d",
+                    "Dynamo native Generate request failed before stream output; retrying attempt %d/%d",
                     attempt + 1,
                     retries,
                 )
                 await asyncio.sleep(min(2**attempt, 30))
 
-        state.active_dynamo_tasks.discard(request_task)
-        uploaded_metadata = None
-        if not cancelled:
-            if generation.terminal_event_received:
-                _clear_task_cancellation(request_task)
-            try:
-                uploaded_metadata = await _read_dynamo_metadata(
-                    metadata_upload_url,
-                    metadata_format,
-                    required=bool(metadata_upload_url),
-                )
-            except asyncio.CancelledError:
-                if not generation.terminal_event_received:
-                    raise
-                _clear_task_cancellation(request_task)
-                uploaded_metadata = await _read_dynamo_metadata(
-                    metadata_upload_url,
-                    metadata_format,
-                    required=bool(metadata_upload_url),
-                )
-        if uploaded_metadata is not None:
-            generation.apply_metadata(uploaded_metadata)
+        if generation.terminal_event_received:
+            _clear_task_cancellation(request_task)
         if cancelled:
             paired_prefix_len = min(len(generation.token_ids), len(generation.token_logprobs))
             generation.token_ids = generation.token_ids[:paired_prefix_len]
             generation.token_logprobs = generation.token_logprobs[:paired_prefix_len]
             generation.text = ""
         else:
-            generation.align_logprobs(required=bool(generation.token_ids))
+            if not generation.terminal_event_received:
+                raise RuntimeError("Dynamo native Generate stream ended without a finish reason")
+
         _update_sample_from_dynamo_generation(
             args,
             sample,
@@ -470,14 +378,8 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
             base_log_probs=base_log_probs,
             base_loss_mask=base_loss_mask,
         )
+        apply_dynamo_metadata_sequence_to_sample(sample, args, generation.metadata_sequence)
 
-        apply_uploaded_metadata_to_sample(sample, args, uploaded_metadata)
-
-        _record_dynamo_response_state(
-            sample,
-            generation,
-            reusable=(store_response and not cancelled and generation.terminal_event_received and generation.finish_reason in {"stop", "length"}),
-        )
         if cancelled:
             sample.status = Sample.Status.ABORTED
         elif generation.finish_reason == "stop":
@@ -489,24 +391,21 @@ async def _generate_dynamo(args: Namespace, sample: Sample, sampling_params: dic
         elif generation.finish_reason in {"abort", "cancelled", "failed"}:
             sample.status = Sample.Status.ABORTED
         else:
-            raise RuntimeError(f"Dynamo stream ended without a finish reason: {generation.finish_reason}")
+            raise RuntimeError(f"Dynamo stream ended with unsupported finish reason: {generation.finish_reason}")
 
         elapsed = time.monotonic() - request_started_at
         logger.info(
-            "[DYNAMO REQUEST] api=%s prompt_tokens=%d output_tokens=%d latency=%.3fs tok/s=%.1f finish=%s stop_reason=%s metadata_upload=%s",
-            api_mode,
+            "[DYNAMO REQUEST] api=sglang_native prompt_tokens=%d output_tokens=%d latency=%.3fs tok/s=%.1f finish=%s stop_reason=%s",
             len(token_ids),
             len(generation.token_ids),
             elapsed,
             len(generation.token_ids) / elapsed if elapsed > 0 else 0.0,
             generation.finish_reason,
             generation.stop_reason,
-            bool(uploaded_metadata),
         )
         return sample
     finally:
         state.active_dynamo_tasks.discard(request_task)
-
 
 @trace_function("generate_and_rm", target="sample")
 async def generate_and_rm(

@@ -18,10 +18,7 @@ from typing import Any
 
 import yaml
 
-from slime.rollout.dynamo_client import (
-    apply_uploaded_metadata_sequence_to_sample,
-    apply_uploaded_metadata_to_sample,
-)
+from slime.rollout.dynamo_client import apply_dynamo_metadata_sequence_to_sample
 
 from completions_direct_model import (
     GLM_TOOL_STOPS,
@@ -264,16 +261,13 @@ def _get_model(args) -> DirectCompletionsModel:
         config = DirectCompletionsConfig(
             base_url=base_url.rstrip("/"),
             tokenizer_path=args.hf_checkpoint,
-            api_mode=os.getenv("SWEPRO_DYNAMO_API_MODE", "completions").strip().lower(),
-            model=os.getenv("SWEPRO_MODEL", getattr(args, "hf_checkpoint", None) or "default"),
             max_tokens=_turn_max_tokens(args),
             temperature=float(getattr(args, "rollout_temperature", 1.0)),
             top_p=float(getattr(args, "rollout_top_p", 1.0)),
             top_k=getattr(args, "rollout_top_k", None),
             timeout=float(os.getenv("SWEPRO_REQUEST_TIMEOUT", "1800")),
             retries=int(os.getenv("SWEPRO_REQUEST_RETRIES", "5")),
-            metadata_upload_url=os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_URL"),
-            metadata_upload_format=os.getenv("SWEPRO_DYNAMO_METADATA_UPLOAD_FORMAT", "msgpack"),
+            return_routed_experts=bool(getattr(args, "use_rollout_routing_replay", False)),
         )
         _MODEL = DirectCompletionsModel(config)
     return _MODEL
@@ -734,9 +728,6 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
         metadata["trace_replay_source_instance_id"] = trace_replay_plan.instance_id
         metadata["trace_replay_turns"] = len(trace_replay_plan.turns)
     messages = _build_sweagent_messages(sample)
-    response_input: list[dict[str, Any]] = list(messages)
-    previous_response_id: str | None = None
-    response_ids: list[str] = []
     image_name = _metadata_image_name(metadata)
     session_id = None
     prompt_token_ids: list[int] = []
@@ -761,7 +752,6 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 base_commit=str(base_commit),
                 repo_name=str((metadata.get("sweagent") or {}).get("repo_name") or metadata.get("repo_name") or "app"),
                 sample=metadata.get("raw_row") or metadata,
-                agent_context=agent_context,
                 tool_events_zmq_endpoint=tool_events_zmq_endpoint,
             ),
             timeout=_session_call_timeout_s("start", 900.0),
@@ -887,10 +877,6 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 asyncio.to_thread(
                     model.complete_prompt_ids,
                     current_ids,
-                    trace_messages=messages,
-                    response_input=response_input,
-                    previous_response_id=previous_response_id,
-                    agent_context=agent_context,
                     x_request_id=request_id,
                     max_tokens=max_turn_tokens,
                     temperature=sampling_params.get("temperature", getattr(args, "rollout_temperature", 1.0)),
@@ -910,12 +896,8 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
             )
             content = result["content"]
             extra = result["extra"]
-            if extra.get("uploaded_metadata") is not None:
-                metadata.setdefault("_dynamo_uploaded_metadata", []).append(extra["uploaded_metadata"])
-            response_id = extra.get("response_id")
-            if response_id:
-                previous_response_id = str(response_id)
-                response_ids.append(previous_response_id)
+            if extra.get("dynamo_metadata"):
+                metadata.setdefault("_dynamo_metadata", []).extend(extra["dynamo_metadata"])
             generated_ids = list(extra.get("generated_token_ids") or [])
             generated_logprobs = list(extra.get("token_logprobs") or [])
             if len(generated_logprobs) < len(generated_ids):
@@ -1050,7 +1032,6 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                 )
                 observation_content = _format_observation(observation)
                 messages.append({"role": "tool", "name": "format_error", "content": observation_content})
-                response_input = [{"role": "user", "content": observation_content}]
                 observation_ids = _tool_observation_delta_ids(model, observation_content)
                 response_token_ids.extend(observation_ids)
                 loss_mask.extend([0] * len(observation_ids))
@@ -1145,14 +1126,6 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
                     "content": observation_content,
                 }
             )
-            tool_call_id = _tool_call_id(tool_call)
-            response_input = [
-                {
-                    "type": "function_call_output",
-                    "call_id": tool_call_id or f"swepro-turn-{turn}",
-                    "output": observation_content,
-                }
-            ]
             if replay_turn is not None:
                 observation_token_count = max(0, replay_turn.observation_tokens)
                 _append_untrainable_tokens(
@@ -1252,17 +1225,6 @@ async def _generate_sweagent_session(args, sample: Sample, sampling_params) -> S
             max_context_len=max_context,
         )
     finally:
-        for response_id in reversed(response_ids):
-            try:
-                await asyncio.to_thread(model.delete_response, response_id)
-            except Exception as delete_exc:
-                _agent_trace_log(
-                    "response_delete_error",
-                    trajectory_id=_trajectory_id(agent_context),
-                    response_id=response_id,
-                    error=repr(delete_exc),
-                )
-                logger.warning("failed to delete Dynamo response %s: %r", response_id, delete_exc)
         if session_id:
             try:
                 _agent_trace_log(
@@ -1354,8 +1316,8 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         for attempt in range(retries + 1):
             attempt_sample = sample if attempt == 0 else copy.deepcopy(original_sample)
             result = await _generate_sweagent_session(args, attempt_sample, sampling_params)
-            uploaded_metadata = result.metadata.pop("_dynamo_uploaded_metadata", None)
-            apply_uploaded_metadata_sequence_to_sample(result, args, uploaded_metadata)
+            dynamo_metadata = result.metadata.pop("_dynamo_metadata", None)
+            apply_dynamo_metadata_sequence_to_sample(result, args, dynamo_metadata)
             result.metadata["session_attempt"] = attempt + 1
             last_result = result
             retryable_error = _metadata(result).get("retryable_session_error")
@@ -1387,7 +1349,6 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         result = await asyncio.to_thread(
             model.query,
             messages,
-            agent_context=agent_context,
             x_request_id=llm_request_id(agent_context, turn=0),
             max_tokens=_turn_max_tokens(args, sampling_params),
             temperature=sampling_params.get("temperature", getattr(args, "rollout_temperature", 1.0)),
@@ -1460,7 +1421,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     sample.rollout_log_probs = rollout_log_probs
     sample.metadata = metadata
     sample.status = Sample.Status.TRUNCATED if context_truncated else _sample_status_for_finish_reason(extra.get("finish_reason") or "stop")
-    apply_uploaded_metadata_to_sample(sample, args, extra.get("uploaded_metadata"))
+    apply_dynamo_metadata_sequence_to_sample(sample, args, extra.get("dynamo_metadata"))
     return sample
 
 
