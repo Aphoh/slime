@@ -196,7 +196,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
 
         self.rollout_engines = None
-
+        self._cached_rollout_update_state = None
         self.rollout_data_postprocess = None
         if self.args.rollout_data_postprocess_path is not None:
             from slime.utils.misc import load_function
@@ -592,21 +592,38 @@ class MegatronTrainRayActor(TrainRayActor):
             return
 
         _t0 = _time.time()
+        allow_stale_rollouts = os.getenv("SLIME_ASYNC_ALLOW_STALE_ROLLOUTS", "0") == "1"
+        can_use_cached_rollout_state = (
+            allow_stale_rollouts
+            and not self.args.use_fault_tolerance
+            and self._cached_rollout_update_state is not None
+        )
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.recover_updatable_engines.remote())
             dist.barrier(group=get_gloo_group())
 
-        _get_engines_t0 = _time.time()
-        (
-            rollout_engines,
-            rollout_engine_lock,
-            num_new_engines,
-            engine_gpu_counts,
-            engine_gpu_offsets,
-            engine_parallel_configs,
-        ) = ray.get(self.rollout_manager.get_updatable_engines_and_lock.remote())
-        _get_engines_elapsed = _time.time() - _get_engines_t0
+        if can_use_cached_rollout_state:
+            (
+                rollout_engines,
+                rollout_engine_lock,
+                engine_gpu_counts,
+                engine_gpu_offsets,
+                engine_parallel_configs,
+            ) = self._cached_rollout_update_state
+            num_new_engines = 0
+            _get_engines_elapsed = 0.0
+        else:
+            _get_engines_t0 = _time.time()
+            (
+                rollout_engines,
+                rollout_engine_lock,
+                num_new_engines,
+                engine_gpu_counts,
+                engine_gpu_offsets,
+                engine_parallel_configs,
+            ) = ray.get(self.rollout_manager.get_updatable_engines_and_lock.remote())
+            _get_engines_elapsed = _time.time() - _get_engines_t0
 
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
 
@@ -614,17 +631,6 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 logger.info("No updatable SGLang engines are running; skip weight update.")
             return
-
-        _total_elapsed = _time.time() - _t0
-        if dist.get_rank() == 0:
-            logger.info(
-                f"[WEIGHT UPDATE OUTER] get_engines={_get_engines_elapsed:.3f}s | "
-                f"connect={_connect_elapsed:.3f}s | "
-                f"sync={_sync_elapsed:.3f}s | "
-                f"total={_total_elapsed:.3f}s | "
-                f"num_engines={len(rollout_engines)} | "
-                f"num_new={num_new_engines}"
-            )
 
         if reconnect_rollout_engines:
             self.wake_up()
@@ -640,6 +646,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 engine_gpu_counts=engine_gpu_counts,
                 engine_gpu_offsets=engine_gpu_offsets,
                 engine_parallel_configs=engine_parallel_configs,
+            )
+            self._cached_rollout_update_state = (
+                rollout_engines,
+                rollout_engine_lock,
+                engine_gpu_counts,
+                engine_gpu_offsets,
+                engine_parallel_configs,
             )
             dist.barrier(group=get_gloo_group())
             _connect_elapsed = _time.time() - _connect_t0
@@ -663,6 +676,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
+
+        _total_elapsed = _time.time() - _t0
+        if dist.get_rank() == 0:
+            logger.info(
+                f"[WEIGHT UPDATE OUTER] get_engines={_get_engines_elapsed:.3f}s | "
+                f"connect={_connect_elapsed:.3f}s | "
+                f"sync={_sync_elapsed:.3f}s | "
+                f"total={_total_elapsed:.3f}s | "
+                f"num_engines={len(rollout_engines)} | "
+                f"num_new={num_new_engines}"
+            )
 
         if reconnect_rollout_engines:
             self.sleep()
