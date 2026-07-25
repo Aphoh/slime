@@ -323,7 +323,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default="sglang",
                 choices=["sglang", "dynamo"],
-                help="Rollout inference backend. 'dynamo' uses Dynamo's native SGLang Generate endpoint (ai-dynamo/dynamo#11640) and requires a single registered model.",
+                help="Rollout inference backend. 'dynamo' uses Dynamo's native SGLang Generate endpoint (ai-dynamo/dynamo#11640) and requires a single registered model and DYN_SGLANG_ENABLE_GENERATE=1 on the frontend.",
             )
             parser.add_argument(
                 "--dynamo-request-retries",

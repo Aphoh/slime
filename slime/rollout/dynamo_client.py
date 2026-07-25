@@ -3,6 +3,8 @@
 The endpoint is provided by ai-dynamo/dynamo#11640. It is a streaming,
 token-in/token-out API: all rollout metadata needed by Slime travels in the
 SSE stream, so the client has no object-store or Dynamo-Python dependency.
+The Dynamo frontend must explicitly enable it with
+``DYN_SGLANG_ENABLE_GENERATE=1``.
 """
 
 import base64

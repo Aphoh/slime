@@ -7,7 +7,7 @@
 - **Model**: GLM-4.7-30B-A3B (30B total, 3B active, MoE with MLA). Model args: `scripts/models/glm4.7-30B-A3B.sh`. Conversion bridge: `slime/backends/megatron_utils/megatron_to_hf/glm4moe.py`. Existing code path exercises conversion — **do not re-implement**.
 - **Task**: SWE-bench Pro (731 instances; ~50% JS/TS, ~36% Python, ~10% Go). Upstream: `~/proj/SWE-bench_Pro-os` on the dev host; canonical eval runner is `swe_bench_pro_eval.py` (Modal-based — we'll replace Modal with an in-cluster runner).
 - **Agent scaffold**: SWE-agent (primary) or mini-swe-agent (fallback) with a small first-party Dynamo adapter that formats prompts locally and posts token IDs to Dynamo's native `/generate` endpoint. **Do not use LiteLLM.** Use the saved SWE-agent `.traj` `history` or mini-swe-agent `messages` as the source of truth for training tokens.
-- **Dynamo requirement**: the native SGLang `/generate` endpoint is stream-only and requires exactly one registered model; it returns token IDs, selected-token logprobs, and optional routed-expert metadata inline.
+- **Dynamo requirement**: set `DYN_SGLANG_ENABLE_GENERATE=1` on the frontend. The native SGLang `/generate` endpoint is otherwise disabled; when enabled, it is stream-only, requires exactly one registered model, and returns token IDs, selected-token logprobs, and optional routed-expert metadata inline.
 - **Hardware**: 2× 8×B200 nscale nodes (~192 vCPU, ~2 TiB RAM each). 16 B200s total. x86_64. No separate CPU pool — eval workers steal spare CPU on the GPU nodes.
 - **Scale**: ramp from 4–8 instances × 1 sample for smoke, then 16 instances × 1 sample, then 32 instances × 2 samples for the dev run. Keep eval concurrency low until CPU, Docker cache, and NCCL jitter are measured.
 
