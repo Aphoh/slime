@@ -156,6 +156,7 @@ class ExternalRolloutServer:
     update_weights: bool = True
     num_new_engines: int = 0
     server_groups: list = dataclasses.field(default_factory=list)
+    engine_parallel_configs: list[dict] = dataclasses.field(default_factory=list)
 
     @property
     def all_engines(self):
