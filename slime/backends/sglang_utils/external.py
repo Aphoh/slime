@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from slime.utils.misc import load_function
+
 logger = logging.getLogger(__name__)
 
 
@@ -122,13 +124,23 @@ def discover_external_engines(addrs: list[str], timeout: float = 30.0) -> list[E
 
 def apply_external_engine_info_to_args(args, logger=None) -> None:
     """Detect external engines and store the derived topology on ``args``."""
-    addrs = args.rollout_external_engine_addrs
-    if not addrs:
-        raise ValueError("apply_external_engine_info_to_args requires --rollout-external-engine-addrs.")
+    discovery_path = getattr(args, "rollout_external_engine_discovery_path", None)
+    if discovery_path is not None:
+        discovered = load_function(discovery_path)(args)
+        infos = [ExternalEngineInfo(**info) if isinstance(info, dict) else info for info in discovered]
+    else:
+        addrs = args.rollout_external_engine_addrs
+        if not addrs:
+            raise ValueError(
+                "External rollout requires --rollout-external-engine-addrs or "
+                "--rollout-external-engine-discovery-path."
+            )
+        infos = discover_external_engines(addrs)
 
-    infos = discover_external_engines(addrs)
     if not infos:
-        raise ValueError("--rollout-external-engine-addrs did not contain any engines.")
+        raise ValueError("External rollout engine discovery returned no engines.")
+    if not all(isinstance(info, ExternalEngineInfo) for info in infos):
+        raise TypeError("External rollout engine discovery must return ExternalEngineInfo objects or dictionaries.")
 
     args.rollout_external_engine_infos = [info.to_dict() for info in infos]
     args.rollout_num_engines = len(infos)
@@ -192,10 +204,20 @@ def external_engine_infos_from_args(args) -> list[ExternalEngineInfo]:
     return [ExternalEngineInfo(**info) if isinstance(info, dict) else info for info in raw_infos]
 
 
+def get_external_engine_class(args):
+    """Return the control actor class for externally managed engines."""
+    engine_class_path = getattr(args, "rollout_external_engine_class_path", None)
+    if engine_class_path is not None:
+        return load_function(engine_class_path)
+
+    from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+
+    return SGLangEngine
+
+
 def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, ExternalRolloutServer], list]:
     import ray
 
-    from slime.backends.sglang_utils.sglang_engine import SGLangEngine
     from slime.ray.utils import add_default_ray_env_vars
 
     infos = external_engine_infos_from_args(args)
@@ -207,7 +229,7 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
     engine_gpu_counts = []
     engine_gpu_offsets = []
     init_handles = []
-    RolloutRayActor = ray.remote(SGLangEngine)
+    RolloutRayActor = ray.remote(get_external_engine_class(args))
     gpu_offset = 0
     for rank, info in enumerate(infos):
         rollout_engine = RolloutRayActor.options(

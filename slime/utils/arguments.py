@@ -572,6 +572,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 nargs="+",
                 help="Address and ports of the external engines.",
             )
+            parser.add_argument(
+                "--rollout-external-engine-discovery-path",
+                type=str,
+                default=None,
+                help=(
+                    "Optional path to a synchronous function that discovers externally managed rollout engines. "
+                    "The function receives args and returns ExternalEngineInfo objects or equivalent dictionaries."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-external-engine-class-path",
+                type=str,
+                default=None,
+                help=(
+                    "Optional path to the control actor class used for externally managed rollout engines. "
+                    "The class must implement the SGLangEngine control interface used by the selected "
+                    "weight-update mode."
+                ),
+            )
             return parser
 
         def add_fault_tolerance_arguments(parser):
@@ -1891,7 +1910,9 @@ def slime_validate_args(args):
         )
         args.debug_train_only = True
 
-    args.rollout_external = args.rollout_external_engine_addrs is not None
+    args.rollout_external = (
+        args.rollout_external_engine_addrs is not None or args.rollout_external_engine_discovery_path is not None
+    )
 
     if args.rollout_external and not args.debug_train_only:
         apply_external_engine_info_to_args(args, logger=logger)
