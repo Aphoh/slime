@@ -8,7 +8,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from slime.backends.sglang_utils.external import apply_external_engine_info_to_args, discover_external_engines
+from slime.backends.sglang_utils import external
+from slime.backends.sglang_utils.external import (
+    apply_external_engine_info_to_args,
+    discover_external_engines,
+    get_external_engine_class,
+)
 from slime.utils.http_utils import get_rollout_num_engines
 
 NUM_GPUS = 0
@@ -130,6 +135,53 @@ def test_apply_external_engine_info_preserves_router_pd_flag(monkeypatch):
     assert args.router_pd_disaggregation is True
     assert args.rollout_num_gpus == 2
     assert args.rollout_num_engines == 1
+
+
+def test_apply_external_engine_info_uses_discovery_hook(monkeypatch):
+    args = Namespace(
+        rollout_external_engine_addrs=None,
+        rollout_external_engine_discovery_path="deployment.discover_engines",
+    )
+
+    def discover(received_args):
+        assert received_args is args
+        return [
+            {
+                "url": "http://worker:9000",
+                "host": "worker",
+                "port": 9000,
+                "worker_type": "regular",
+                "num_gpus": 2,
+                "server_info": {"tp_size": 2},
+            }
+        ]
+
+    def fake_load_function(path):
+        assert path == "deployment.discover_engines"
+        return discover
+
+    monkeypatch.setattr(external, "load_function", fake_load_function)
+
+    apply_external_engine_info_to_args(args)
+
+    assert args.rollout_num_engines == 1
+    assert args.rollout_num_gpus == 2
+    assert args.rollout_external_engine_infos[0]["url"] == "http://worker:9000"
+
+
+def test_get_external_engine_class_uses_control_actor_hook(monkeypatch):
+    class DeploymentControlActor:
+        pass
+
+    def fake_load_function(path):
+        assert path == "deployment.ControlActor"
+        return DeploymentControlActor
+
+    monkeypatch.setattr(external, "load_function", fake_load_function)
+
+    actor_class = get_external_engine_class(Namespace(rollout_external_engine_class_path="deployment.ControlActor"))
+
+    assert actor_class is DeploymentControlActor
 
 
 def test_apply_external_engine_info_requires_addrs():

@@ -133,6 +133,8 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size = 0
         self.pendings = set()
         self.aborted = False
+        self.streaming_generation = False
+        self.streaming_tasks = set()
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
@@ -340,14 +342,20 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1"):
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
+    if state.streaming_generation:
+        streaming_tasks = list(state.streaming_tasks)
+        for task in streaming_tasks:
+            task.cancel()
+        await asyncio.gather(*streaming_tasks, return_exceptions=True)
     else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
+        if parse(sglang_router.__version__) <= parse("0.2.1"):
+            response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+            urls = response["urls"]
+        else:
+            response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+            urls = [worker["url"] for worker in response["workers"]]
 
-    await abort_servers_until_idle(urls)
+        await abort_servers_until_idle(urls)
 
     # make sure all the pending tasks are finished
     count = 0
@@ -360,6 +368,10 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
             group = task.result()
+            if not all(sample.status == Sample.Status.ABORTED for sample in group):
+                continue
+            if not any(sample.response_length > 0 for sample in group):
+                continue
             for sample in group:
                 if sample.response and "start_rollout_id" not in sample.metadata:
                     sample.metadata["start_rollout_id"] = rollout_id
