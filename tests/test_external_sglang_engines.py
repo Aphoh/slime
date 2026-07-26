@@ -238,5 +238,11 @@ def test_apply_external_engine_info_requires_addrs():
         apply_external_engine_info_to_args(args)
 
 
+def test_external_rollout_server_has_neutral_parallel_config():
+    server = external.ExternalRolloutServer(engines=[], engine_gpu_counts=[], engine_gpu_offsets=[])
+
+    assert server.engine_parallel_configs == []
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
