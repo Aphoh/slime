@@ -219,6 +219,7 @@ def make_slime_validate_args(**overrides):
         save_debug_train_data=None,
         load_debug_rollout_data=None,
         rollout_external_engine_addrs=None,
+        rollout_external_engine_discovery_path=None,
         debug_train_only=False,
         actor_num_gpus_per_node=8,
         actor_num_nodes=1,
@@ -345,6 +346,29 @@ def test_update_weight_delta_requires_local_checkpoint_dir(monkeypatch):
 
     with pytest.raises(ValueError, match="requires --update-weight-local-checkpoint-dir"):
         module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_external_debug_rollout_does_not_allocate_train_gpus(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+
+    def discover_external_engine(args, logger=None):
+        args.rollout_num_gpus = 2
+
+    module.apply_external_engine_info_to_args = discover_external_engine
+    args = make_slime_validate_args(
+        rollout_external_engine_discovery_path="deployment.discover_engines",
+        debug_rollout_only=True,
+    )
+
+    module.slime_validate_args(args)
+
+    assert args.rollout_external is True
+    assert args.rollout_num_gpus == 2
+    assert args.actor_num_gpus_per_node == 0
+    assert args.actor_num_nodes == 0
+    assert args.critic_num_gpus_per_node == 0
+    assert args.critic_num_nodes == 0
 
 
 if __name__ == "__main__":
