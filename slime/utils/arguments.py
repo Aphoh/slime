@@ -573,6 +573,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Address and ports of the external engines.",
             )
             parser.add_argument(
+                "--rollout-external-engine-api-prefix",
+                type=str,
+                default="",
+                help="Optional per-worker control API prefix, for example /engine.",
+            )
+            parser.add_argument(
+                "--rollout-external-rollout-url",
+                type=str,
+                default=None,
+                help="Optional shared rollout endpoint. When set, Slime sends /generate there instead of starting a router.",
+            )
+            parser.add_argument(
                 "--rollout-external-engine-discovery-path",
                 type=str,
                 default=None,

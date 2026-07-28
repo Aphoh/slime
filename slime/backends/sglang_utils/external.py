@@ -22,6 +22,8 @@ class ExternalEngineInfo:
     num_gpus: int
     disaggregation_bootstrap_port: int | None = None
     server_info: dict = dataclasses.field(default_factory=dict)
+    engine_api_prefix: str = ""
+    rollout_url: str | None = None
 
     @property
     def is_pd_worker(self) -> bool:
@@ -61,6 +63,12 @@ def normalize_external_engine_addr(addr: str) -> str:
     return addr
 
 
+def engine_control_url(url: str, engine_api_prefix: str, method: str) -> str:
+    """Build a per-worker SGLang control URL."""
+    prefix = engine_api_prefix.strip("/")
+    return "{}/{}{}".format(url.rstrip("/"), prefix + "/" if prefix else "", method)
+
+
 def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
     init_kwargs = {
         "dist_init_addr": f"{info.host}:{info.port}",
@@ -70,14 +78,17 @@ def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
     }
     if info.worker_type == "prefill":
         init_kwargs["disaggregation_bootstrap_port"] = info.disaggregation_bootstrap_port
+    if info.engine_api_prefix:
+        init_kwargs["engine_api_prefix"] = info.engine_api_prefix
     return init_kwargs
 
 
-def get_server_info(url: str, timeout: float = 30.0) -> dict:
+def get_server_info(url: str, engine_api_prefix: str = "", timeout: float = 30.0) -> dict:
     errors = []
-    for endpoint in ("/server_info", "/get_server_info"):
+    for method in ("server_info", "get_server_info"):
+        endpoint = engine_control_url(url, engine_api_prefix, method)
         try:
-            response = requests.get(f"{url}{endpoint}", timeout=timeout)
+            response = requests.get(endpoint, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except Exception as exc:
@@ -94,13 +105,15 @@ def _infer_worker_type(server_info: dict) -> str:
     return "regular"
 
 
-def discover_external_engines(addrs: list[str], timeout: float = 30.0) -> list[ExternalEngineInfo]:
+def discover_external_engines(
+    addrs: list[str], engine_api_prefix: str = "", rollout_url: str | None = None, timeout: float = 30.0
+) -> list[ExternalEngineInfo]:
     infos = []
     for addr in addrs:
         url = normalize_external_engine_addr(addr)
         parsed = urlparse(url)
         assert parsed.hostname is not None and parsed.port is not None
-        server_info = get_server_info(url, timeout=timeout)
+        server_info = get_server_info(url, engine_api_prefix=engine_api_prefix, timeout=timeout)
 
         pp_size = int(server_info.get("pp_size") or server_info.get("pipeline_parallel_size") or 1)
         tp_size = int(server_info.get("tp_size") or server_info.get("tensor_parallel_size") or 1)
@@ -115,6 +128,8 @@ def discover_external_engines(addrs: list[str], timeout: float = 30.0) -> list[E
                 port=parsed.port,
                 worker_type=_infer_worker_type(server_info),
                 num_gpus=num_gpus,
+                engine_api_prefix=engine_api_prefix,
+                rollout_url=normalize_external_engine_addr(rollout_url) if rollout_url else None,
                 disaggregation_bootstrap_port=bootstrap_port,
                 server_info=server_info,
             )
@@ -135,7 +150,11 @@ def apply_external_engine_info_to_args(args, logger=None) -> None:
                 "External rollout requires --rollout-external-engine-addrs or "
                 "--rollout-external-engine-discovery-path."
             )
-        infos = discover_external_engines(addrs)
+        infos = discover_external_engines(
+            addrs,
+            engine_api_prefix=getattr(args, "rollout_external_engine_api_prefix", ""),
+            rollout_url=getattr(args, "rollout_external_rollout_url", None),
+        )
 
     if not infos:
         raise ValueError("External rollout engine discovery returned no engines.")
@@ -216,13 +235,28 @@ def get_external_engine_class(args):
     return SGLangEngine
 
 
+def get_external_rollout_url(infos: list[ExternalEngineInfo]) -> str | None:
+    rollout_urls = {info.rollout_url for info in infos}
+    if rollout_urls == {None}:
+        return None
+    if None in rollout_urls or len(rollout_urls) != 1:
+        raise ValueError("External rollout engines must all use the same rollout_url, or none.")
+    return rollout_urls.pop()
+
+
 def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, ExternalRolloutServer], list]:
     import ray
 
     from slime.ray.utils import add_default_ray_env_vars
 
     infos = external_engine_infos_from_args(args)
-    router_ip, router_port = start_router(args, has_pd_disaggregation=any(info.is_pd_worker for info in infos))
+    rollout_url = get_external_rollout_url(infos)
+    if rollout_url is None:
+        router_ip, router_port = start_router(args, has_pd_disaggregation=any(info.is_pd_worker for info in infos))
+    else:
+        parsed = urlparse(rollout_url)
+        assert parsed.hostname is not None and parsed.port is not None
+        router_ip, router_port = parsed.hostname, parsed.port
     args.sglang_router_ip = router_ip
     args.sglang_router_port = router_port
 
@@ -248,13 +282,10 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
         engine_gpu_counts.append(info.num_gpus)
         engine_gpu_offsets.append(gpu_offset)
         gpu_offset += info.num_gpus
-        init_handles.append(
-            rollout_engine.init.remote(
-                **external_engine_init_kwargs(info),
-                router_ip=router_ip,
-                router_port=router_port,
-            )
-        )
+        init_kwargs = external_engine_init_kwargs(info)
+        if rollout_url is not None:
+            init_kwargs["register_to_router"] = False
+        init_handles.append(rollout_engine.init.remote(**init_kwargs, router_ip=router_ip, router_port=router_port))
 
     args.sglang_model_routers = {"default": (router_ip, router_port)}
     servers = {

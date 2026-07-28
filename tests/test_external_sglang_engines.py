@@ -20,6 +20,8 @@ from slime.backends.sglang_utils import external
 from slime.backends.sglang_utils.external import (
     apply_external_engine_info_to_args,
     discover_external_engines,
+    engine_control_url,
+    get_external_rollout_url,
     get_external_engine_class,
 >>>>>>> 0b31af6a (Support externally routed streaming rollouts)
 )
@@ -116,6 +118,35 @@ def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch):
 
     assert servers["default"].engine_parallel_configs == [{"tp_size": 4, "pp_size": 2, "ep_size": 4, "moe_dp_size": 2}]
     assert len(init_handles) == 1
+
+
+def test_discover_external_engines_uses_control_prefix_and_shared_rollout_url(monkeypatch):
+    def fake_get(url, timeout):
+        assert timeout == 30.0
+        assert url == "http://worker:9090/engine/server_info"
+        return _Response({"tp_size": 2})
+
+    monkeypatch.setattr("slime.backends.sglang_utils.external.requests.get", fake_get)
+
+    info = discover_external_engines(
+        ["worker:9090"], engine_api_prefix="/engine", rollout_url="http://frontend:8000"
+    )[0]
+
+    assert info.engine_api_prefix == "/engine"
+    assert info.rollout_url == "http://frontend:8000"
+    assert engine_control_url(info.url, info.engine_api_prefix, "flush_cache") == "http://worker:9090/engine/flush_cache"
+
+
+def test_get_external_rollout_url_requires_one_shared_frontend():
+    engine = external.ExternalEngineInfo("http://worker:9090", "worker", 9090, "regular", 1)
+    shared = external.ExternalEngineInfo(
+        "http://worker:9091", "worker", 9091, "regular", 1, rollout_url="http://frontend:8000"
+    )
+
+    assert get_external_rollout_url([engine]) is None
+    assert get_external_rollout_url([shared]) == "http://frontend:8000"
+    with pytest.raises(ValueError, match="same rollout_url"):
+        get_external_rollout_url([engine, shared])
 
 
 def test_apply_external_engine_info_handles_pd(monkeypatch):
