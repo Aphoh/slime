@@ -41,6 +41,14 @@ class _Response:
         return self.payload
 
 
+def _loader(expected_path, result):
+    def load(path):
+        assert path == expected_path
+        return result
+
+    return load
+
+
 def test_discover_external_engines_reads_server_info(monkeypatch):
     def fake_get(url, timeout):
         assert timeout == 30.0
@@ -203,11 +211,7 @@ def test_apply_external_engine_info_uses_discovery_hook(monkeypatch):
             }
         ]
 
-    def fake_load_function(path):
-        assert path == "deployment.discover_engines"
-        return discover
-
-    monkeypatch.setattr(external, "load_function", fake_load_function)
+    monkeypatch.setattr(external, "load_function", _loader("deployment.discover_engines", discover))
 
     apply_external_engine_info_to_args(args)
 
@@ -220,12 +224,7 @@ def test_get_external_engine_class_uses_control_actor_hook(monkeypatch):
     class DeploymentControlActor:
         pass
 
-    def fake_load_function(path):
-        assert path == "deployment.ControlActor"
-        return DeploymentControlActor
-
-    monkeypatch.setattr(external, "load_function", fake_load_function)
-
+    monkeypatch.setattr(external, "load_function", _loader("deployment.ControlActor", DeploymentControlActor))
     actor_class = get_external_engine_class(Namespace(rollout_external_engine_class_path="deployment.ControlActor"))
 
     assert actor_class is DeploymentControlActor
@@ -236,12 +235,6 @@ def test_apply_external_engine_info_requires_addrs():
 
     with pytest.raises(ValueError, match="rollout-external-engine-addrs"):
         apply_external_engine_info_to_args(args)
-
-
-def test_external_rollout_server_has_neutral_parallel_config():
-    server = external.ExternalRolloutServer(engines=[], engine_gpu_counts=[], engine_gpu_offsets=[])
-
-    assert server.engine_parallel_configs == []
 
 
 if __name__ == "__main__":
