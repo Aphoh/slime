@@ -1930,7 +1930,6 @@ def slime_validate_args(args):
         args.colocate = False
         args.offload_train = args.offload_rollout = False
 
-
     assert not (args.debug_rollout_only and args.debug_train_only), (
         "debug_rollout_only and debug_train_only cannot be set at the same time, " "please set only one of them."
     )

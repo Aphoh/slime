@@ -113,16 +113,22 @@ def test_discover_external_engines_uses_control_prefix_and_shared_rollout_url(mo
 
     monkeypatch.setattr("slime.backends.sglang_utils.external.requests.get", fake_get)
 
-    info = discover_external_engines(["worker:9090"], engine_api_prefix="/engine", rollout_url="http://frontend:8000")[0]
+    info = discover_external_engines(["worker:9090"], engine_api_prefix="/engine", rollout_url="http://frontend:8000")[
+        0
+    ]
 
     assert info.engine_api_prefix == "/engine"
     assert info.rollout_url == "http://frontend:8000"
-    assert engine_control_url(info.url, info.engine_api_prefix, "flush_cache") == "http://worker:9090/engine/flush_cache"
+    assert (
+        engine_control_url(info.url, info.engine_api_prefix, "flush_cache") == "http://worker:9090/engine/flush_cache"
+    )
 
 
 def test_get_external_rollout_url_requires_one_shared_frontend():
     engine = external.ExternalEngineInfo("http://worker:9090", "worker", 9090, "regular", 1)
-    shared = external.ExternalEngineInfo("http://worker:9091", "worker", 9091, "regular", 1, rollout_url="http://frontend:8000")
+    shared = external.ExternalEngineInfo(
+        "http://worker:9091", "worker", 9091, "regular", 1, rollout_url="http://frontend:8000"
+    )
 
     assert get_external_rollout_url([engine]) is None
     assert get_external_rollout_url([shared]) == "http://frontend:8000"
@@ -156,6 +162,8 @@ def test_apply_external_engine_info_handles_pd(monkeypatch):
     args = Namespace(
         rollout_external=True,
         rollout_external_engine_addrs=["prefill:10090", "decode:10091"],
+        rollout_external_engine_api_prefix="",
+        rollout_external_rollout_url=None,
         rollout_num_gpus=None,
         rollout_num_gpus_per_engine=1,
         sglang_pipeline_parallel_size=1,
@@ -193,6 +201,8 @@ def test_apply_external_engine_info_preserves_router_pd_flag(monkeypatch):
     args = Namespace(
         rollout_external=True,
         rollout_external_engine_addrs=["regular:10090"],
+        rollout_external_engine_api_prefix="",
+        rollout_external_rollout_url=None,
         router_pd_disaggregation=True,
     )
 

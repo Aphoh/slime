@@ -26,7 +26,8 @@ except ImportError:
         ProcessorMixin=object,
     )
 
-from slime.rollout import sglang_rollout, sglang_streaming_rollout as streaming
+from slime.rollout import sglang_rollout
+from slime.rollout import sglang_streaming_rollout as streaming
 from slime.rollout.streaming_utils import merge_stream_chunk
 from slime.utils.types import Sample
 
@@ -174,8 +175,7 @@ def test_partial_abort_buffers_only_nonempty_fully_aborted_groups(monkeypatch):
             streaming_generation=True,
             streaming_tasks=set(),
             pendings={
-                asyncio.create_task(asyncio.sleep(0, result=group))
-                for group in ([partial], [terminal], [empty])
+                asyncio.create_task(asyncio.sleep(0, result=group)) for group in ([partial], [terminal], [empty])
             },
         )
         monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)

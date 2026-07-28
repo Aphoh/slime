@@ -8,7 +8,6 @@ from urllib.parse import urlparse
 
 import requests
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -55,7 +54,9 @@ def normalize_external_engine_addr(addr: str) -> str:
     addr = addr.rstrip("/")
     parsed = urlparse(addr)
     if parsed.scheme != "http" or parsed.hostname is None or parsed.port is None:
-        raise ValueError(f"Invalid external SGLang engine address {addr!r}. Use host:port or http://host:port (IPv6 must be bracketed).")
+        raise ValueError(
+            f"Invalid external SGLang engine address {addr!r}. Use host:port or http://host:port (IPv6 must be bracketed)."
+        )
     return addr
 
 
@@ -101,7 +102,9 @@ def _infer_worker_type(server_info: dict) -> str:
     return "regular"
 
 
-def discover_external_engines(addrs: list[str], engine_api_prefix: str = "", rollout_url: str | None = None, timeout: float = 30.0) -> list[ExternalEngineInfo]:
+def discover_external_engines(
+    addrs: list[str], engine_api_prefix: str = "", rollout_url: str | None = None, timeout: float = 30.0
+) -> list[ExternalEngineInfo]:
     infos = []
     for addr in addrs:
         url = normalize_external_engine_addr(addr)
@@ -138,8 +141,8 @@ def apply_external_engine_info_to_args(args, logger=None) -> None:
         raise ValueError("External rollout requires --rollout-external-engine-addrs.")
     infos = discover_external_engines(
         addrs,
-        engine_api_prefix=getattr(args, "rollout_external_engine_api_prefix", ""),
-        rollout_url=getattr(args, "rollout_external_rollout_url", None),
+        engine_api_prefix=args.rollout_external_engine_api_prefix,
+        rollout_url=args.rollout_external_rollout_url,
     )
 
     if not infos:
@@ -203,7 +206,9 @@ class ExternalRolloutServer:
 def external_engine_infos_from_args(args) -> list[ExternalEngineInfo]:
     raw_infos = getattr(args, "rollout_external_engine_infos", None)
     if raw_infos is None:
-        raise RuntimeError("External rollout engine info is missing. apply_external_engine_info_to_args must run before starting external rollout servers.")
+        raise RuntimeError(
+            "External rollout engine info is missing. apply_external_engine_info_to_args must run before starting external rollout servers."
+        )
     return [ExternalEngineInfo(**info) if isinstance(info, dict) else info for info in raw_infos]
 
 
@@ -219,8 +224,8 @@ def get_external_rollout_url(infos: list[ExternalEngineInfo]) -> str | None:
 def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, ExternalRolloutServer], list]:
     import ray
 
-    from slime.ray.utils import add_default_ray_env_vars
     from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+    from slime.ray.utils import add_default_ray_env_vars
 
     infos = external_engine_infos_from_args(args)
     rollout_url = get_external_rollout_url(infos)
