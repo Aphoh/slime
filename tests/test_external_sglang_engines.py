@@ -9,21 +9,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-<<<<<<< HEAD
+from slime.backends.sglang_utils import external
 from slime.backends.sglang_utils.external import (
     ExternalEngineInfo,
     apply_external_engine_info_to_args,
     discover_external_engines,
-    start_external_rollout_servers,
-=======
-from slime.backends.sglang_utils import external
-from slime.backends.sglang_utils.external import (
-    apply_external_engine_info_to_args,
-    discover_external_engines,
     engine_control_url,
     get_external_rollout_url,
-    get_external_engine_class,
->>>>>>> 0b31af6a (Support externally routed streaming rollouts)
+    start_external_rollout_servers,
 )
 from slime.utils.http_utils import get_rollout_num_engines
 
@@ -41,14 +34,6 @@ class _Response:
 
     def json(self):
         return self.payload
-
-
-def _loader(expected_path, result):
-    def load(path):
-        assert path == expected_path
-        return result
-
-    return load
 
 
 def test_discover_external_engines_reads_server_info(monkeypatch):
@@ -128,9 +113,7 @@ def test_discover_external_engines_uses_control_prefix_and_shared_rollout_url(mo
 
     monkeypatch.setattr("slime.backends.sglang_utils.external.requests.get", fake_get)
 
-    info = discover_external_engines(
-        ["worker:9090"], engine_api_prefix="/engine", rollout_url="http://frontend:8000"
-    )[0]
+    info = discover_external_engines(["worker:9090"], engine_api_prefix="/engine", rollout_url="http://frontend:8000")[0]
 
     assert info.engine_api_prefix == "/engine"
     assert info.rollout_url == "http://frontend:8000"
@@ -139,9 +122,7 @@ def test_discover_external_engines_uses_control_prefix_and_shared_rollout_url(mo
 
 def test_get_external_rollout_url_requires_one_shared_frontend():
     engine = external.ExternalEngineInfo("http://worker:9090", "worker", 9090, "regular", 1)
-    shared = external.ExternalEngineInfo(
-        "http://worker:9091", "worker", 9091, "regular", 1, rollout_url="http://frontend:8000"
-    )
+    shared = external.ExternalEngineInfo("http://worker:9091", "worker", 9091, "regular", 1, rollout_url="http://frontend:8000")
 
     assert get_external_rollout_url([engine]) is None
     assert get_external_rollout_url([shared]) == "http://frontend:8000"
@@ -221,44 +202,6 @@ def test_apply_external_engine_info_preserves_router_pd_flag(monkeypatch):
     assert args.router_pd_disaggregation is True
     assert args.rollout_num_gpus == 2
     assert args.rollout_num_engines == 1
-
-
-def test_apply_external_engine_info_uses_discovery_hook(monkeypatch):
-    args = Namespace(
-        rollout_external_engine_addrs=None,
-        rollout_external_engine_discovery_path="deployment.discover_engines",
-    )
-
-    def discover(received_args):
-        assert received_args is args
-        return [
-            {
-                "url": "http://worker:9000",
-                "host": "worker",
-                "port": 9000,
-                "worker_type": "regular",
-                "num_gpus": 2,
-                "server_info": {"tp_size": 2},
-            }
-        ]
-
-    monkeypatch.setattr(external, "load_function", _loader("deployment.discover_engines", discover))
-
-    apply_external_engine_info_to_args(args)
-
-    assert args.rollout_num_engines == 1
-    assert args.rollout_num_gpus == 2
-    assert args.rollout_external_engine_infos[0]["url"] == "http://worker:9000"
-
-
-def test_get_external_engine_class_uses_control_actor_hook(monkeypatch):
-    class DeploymentControlActor:
-        pass
-
-    monkeypatch.setattr(external, "load_function", _loader("deployment.ControlActor", DeploymentControlActor))
-    actor_class = get_external_engine_class(Namespace(rollout_external_engine_class_path="deployment.ControlActor"))
-
-    assert actor_class is DeploymentControlActor
 
 
 def test_apply_external_engine_info_requires_addrs():
