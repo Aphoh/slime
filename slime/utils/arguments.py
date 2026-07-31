@@ -573,12 +573,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Control base URLs of the external engines, optionally including a path prefix.",
             )
             parser.add_argument(
-                "--rollout-external-engine-discovery-path",
+                "--rollout-external-dynamic-discovery-path",
                 type=str,
                 default=None,
                 help=(
-                    "Optional path to a synchronous function that receives args and returns a list of external "
-                    "engine control base URLs."
+                    "Optional path to a synchronous function called before every weight update. It receives args "
+                    "and returns the current external engine control base URLs."
                 ),
             )
             parser.add_argument(
@@ -1907,7 +1907,8 @@ def slime_validate_args(args):
         args.debug_train_only = True
 
     args.rollout_external = (
-        args.rollout_external_engine_addrs is not None or args.rollout_external_engine_discovery_path is not None
+        args.rollout_external_engine_addrs is not None
+        or getattr(args, "rollout_external_dynamic_discovery_path", None) is not None
     )
 
     if args.rollout_external and not args.debug_train_only:

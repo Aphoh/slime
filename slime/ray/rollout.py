@@ -638,6 +638,11 @@ class RolloutManager:
         for srv in self.servers.values():
             srv.onload_kv()
 
+    def refresh_updatable_engines(self):
+        """Refresh dynamic external-engine membership before the next weight update."""
+        srv = self._get_updatable_server()
+        return srv.refresh() if srv else False
+
     def recover_updatable_engines(self):
         """Restart dead updatable rollout engines before the next weight update.
 
@@ -655,7 +660,7 @@ class RolloutManager:
         # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights
         srv = self._get_updatable_server()
         if srv:
-            srv.num_new_engines = 0
+            srv.clear_num_new_engines()
 
     def health_monitoring_pause(self) -> None:
         for monitor in self._health_monitors:

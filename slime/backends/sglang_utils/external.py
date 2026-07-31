@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from itertools import accumulate
 from urllib.parse import urlparse
 
 import requests
@@ -133,27 +134,33 @@ def discover_external_engines(
 
 
 def external_engine_addrs_from_args(args) -> list[str]:
-    """Return external-engine control base URLs from the CLI or a discovery plugin."""
-    if args.rollout_external_engine_discovery_path:
-        addrs = load_function(args.rollout_external_engine_discovery_path)(args)
+    """Return external-engine control base URLs from the CLI or dynamic discovery."""
+    dynamic_discovery_path = getattr(args, "rollout_external_dynamic_discovery_path", None)
+    if dynamic_discovery_path:
+        addrs = load_function(dynamic_discovery_path)(args)
     else:
         addrs = args.rollout_external_engine_addrs
 
     if not addrs:
         raise ValueError(
-            "External rollout requires --rollout-external-engine-addrs or " "--rollout-external-engine-discovery-path."
+            "External rollout requires --rollout-external-engine-addrs or "
+            "--rollout-external-dynamic-discovery-path."
         )
     if not all(isinstance(addr, str) for addr in addrs):
         raise TypeError("External engine discovery must return a list of control base URLs.")
     return addrs
 
 
-def apply_external_engine_info_to_args(args, logger=None) -> None:
-    """Detect external engines and store the derived topology on ``args``."""
-    infos = discover_external_engines(
+def discover_external_engine_infos(args) -> list[ExternalEngineInfo]:
+    return discover_external_engines(
         external_engine_addrs_from_args(args),
         rollout_url=args.rollout_external_rollout_url,
     )
+
+
+def apply_external_engine_info_to_args(args, logger=None) -> None:
+    """Detect external engines and store the derived topology on ``args``."""
+    infos = discover_external_engine_infos(args)
 
     if not infos:
         raise ValueError("External rollout engine discovery returned no engines.")
@@ -177,6 +184,53 @@ def apply_external_engine_info_to_args(args, logger=None) -> None:
         logger.info(f"Detected external SGLang engines: {summary}")
 
 
+def _topology_signature(infos: list[ExternalEngineInfo]) -> tuple:
+    """Return fields that require a new control/NCCL membership when changed."""
+    return tuple(
+        sorted(
+            (
+                info.url,
+                info.worker_type,
+                info.num_gpus,
+                info.disaggregation_bootstrap_port,
+                info.server_info.get("tp_size"),
+                info.server_info.get("pp_size"),
+                info.server_info.get("dp_size"),
+                info.server_info.get("ep_size"),
+            )
+            for info in infos
+        )
+    )
+
+
+def _start_external_engine_actors(args, infos, router_ip, router_port, *, register_to_router):
+    import ray
+
+    from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+    from slime.ray.utils import add_default_ray_env_vars
+
+    engines = []
+    init_handles = []
+    RolloutRayActor = ray.remote(SGLangEngine)
+    for rank, info in enumerate(infos):
+        rollout_engine = RolloutRayActor.options(
+            num_cpus=0.2,
+            num_gpus=0,
+            runtime_env={"env_vars": add_default_ray_env_vars()},
+        ).remote(
+            args=args,
+            rank=rank,
+            worker_type=info.worker_type,
+            base_gpu_id=0,
+            num_gpus_per_engine=info.num_gpus,
+        )
+        init_kwargs = external_engine_init_kwargs(info)
+        init_kwargs["register_to_router"] = register_to_router
+        init_handles.append(rollout_engine.init.remote(**init_kwargs, router_ip=router_ip, router_port=router_port))
+        engines.append(rollout_engine)
+    return engines, init_handles
+
+
 @dataclasses.dataclass
 class ExternalRolloutServer:
     """Rollout server backed by pre-launched external SGLang engines."""
@@ -184,18 +238,63 @@ class ExternalRolloutServer:
     engines: list
     engine_gpu_counts: list[int]
     engine_gpu_offsets: list[int]
-    engine_parallel_configs: list[dict[str, int]]
+    args: object
+    engine_infos: list[ExternalEngineInfo]
+    register_to_router: bool
     router_ip: str | None = None
     router_port: int | None = None
     model_name: str = "default"
     update_weights: bool = True
     num_new_engines: int = 0
+    retired_engines: list = dataclasses.field(default_factory=list)
     server_groups: list = dataclasses.field(default_factory=list)
     engine_parallel_configs: list[dict] = dataclasses.field(default_factory=list)
 
     @property
     def all_engines(self):
         return self.engines
+
+    def refresh(self) -> bool:
+        """Refresh dynamic external-engine membership before a weight update."""
+        if not getattr(self.args, "rollout_external_dynamic_discovery_path", None):
+            return False
+
+        infos = discover_external_engine_infos(self.args)
+        if _topology_signature(infos) == _topology_signature(self.engine_infos):
+            return False
+
+        engines, init_handles = _start_external_engine_actors(
+            self.args,
+            infos,
+            self.router_ip,
+            self.router_port,
+            register_to_router=self.register_to_router,
+        )
+        if init_handles:
+            import ray
+
+            ray.get(init_handles)
+        self.retired_engines.extend(self.engines)
+        self.engines = engines
+        self.engine_gpu_counts = [info.num_gpus for info in infos]
+        self.engine_gpu_offsets = list(accumulate([0, *self.engine_gpu_counts[:-1]]))
+        self.engine_parallel_configs = [info.parallel_config for info in infos]
+        self.engine_infos = infos
+        self.num_new_engines = len(engines)
+        self.args.rollout_external_engine_infos = [info.to_dict() for info in infos]
+        self.args.rollout_num_engines = len(infos)
+        self.args.rollout_num_gpus = sum(self.engine_gpu_counts)
+        logger.info("Refreshed external rollout engines: %s", [info.url for info in infos])
+        return True
+
+    def clear_num_new_engines(self) -> None:
+        self.num_new_engines = 0
+        if self.retired_engines:
+            import ray
+
+            for engine in self.retired_engines:
+                ray.kill(engine, no_restart=True)
+            self.retired_engines.clear()
 
     def recover(self):
         logger.warning("Fault tolerance is not supported for external rollout engines; skip recover.")
@@ -232,13 +331,10 @@ def get_external_rollout_url(infos: list[ExternalEngineInfo]) -> str | None:
 
 
 def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, ExternalRolloutServer], list]:
-    import ray
-
-    from slime.backends.sglang_utils.sglang_engine import SGLangEngine
-    from slime.ray.utils import add_default_ray_env_vars
-
     infos = external_engine_infos_from_args(args)
     rollout_url = get_external_rollout_url(infos)
+    if getattr(args, "rollout_external_dynamic_discovery_path", None) and rollout_url is None:
+        raise ValueError("--rollout-external-dynamic-discovery-path requires --rollout-external-rollout-url.")
     if rollout_url is None:
         router_ip, router_port = start_router(args, has_pd_disaggregation=any(info.is_pd_worker for info in infos))
     else:
@@ -248,33 +344,15 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
     args.sglang_router_ip = router_ip
     args.sglang_router_port = router_port
 
-    engines = []
-    engine_gpu_counts = []
-    engine_gpu_offsets = []
-    init_handles = []
-    RolloutRayActor = ray.remote(SGLangEngine)
-    gpu_offset = 0
-    for rank, info in enumerate(infos):
-        rollout_engine = RolloutRayActor.options(
-            num_cpus=0.2,
-            num_gpus=0,
-            runtime_env={"env_vars": add_default_ray_env_vars()},
-        ).remote(
-            args=args,
-            rank=rank,
-            worker_type=info.worker_type,
-            base_gpu_id=0,
-            num_gpus_per_engine=info.num_gpus,
-        )
-        engines.append(rollout_engine)
-        engine_gpu_counts.append(info.num_gpus)
-        engine_gpu_offsets.append(gpu_offset)
-        gpu_offset += info.num_gpus
-        init_kwargs = external_engine_init_kwargs(info)
-        if rollout_url is not None:
-            init_kwargs["register_to_router"] = False
-        init_handles.append(rollout_engine.init.remote(**init_kwargs, router_ip=router_ip, router_port=router_port))
-
+    engines, init_handles = _start_external_engine_actors(
+        args,
+        infos,
+        router_ip,
+        router_port,
+        register_to_router=rollout_url is None,
+    )
+    engine_gpu_counts = [info.num_gpus for info in infos]
+    engine_gpu_offsets = list(accumulate([0, *engine_gpu_counts[:-1]]))
     args.sglang_model_routers = {"default": (router_ip, router_port)}
     servers = {
         "default": ExternalRolloutServer(
@@ -282,6 +360,9 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
             engine_gpu_counts=engine_gpu_counts,
             engine_gpu_offsets=engine_gpu_offsets,
             engine_parallel_configs=[info.parallel_config for info in infos],
+            args=args,
+            engine_infos=infos,
+            register_to_router=rollout_url is None,
             router_ip=router_ip,
             router_port=router_port,
             model_name="default",
