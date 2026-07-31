@@ -15,6 +15,7 @@ from slime.backends.sglang_utils.external import (
     apply_external_engine_info_to_args,
     discover_external_engines,
     engine_control_url,
+    external_engine_init_kwargs,
     get_external_rollout_url,
     start_external_rollout_servers,
 )
@@ -105,7 +106,7 @@ def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch):
     assert len(init_handles) == 1
 
 
-def test_discover_external_engines_uses_control_prefix_and_shared_rollout_url(monkeypatch):
+def test_discover_external_engines_uses_control_base_url_and_shared_rollout_url(monkeypatch):
     def fake_get(url, timeout):
         assert timeout == 30.0
         assert url == "http://worker:9090/engine/server_info"
@@ -113,15 +114,33 @@ def test_discover_external_engines_uses_control_prefix_and_shared_rollout_url(mo
 
     monkeypatch.setattr("slime.backends.sglang_utils.external.requests.get", fake_get)
 
-    info = discover_external_engines(["worker:9090"], engine_api_prefix="/engine", rollout_url="http://frontend:8000")[
-        0
-    ]
+    info = discover_external_engines(["worker:9090/engine"], rollout_url="http://frontend:8000")[0]
 
-    assert info.engine_api_prefix == "/engine"
+    assert info.url == "http://worker:9090/engine"
     assert info.rollout_url == "http://frontend:8000"
-    assert (
-        engine_control_url(info.url, info.engine_api_prefix, "flush_cache") == "http://worker:9090/engine/flush_cache"
+    assert external_engine_init_kwargs(info)["control_url"] == "http://worker:9090/engine"
+    assert engine_control_url(info.url, "flush_cache") == "http://worker:9090/engine/flush_cache"
+
+
+def test_apply_external_engine_info_uses_discovery_control_base_urls(monkeypatch):
+    monkeypatch.setattr(external, "load_function", lambda path: lambda args: ["worker:9090/engine"])
+
+    def fake_get(url, timeout):
+        assert url == "http://worker:9090/engine/server_info"
+        return _Response({"tp_size": 2})
+
+    monkeypatch.setattr("slime.backends.sglang_utils.external.requests.get", fake_get)
+    args = Namespace(
+        rollout_external_engine_addrs=None,
+        rollout_external_engine_discovery_path="example.discover",
+        rollout_external_rollout_url="http://frontend:8000",
     )
+
+    apply_external_engine_info_to_args(args)
+
+    assert args.rollout_external_engine_infos[0]["url"] == "http://worker:9090/engine"
+    assert args.rollout_external_engine_infos[0]["host"] == "worker"
+    assert args.rollout_external_engine_infos[0]["port"] == 9090
 
 
 def test_get_external_rollout_url_requires_one_shared_frontend():
@@ -162,7 +181,7 @@ def test_apply_external_engine_info_handles_pd(monkeypatch):
     args = Namespace(
         rollout_external=True,
         rollout_external_engine_addrs=["prefill:10090", "decode:10091"],
-        rollout_external_engine_api_prefix="",
+        rollout_external_engine_discovery_path=None,
         rollout_external_rollout_url=None,
         rollout_num_gpus=None,
         rollout_num_gpus_per_engine=1,
@@ -201,7 +220,7 @@ def test_apply_external_engine_info_preserves_router_pd_flag(monkeypatch):
     args = Namespace(
         rollout_external=True,
         rollout_external_engine_addrs=["regular:10090"],
-        rollout_external_engine_api_prefix="",
+        rollout_external_engine_discovery_path=None,
         rollout_external_rollout_url=None,
         router_pd_disaggregation=True,
     )
@@ -214,10 +233,10 @@ def test_apply_external_engine_info_preserves_router_pd_flag(monkeypatch):
     assert args.rollout_num_engines == 1
 
 
-def test_apply_external_engine_info_requires_addrs():
-    args = Namespace(rollout_external_engine_addrs=None)
+def test_apply_external_engine_info_requires_addrs_or_discovery():
+    args = Namespace(rollout_external_engine_addrs=None, rollout_external_engine_discovery_path=None)
 
-    with pytest.raises(ValueError, match="rollout-external-engine-addrs"):
+    with pytest.raises(ValueError, match="rollout-external-engine-addrs or"):
         apply_external_engine_info_to_args(args)
 
 

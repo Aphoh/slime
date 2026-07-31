@@ -128,12 +128,11 @@ class SGLangEngine(RayActor):
         disaggregation_bootstrap_port=None,
         router_ip=None,
         router_port=None,
-        engine_api_prefix="",
+        control_url=None,
         register_to_router=True,
     ):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
-        self.engine_api_prefix = engine_api_prefix
         self.register_to_router = register_to_router
 
         host = host or get_host_info()[1]
@@ -169,6 +168,7 @@ class SGLangEngine(RayActor):
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        self.control_url = control_url.rstrip("/") if control_url else f"http://{self.server_host}:{self.server_port}"
 
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
@@ -186,9 +186,7 @@ class SGLangEngine(RayActor):
                     actual_value == expect_value
                 ), f"{name=} {expect_value=} {actual_value=} {expect_server_args=} {actual_server_args=}"
 
-        actual_server_args = get_server_info(
-            f"http://{self.server_host}:{self.server_port}", engine_api_prefix=self.engine_api_prefix
-        )
+        actual_server_args = get_server_info(self.control_url)
         _sanity_check_server_args(actual_server_args, expect_server_args)
         if self.register_to_router:
             self._register_to_router(expect_server_args)
@@ -245,7 +243,7 @@ class SGLangEngine(RayActor):
         return response.json()
 
     def _engine_control_url(self, method: str) -> str:
-        return engine_control_url(f"http://{self.server_host}:{self.server_port}", self.engine_api_prefix, method)
+        return engine_control_url(self.control_url, method)
 
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.

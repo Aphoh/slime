@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from slime.utils.misc import load_function
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,7 +22,6 @@ class ExternalEngineInfo:
     num_gpus: int
     disaggregation_bootstrap_port: int | None = None
     server_info: dict = dataclasses.field(default_factory=dict)
-    engine_api_prefix: str = ""
     rollout_url: str | None = None
 
     @property
@@ -60,10 +61,9 @@ def normalize_external_engine_addr(addr: str) -> str:
     return addr
 
 
-def engine_control_url(url: str, engine_api_prefix: str, method: str) -> str:
+def engine_control_url(url: str, method: str) -> str:
     """Build a per-worker SGLang control URL."""
-    prefix = engine_api_prefix.strip("/")
-    return "{}/{}{}".format(url.rstrip("/"), prefix + "/" if prefix else "", method)
+    return f"{url.rstrip('/')}/{method}"
 
 
 def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
@@ -72,18 +72,17 @@ def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
         "nccl_port": None,
         "host": info.host,
         "port": info.port,
+        "control_url": info.url,
     }
     if info.worker_type == "prefill":
         init_kwargs["disaggregation_bootstrap_port"] = info.disaggregation_bootstrap_port
-    if info.engine_api_prefix:
-        init_kwargs["engine_api_prefix"] = info.engine_api_prefix
     return init_kwargs
 
 
-def get_server_info(url: str, engine_api_prefix: str = "", timeout: float = 30.0) -> dict:
+def get_server_info(url: str, timeout: float = 30.0) -> dict:
     errors = []
     for method in ("server_info", "get_server_info"):
-        endpoint = engine_control_url(url, engine_api_prefix, method)
+        endpoint = engine_control_url(url, method)
         try:
             response = requests.get(endpoint, timeout=timeout)
             response.raise_for_status()
@@ -103,14 +102,14 @@ def _infer_worker_type(server_info: dict) -> str:
 
 
 def discover_external_engines(
-    addrs: list[str], engine_api_prefix: str = "", rollout_url: str | None = None, timeout: float = 30.0
+    addrs: list[str], rollout_url: str | None = None, timeout: float = 30.0
 ) -> list[ExternalEngineInfo]:
     infos = []
     for addr in addrs:
         url = normalize_external_engine_addr(addr)
         parsed = urlparse(url)
         assert parsed.hostname is not None and parsed.port is not None
-        server_info = get_server_info(url, engine_api_prefix=engine_api_prefix, timeout=timeout)
+        server_info = get_server_info(url, timeout=timeout)
 
         pp_size = int(server_info.get("pp_size") or server_info.get("pipeline_parallel_size") or 1)
         tp_size = int(server_info.get("tp_size") or server_info.get("tensor_parallel_size") or 1)
@@ -125,7 +124,6 @@ def discover_external_engines(
                 port=parsed.port,
                 worker_type=_infer_worker_type(server_info),
                 num_gpus=num_gpus,
-                engine_api_prefix=engine_api_prefix,
                 rollout_url=normalize_external_engine_addr(rollout_url) if rollout_url else None,
                 disaggregation_bootstrap_port=bootstrap_port,
                 server_info=server_info,
@@ -134,14 +132,26 @@ def discover_external_engines(
     return infos
 
 
+def external_engine_addrs_from_args(args) -> list[str]:
+    """Return external-engine control base URLs from the CLI or a discovery plugin."""
+    if args.rollout_external_engine_discovery_path:
+        addrs = load_function(args.rollout_external_engine_discovery_path)(args)
+    else:
+        addrs = args.rollout_external_engine_addrs
+
+    if not addrs:
+        raise ValueError(
+            "External rollout requires --rollout-external-engine-addrs or " "--rollout-external-engine-discovery-path."
+        )
+    if not all(isinstance(addr, str) for addr in addrs):
+        raise TypeError("External engine discovery must return a list of control base URLs.")
+    return addrs
+
+
 def apply_external_engine_info_to_args(args, logger=None) -> None:
     """Detect external engines and store the derived topology on ``args``."""
-    addrs = args.rollout_external_engine_addrs
-    if not addrs:
-        raise ValueError("External rollout requires --rollout-external-engine-addrs.")
     infos = discover_external_engines(
-        addrs,
-        engine_api_prefix=args.rollout_external_engine_api_prefix,
+        external_engine_addrs_from_args(args),
         rollout_url=args.rollout_external_rollout_url,
     )
 

@@ -570,13 +570,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 nargs="+",
-                help="Address and ports of the external engines.",
+                help="Control base URLs of the external engines, optionally including a path prefix.",
             )
             parser.add_argument(
-                "--rollout-external-engine-api-prefix",
+                "--rollout-external-engine-discovery-path",
                 type=str,
-                default="",
-                help="Optional per-worker control API prefix, for example /engine.",
+                default=None,
+                help=(
+                    "Optional path to a synchronous function that receives args and returns a list of external "
+                    "engine control base URLs."
+                ),
             )
             parser.add_argument(
                 "--rollout-external-rollout-url",
@@ -1903,7 +1906,9 @@ def slime_validate_args(args):
         )
         args.debug_train_only = True
 
-    args.rollout_external = args.rollout_external_engine_addrs is not None
+    args.rollout_external = (
+        args.rollout_external_engine_addrs is not None or args.rollout_external_engine_discovery_path is not None
+    )
 
     if args.rollout_external and not args.debug_train_only:
         apply_external_engine_info_to_args(args, logger=logger)
