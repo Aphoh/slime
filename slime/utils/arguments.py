@@ -1907,8 +1907,7 @@ def slime_validate_args(args):
         args.debug_train_only = True
 
     args.rollout_external = (
-        args.rollout_external_engine_addrs is not None
-        or getattr(args, "rollout_external_dynamic_discovery_path", None) is not None
+        args.rollout_external_engine_addrs is not None or args.rollout_external_dynamic_discovery_path is not None
     )
 
     if args.rollout_external and not args.debug_train_only:

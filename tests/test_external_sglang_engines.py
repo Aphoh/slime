@@ -16,7 +16,6 @@ from slime.backends.sglang_utils.external import (
     discover_external_engines,
     engine_control_url,
     external_engine_init_kwargs,
-    get_external_rollout_url,
     start_external_rollout_servers,
 )
 from slime.utils.http_utils import get_rollout_num_engines
@@ -98,7 +97,11 @@ def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch):
         num_gpus=8,
         server_info={"tp_size": 4, "pp_size": 2, "ep_size": 4, "moe_dp_size": 2},
     )
-    args = Namespace(rollout_external_engine_infos=[info.to_dict()])
+    args = Namespace(
+        rollout_external_engine_infos=[info.to_dict()],
+        rollout_external_dynamic_discovery_path=None,
+        rollout_external_rollout_url=None,
+    )
 
     servers, init_handles = start_external_rollout_servers(args, start_router=lambda *args, **kwargs: ("host1", 30000))
 
@@ -106,7 +109,7 @@ def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch):
     assert len(init_handles) == 1
 
 
-def test_discover_external_engines_uses_control_base_url_and_shared_rollout_url(monkeypatch):
+def test_discover_external_engines_uses_control_base_url(monkeypatch):
     def fake_get(url, timeout):
         assert timeout == 30.0
         assert url == "http://worker:9090/engine/server_info"
@@ -114,10 +117,9 @@ def test_discover_external_engines_uses_control_base_url_and_shared_rollout_url(
 
     monkeypatch.setattr("slime.backends.sglang_utils.external.requests.get", fake_get)
 
-    info = discover_external_engines(["worker:9090/engine"], rollout_url="http://frontend:8000")[0]
+    info = discover_external_engines(["worker:9090/engine"])[0]
 
     assert info.url == "http://worker:9090/engine"
-    assert info.rollout_url == "http://frontend:8000"
     assert external_engine_init_kwargs(info)["control_url"] == "http://worker:9090/engine"
     assert engine_control_url(info.url, "flush_cache") == "http://worker:9090/engine/flush_cache"
 
@@ -205,18 +207,6 @@ def test_dynamic_discovery_skips_unchanged_external_engine_membership(monkeypatc
 
     assert server.refresh() is False
     assert server.engines == ["engine"]
-
-
-def test_get_external_rollout_url_requires_one_shared_frontend():
-    engine = external.ExternalEngineInfo("http://worker:9090", "worker", 9090, "regular", 1)
-    shared = external.ExternalEngineInfo(
-        "http://worker:9091", "worker", 9091, "regular", 1, rollout_url="http://frontend:8000"
-    )
-
-    assert get_external_rollout_url([engine]) is None
-    assert get_external_rollout_url([shared]) == "http://frontend:8000"
-    with pytest.raises(ValueError, match="same rollout_url"):
-        get_external_rollout_url([engine, shared])
 
 
 def test_apply_external_engine_info_handles_pd(monkeypatch):

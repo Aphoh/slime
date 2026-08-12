@@ -572,7 +572,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
-        dynamic_discovery_path = getattr(self.args, "rollout_external_dynamic_discovery_path", None)
+        dynamic_discovery_path = self.args.rollout_external_dynamic_discovery_path
         if dynamic_discovery_path or self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
                 if dynamic_discovery_path:

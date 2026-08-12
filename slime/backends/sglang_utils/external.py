@@ -23,7 +23,6 @@ class ExternalEngineInfo:
     num_gpus: int
     disaggregation_bootstrap_port: int | None = None
     server_info: dict = dataclasses.field(default_factory=dict)
-    rollout_url: str | None = None
 
     @property
     def is_pd_worker(self) -> bool:
@@ -102,9 +101,7 @@ def _infer_worker_type(server_info: dict) -> str:
     return "regular"
 
 
-def discover_external_engines(
-    addrs: list[str], rollout_url: str | None = None, timeout: float = 30.0
-) -> list[ExternalEngineInfo]:
+def discover_external_engines(addrs: list[str], timeout: float = 30.0) -> list[ExternalEngineInfo]:
     infos = []
     for addr in addrs:
         url = normalize_external_engine_addr(addr)
@@ -125,7 +122,6 @@ def discover_external_engines(
                 port=parsed.port,
                 worker_type=_infer_worker_type(server_info),
                 num_gpus=num_gpus,
-                rollout_url=normalize_external_engine_addr(rollout_url) if rollout_url else None,
                 disaggregation_bootstrap_port=bootstrap_port,
                 server_info=server_info,
             )
@@ -135,7 +131,7 @@ def discover_external_engines(
 
 def external_engine_addrs_from_args(args) -> list[str]:
     """Return external-engine control base URLs from the CLI or dynamic discovery."""
-    dynamic_discovery_path = getattr(args, "rollout_external_dynamic_discovery_path", None)
+    dynamic_discovery_path = args.rollout_external_dynamic_discovery_path
     if dynamic_discovery_path:
         addrs = load_function(dynamic_discovery_path)(args)
     else:
@@ -152,10 +148,7 @@ def external_engine_addrs_from_args(args) -> list[str]:
 
 
 def discover_external_engine_infos(args) -> list[ExternalEngineInfo]:
-    return discover_external_engines(
-        external_engine_addrs_from_args(args),
-        rollout_url=args.rollout_external_rollout_url,
-    )
+    return discover_external_engines(external_engine_addrs_from_args(args))
 
 
 def apply_external_engine_info_to_args(args, logger=None) -> None:
@@ -164,8 +157,6 @@ def apply_external_engine_info_to_args(args, logger=None) -> None:
 
     if not infos:
         raise ValueError("External rollout engine discovery returned no engines.")
-    if not all(isinstance(info, ExternalEngineInfo) for info in infos):
-        raise TypeError("External rollout engine discovery must return ExternalEngineInfo objects or dictionaries.")
 
     args.rollout_external_engine_infos = [info.to_dict() for info in infos]
     args.rollout_num_engines = len(infos)
@@ -256,7 +247,7 @@ class ExternalRolloutServer:
 
     def refresh(self) -> bool:
         """Refresh dynamic external-engine membership before a weight update."""
-        if not getattr(self.args, "rollout_external_dynamic_discovery_path", None):
+        if not self.args.rollout_external_dynamic_discovery_path:
             return False
 
         infos = discover_external_engine_infos(self.args)
@@ -321,19 +312,14 @@ def external_engine_infos_from_args(args) -> list[ExternalEngineInfo]:
     return [ExternalEngineInfo(**info) if isinstance(info, dict) else info for info in raw_infos]
 
 
-def get_external_rollout_url(infos: list[ExternalEngineInfo]) -> str | None:
-    rollout_urls = {info.rollout_url for info in infos}
-    if rollout_urls == {None}:
-        return None
-    if None in rollout_urls or len(rollout_urls) != 1:
-        raise ValueError("External rollout engines must all use the same rollout_url, or none.")
-    return rollout_urls.pop()
-
-
 def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, ExternalRolloutServer], list]:
     infos = external_engine_infos_from_args(args)
-    rollout_url = get_external_rollout_url(infos)
-    if getattr(args, "rollout_external_dynamic_discovery_path", None) and rollout_url is None:
+    rollout_url = (
+        normalize_external_engine_addr(args.rollout_external_rollout_url)
+        if args.rollout_external_rollout_url
+        else None
+    )
+    if args.rollout_external_dynamic_discovery_path and rollout_url is None:
         raise ValueError("--rollout-external-dynamic-discovery-path requires --rollout-external-rollout-url.")
     if rollout_url is None:
         router_ip, router_port = start_router(args, has_pd_disaggregation=any(info.is_pd_worker for info in infos))
