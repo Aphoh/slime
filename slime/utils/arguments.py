@@ -580,7 +580,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 nargs="+",
-                help="Address and ports of the external engines.",
+                help="Control base URLs of the external engines, optionally including a path prefix.",
+            )
+            parser.add_argument(
+                "--rollout-external-dynamic-discovery-path",
+                type=str,
+                default=None,
+                help=(
+                    "Optional path to a synchronous function called before every weight update. It receives args "
+                    "and returns the current external engine control base URLs."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-external-rollout-url",
+                type=str,
+                default=None,
+                help="Optional shared rollout endpoint. When set, Slime sends /generate there instead of starting a router.",
             )
             return parser
 
@@ -1910,7 +1925,9 @@ def slime_validate_args(args):
         )
         args.debug_train_only = True
 
-    args.rollout_external = args.rollout_external_engine_addrs is not None
+    args.rollout_external = (
+        args.rollout_external_engine_addrs is not None or args.rollout_external_dynamic_discovery_path is not None
+    )
 
     if args.rollout_external and not args.debug_train_only:
         apply_external_engine_info_to_args(args, logger=logger)

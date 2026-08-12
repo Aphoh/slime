@@ -227,6 +227,7 @@ def make_slime_validate_args(**overrides):
         save_debug_train_data=None,
         load_debug_rollout_data=None,
         rollout_external_engine_addrs=None,
+        rollout_external_dynamic_discovery_path=None,
         debug_train_only=False,
         actor_num_gpus_per_node=8,
         actor_num_nodes=1,

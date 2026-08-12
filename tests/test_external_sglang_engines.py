@@ -9,10 +9,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from slime.backends.sglang_utils import external
 from slime.backends.sglang_utils.external import (
     ExternalEngineInfo,
     apply_external_engine_info_to_args,
     discover_external_engines,
+    external_engine_init_kwargs,
     start_external_rollout_servers,
 )
 from slime.utils.http_utils import get_rollout_num_engines
@@ -65,7 +67,8 @@ def test_discover_external_engines_reads_server_info(monkeypatch):
     assert info.parallel_config == {"tp_size": 4, "pp_size": 2, "ep_size": 4, "moe_dp_size": 1}
 
 
-def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch):
+@pytest.mark.parametrize("rollout_url", [None, "http://frontend:8000"])
+def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch, rollout_url):
     class FakeActor:
         init = Namespace(remote=lambda **kwargs: kwargs)
 
@@ -94,12 +97,135 @@ def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch):
         num_gpus=8,
         server_info={"tp_size": 4, "pp_size": 2, "ep_size": 4, "moe_dp_size": 2},
     )
-    args = Namespace(rollout_external_engine_infos=[info.to_dict()])
+    args = Namespace(
+        rollout_external_engine_infos=[info.to_dict()],
+        rollout_external_dynamic_discovery_path=None,
+        rollout_external_rollout_url=rollout_url,
+    )
 
     servers, init_handles = start_external_rollout_servers(args, start_router=lambda *args, **kwargs: ("host1", 30000))
 
     assert servers["default"].engine_parallel_configs == [{"tp_size": 4, "pp_size": 2, "ep_size": 4, "moe_dp_size": 2}]
     assert len(init_handles) == 1
+    expected_router = ("host1", 30000) if rollout_url is None else ("frontend", 8000)
+    assert (args.sglang_router_ip, args.sglang_router_port) == expected_router
+    assert init_handles[0].get("register_to_router", True) is (rollout_url is None)
+
+
+def test_dynamic_discovery_requires_shared_rollout_url():
+    info = ExternalEngineInfo("http://worker:9090", "worker", 9090, "regular", 1)
+    args = Namespace(
+        rollout_external_engine_infos=[info.to_dict()],
+        rollout_external_dynamic_discovery_path="example.discover",
+        rollout_external_rollout_url=None,
+    )
+
+    with pytest.raises(ValueError, match="requires --rollout-external-rollout-url"):
+        start_external_rollout_servers(
+            args,
+            start_router=lambda *args, **kwargs: pytest.fail("must reject before starting a router"),
+        )
+
+
+def test_discover_external_engines_uses_control_base_url(monkeypatch):
+    def fake_get(url, timeout):
+        assert timeout == 30.0
+        assert url == "http://worker:9090/engine/server_info"
+        return _Response({"tp_size": 2})
+
+    monkeypatch.setattr("slime.backends.sglang_utils.external.requests.get", fake_get)
+
+    info = discover_external_engines(["worker:9090/engine"])[0]
+
+    assert info.url == "http://worker:9090/engine"
+    assert external_engine_init_kwargs(info)["control_url"] == "http://worker:9090/engine"
+
+
+def test_apply_external_engine_info_uses_dynamic_discovery_control_base_urls(monkeypatch):
+    monkeypatch.setattr(external, "load_function", lambda path: lambda args: ["worker:9090/engine"])
+
+    def fake_get(url, timeout):
+        assert url == "http://worker:9090/engine/server_info"
+        return _Response({"tp_size": 2})
+
+    monkeypatch.setattr("slime.backends.sglang_utils.external.requests.get", fake_get)
+    args = Namespace(
+        rollout_external_engine_addrs=None,
+        rollout_external_dynamic_discovery_path="example.discover",
+        rollout_external_rollout_url="http://frontend:8000",
+    )
+
+    apply_external_engine_info_to_args(args)
+
+    assert args.rollout_external_engine_infos[0]["url"] == "http://worker:9090/engine"
+    assert args.rollout_external_engine_infos[0]["host"] == "worker"
+    assert args.rollout_external_engine_infos[0]["port"] == 9090
+
+
+def test_dynamic_discovery_refreshes_changed_external_engine_membership(monkeypatch):
+    args = Namespace(
+        rollout_external_engine_addrs=None,
+        rollout_external_dynamic_discovery_path="example.discover",
+        rollout_external_rollout_url="http://frontend:8000",
+    )
+    old_info = external.ExternalEngineInfo(
+        "http://old:9090/engine", "old", 9090, "regular", 2, server_info={"tp_size": 2}
+    )
+    new_info = external.ExternalEngineInfo(
+        "http://new:9090/engine", "new", 9090, "regular", 4, server_info={"tp_size": 4}
+    )
+    server = external.ExternalRolloutServer(
+        engines=["old-engine"],
+        engine_gpu_counts=[2],
+        engine_gpu_offsets=[0],
+        engine_parallel_configs=[old_info.parallel_config],
+        args=args,
+        engine_infos=[old_info],
+        should_register_to_router=False,
+    )
+    monkeypatch.setattr(external, "discover_external_engine_infos", lambda _args: [new_info])
+    monkeypatch.setattr(
+        external,
+        "_start_external_engine_actors",
+        lambda *args, **kwargs: (["new-engine"], []),
+    )
+
+    assert server.refresh() is True
+    assert server.engines == ["new-engine"]
+    assert server.engine_gpu_counts == [4]
+    assert server.engine_gpu_offsets == [0]
+    assert server.num_new_engines == 1
+    assert server.retired_engines == ["old-engine"]
+    assert args.rollout_external_engine_infos == [new_info.to_dict()]
+
+
+def test_dynamic_discovery_skips_unchanged_external_engine_membership(monkeypatch):
+    args = Namespace(
+        rollout_external_engine_addrs=None,
+        rollout_external_dynamic_discovery_path="example.discover",
+        rollout_external_rollout_url="http://frontend:8000",
+    )
+    info = external.ExternalEngineInfo(
+        "http://worker:9090/engine", "worker", 9090, "regular", 2, server_info={"tp_size": 2}
+    )
+    server = external.ExternalRolloutServer(
+        engines=["engine"],
+        engine_gpu_counts=[2],
+        engine_gpu_offsets=[0],
+        engine_parallel_configs=[info.parallel_config],
+        args=args,
+        engine_infos=[info],
+        should_register_to_router=False,
+    )
+    monkeypatch.setattr(external, "discover_external_engine_infos", lambda _args: [info])
+    monkeypatch.setattr(
+        external,
+        "_start_external_engine_actors",
+        lambda *args, **kwargs: pytest.fail("unchanged membership must not recreate control actors"),
+    )
+
+    assert server.refresh() is False
+    assert server.engines == ["engine"]
 
 
 def test_apply_external_engine_info_handles_pd(monkeypatch):
@@ -128,6 +254,8 @@ def test_apply_external_engine_info_handles_pd(monkeypatch):
     args = Namespace(
         rollout_external=True,
         rollout_external_engine_addrs=["prefill:10090", "decode:10091"],
+        rollout_external_dynamic_discovery_path=None,
+        rollout_external_rollout_url=None,
         rollout_num_gpus=None,
         rollout_num_gpus_per_engine=1,
         sglang_pipeline_parallel_size=1,
@@ -165,6 +293,8 @@ def test_apply_external_engine_info_preserves_router_pd_flag(monkeypatch):
     args = Namespace(
         rollout_external=True,
         rollout_external_engine_addrs=["regular:10090"],
+        rollout_external_dynamic_discovery_path=None,
+        rollout_external_rollout_url=None,
         router_pd_disaggregation=True,
     )
 
@@ -176,10 +306,10 @@ def test_apply_external_engine_info_preserves_router_pd_flag(monkeypatch):
     assert args.rollout_num_engines == 1
 
 
-def test_apply_external_engine_info_requires_addrs():
-    args = Namespace(rollout_external_engine_addrs=None)
+def test_apply_external_engine_info_requires_addrs_or_discovery():
+    args = Namespace(rollout_external_engine_addrs=None, rollout_external_dynamic_discovery_path=None)
 
-    with pytest.raises(ValueError, match="rollout-external-engine-addrs"):
+    with pytest.raises(ValueError, match="rollout-external-engine-addrs or"):
         apply_external_engine_info_to_args(args)
 
 

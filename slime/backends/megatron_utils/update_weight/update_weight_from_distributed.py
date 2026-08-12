@@ -65,7 +65,7 @@ class UpdateWeightFromDistributed:
         """
         Create NCCL "slime-pp_{pp_rank}" if PP source (DP=TP=0). Lock prevents concurrent broadcasts.
         """
-        self.rollout_engines = rollout_engines
+        previous_rollout_engines = getattr(self, "rollout_engines", [])
         self.rollout_engine_lock = rollout_engine_lock
         self._engine_gpu_counts = engine_gpu_counts
 
@@ -82,7 +82,7 @@ class UpdateWeightFromDistributed:
         if self._is_pp_src_rank:
             if self._model_update_groups is not None:
                 disconnect_rollout_engines_from_distributed(
-                    self.args, self._group_name, self._model_update_groups, self.rollout_engines
+                    self.args, self._group_name, self._model_update_groups, previous_rollout_engines
                 )
             self._model_update_groups = connect_rollout_engines_from_distributed(
                 self.args,
@@ -90,6 +90,7 @@ class UpdateWeightFromDistributed:
                 rollout_engines,
                 engine_gpu_counts=engine_gpu_counts,
             )
+        self.rollout_engines = rollout_engines
 
     def disconnect_rollout_engines(self) -> None:
         if not getattr(self, "_is_pp_src_rank", False) or self._model_update_groups is None:
