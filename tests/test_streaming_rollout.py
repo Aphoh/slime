@@ -123,12 +123,18 @@ def _generation_state(*, abort_mode="request", stream_output_mode="incremental")
 def test_generators_reject_wrong_abort_mode(monkeypatch):
     args = SimpleNamespace(ci_test=False)
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: _generation_state(abort_mode="request"))
-    with pytest.raises(RuntimeError, match="Non-streaming generation requires"):
+    with pytest.raises(RuntimeError, match="cannot be mixed with request-cancelled"):
         asyncio.run(sglang_rollout.generate(args, Sample(prompt="hello"), {"max_new_tokens": 1}))
 
     monkeypatch.setattr(streaming, "GenerateState", lambda _args: _generation_state(abort_mode="server"))
-    with pytest.raises(RuntimeError, match="Streaming generation requires"):
+    with pytest.raises(RuntimeError, match="must be the globally configured"):
         asyncio.run(streaming.generate_streaming(args, Sample(prompt="hello"), {"max_new_tokens": 1}))
+
+
+def test_abort_mode_follows_configured_generate_function():
+    assert sglang_rollout._generate_abort_mode(None) == "server"
+    assert sglang_rollout._generate_abort_mode(lambda: None) == "server"
+    assert sglang_rollout._generate_abort_mode(streaming.generate_streaming) == "request"
 
 
 def test_stream_accumulator_requires_reported_length():

@@ -465,15 +465,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--rollout-abort-mode",
-                choices=["server", "request"],
-                default="server",
-                help=(
-                    "How to stop unfinished generation: call the SGLang server abort APIs, "
-                    "or cancel active HTTP requests."
-                ),
-            )
-            parser.add_argument(
                 "--mask-offpolicy-in-partial-rollout",
                 action="store_true",
                 default=False,

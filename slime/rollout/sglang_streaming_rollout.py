@@ -51,7 +51,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
 
     state = GenerateState(args)
     if state.abort_mode != "request":
-        raise RuntimeError("Streaming generation requires --rollout-abort-mode request.")
+        raise RuntimeError("generate_streaming must be the globally configured --custom-generate-function-path.")
     url = get_model_url(args, "default")
 
     assert sample.status in (

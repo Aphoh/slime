@@ -80,6 +80,15 @@ def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate")
     return f"http://{args.sglang_router_ip}:{args.sglang_router_port}{endpoint}"
 
 
+def _generate_abort_mode(generate_function) -> Literal["request", "server"]:
+    if generate_function is None:
+        return "server"
+
+    from slime.rollout.sglang_streaming_rollout import generate_streaming
+
+    return "request" if generate_function is generate_streaming else "server"
+
+
 class GenerateState(metaclass=SingletonMeta):
     """
     The global state for the generation process.
@@ -88,7 +97,10 @@ class GenerateState(metaclass=SingletonMeta):
     def __init__(self, args: Namespace) -> None:
         # persistent state for the generation process
         self.args = args
-        self.abort_mode: Literal["request", "server"] = args.rollout_abort_mode
+        generate_function = (
+            load_function(args.custom_generate_function_path) if args.custom_generate_function_path else None
+        )
+        self.abort_mode = _generate_abort_mode(generate_function)
         self.stream_output_mode: Literal["incremental", "cumulative"] = (
             "incremental" if args.sglang_incremental_streaming_output else "cumulative"
         )
@@ -161,7 +173,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     state = GenerateState(args)
     if state.abort_mode != "server":
-        raise RuntimeError("Non-streaming generation requires --rollout-abort-mode server.")
+        raise RuntimeError("Non-streaming generation cannot be mixed with request-cancelled generation.")
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert (
