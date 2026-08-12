@@ -465,6 +465,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-abort-mode",
+                choices=("server", "request"),
+                default="server",
+                help=(
+                    "How to stop in-flight rollout generation. 'server' uses the SGLang abort API and waits for "
+                    "the engines to become idle. 'request' cancels active HTTP requests and requires "
+                    "slime.rollout.sglang_streaming_rollout.generate_streaming."
+                ),
+            )
+            parser.add_argument(
                 "--mask-offpolicy-in-partial-rollout",
                 action="store_true",
                 default=False,
@@ -570,7 +580,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 nargs="+",
-                help="Address and ports of the external engines.",
+                help="Control base URLs of the external engines, optionally including a path prefix.",
+            )
+            parser.add_argument(
+                "--rollout-external-dynamic-discovery-path",
+                type=str,
+                default=None,
+                help=(
+                    "Optional path to a synchronous function called before every weight update. It receives args "
+                    "and returns the current external engine control base URLs."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-external-rollout-url",
+                type=str,
+                default=None,
+                help="Optional shared rollout endpoint. When set, Slime sends /generate there instead of starting a router.",
             )
             return parser
 
@@ -1766,6 +1791,15 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
+    if (
+        args.rollout_abort_mode == "request"
+        and args.custom_generate_function_path != "slime.rollout.sglang_streaming_rollout.generate_streaming"
+    ):
+        raise ValueError(
+            "--rollout-abort-mode=request requires "
+            "--custom-generate-function-path=slime.rollout.sglang_streaming_rollout.generate_streaming."
+        )
+
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):
             raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
@@ -1891,7 +1925,9 @@ def slime_validate_args(args):
         )
         args.debug_train_only = True
 
-    args.rollout_external = args.rollout_external_engine_addrs is not None
+    args.rollout_external = (
+        args.rollout_external_engine_addrs is not None or args.rollout_external_dynamic_discovery_path is not None
+    )
 
     if args.rollout_external and not args.debug_train_only:
         apply_external_engine_info_to_args(args, logger=logger)

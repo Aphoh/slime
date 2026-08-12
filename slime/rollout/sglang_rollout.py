@@ -7,7 +7,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from tqdm import tqdm
@@ -88,6 +88,10 @@ class GenerateState(metaclass=SingletonMeta):
     def __init__(self, args: Namespace) -> None:
         # persistent state for the generation process
         self.args = args
+        self.abort_mode: Literal["request", "server"] = args.rollout_abort_mode
+        self.stream_output_mode: Literal["incremental", "cumulative"] = (
+            "incremental" if args.sglang_incremental_streaming_output else "cumulative"
+        )
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
@@ -132,6 +136,8 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size = 0
         self.pendings = set()
         self.aborted = False
+        self.cancellable_tasks = set()
+        self.request_abort_tasks = set()
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
@@ -248,6 +254,11 @@ async def generate_and_rm(
         with state.dp_rank_context() as _:
             # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
             custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+            if state.abort_mode == "request" and custom_func_path != args.custom_generate_function_path:
+                raise ValueError(
+                    "--rollout-abort-mode=request requires every sample to use the globally configured "
+                    "--custom-generate-function-path."
+                )
 
             if custom_func_path is not None:
                 custom_generate_func = load_function(custom_func_path)
@@ -341,10 +352,17 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-    urls = [worker["url"] for worker in response["workers"]]
-
-    await abort_servers_until_idle(urls)
+    if state.abort_mode == "request":
+        while state.cancellable_tasks:
+            cancellable_tasks = list(state.cancellable_tasks)
+            for task in cancellable_tasks:
+                state.request_abort_tasks.add(task)
+                task.cancel()
+            await asyncio.gather(*cancellable_tasks, return_exceptions=True)
+    else:
+        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+        urls = [worker["url"] for worker in response["workers"]]
+        await abort_servers_until_idle(urls)
 
     # make sure all the pending tasks are finished
     count = 0
@@ -357,6 +375,8 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
             group = task.result()
+            if not any(sample.status == Sample.Status.ABORTED and sample.response_length > 0 for sample in group):
+                continue
             for sample in group:
                 if sample.response and "start_rollout_id" not in sample.metadata:
                     sample.metadata["start_rollout_id"] = rollout_id
