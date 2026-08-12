@@ -50,7 +50,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    state.register_generation_mode("streaming")
+    state.register_abort_mode("request")
     url = get_model_url(args, "default")
 
     assert sample.status in (
@@ -109,7 +109,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
 
     current_task = asyncio.current_task()
     assert current_task is not None
-    state.streaming_tasks.add(current_task)
+    state.cancellable_tasks.add(current_task)
     try:
         with trace_span(
             sample, "sglang_generate_stream", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}
@@ -135,6 +135,8 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
                             skip_special_tokens=sampling_params.get("skip_special_tokens", True),
                         ),
                     )
+                    if update.output_mode is not None:
+                        state.register_stream_output_mode(update.output_mode)
                     last_meta_info = update.meta_info
 
                     if update.replace_call_state:
@@ -166,7 +168,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
             sample.status = Sample.Status.ABORTED
         return sample
     finally:
-        state.streaming_tasks.discard(current_task)
+        state.cancellable_tasks.discard(current_task)
 
     if state.aborted and not last_meta_info.get("finish_reason"):
         sample.status = Sample.Status.ABORTED

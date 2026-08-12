@@ -132,16 +132,25 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size = 0
         self.pendings = set()
         self.aborted = False
-        self.generation_mode: Literal["streaming", "non_streaming"] | None = None
-        self.streaming_tasks = set()
+        self.abort_mode: Literal["request", "server"] | None = None
+        self.stream_output_mode: Literal["incremental", "cumulative"] | None = None
+        self.cancellable_tasks = set()
 
-    def register_generation_mode(self, mode: Literal["streaming", "non_streaming"]) -> None:
-        if self.generation_mode is not None and self.generation_mode != mode:
+    def register_abort_mode(self, mode: Literal["request", "server"]) -> None:
+        if self.abort_mode is not None and self.abort_mode != mode:
             raise RuntimeError(
-                "A rollout batch cannot mix streaming and non-streaming generation "
-                f"(already using {self.generation_mode}, received {mode})."
+                "A rollout batch cannot mix request-cancelled and server-aborted generation "
+                f"(already using {self.abort_mode}, received {mode})."
             )
-        self.generation_mode = mode
+        self.abort_mode = mode
+
+    def register_stream_output_mode(self, mode: Literal["incremental", "cumulative"]) -> None:
+        if self.stream_output_mode is not None and self.stream_output_mode != mode:
+            raise RuntimeError(
+                "A rollout batch cannot mix incremental and cumulative streaming output "
+                f"(already using {self.stream_output_mode}, received {mode})."
+            )
+        self.stream_output_mode = mode
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
@@ -165,7 +174,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    state.register_generation_mode("non_streaming")
+    state.register_abort_mode("server")
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert (
@@ -352,11 +361,11 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    if state.generation_mode == "streaming":
-        streaming_tasks = list(state.streaming_tasks)
-        for task in streaming_tasks:
+    if state.abort_mode == "request":
+        cancellable_tasks = list(state.cancellable_tasks)
+        for task in cancellable_tasks:
             task.cancel()
-        await asyncio.gather(*streaming_tasks, return_exceptions=True)
+        await asyncio.gather(*cancellable_tasks, return_exceptions=True)
     else:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
         urls = [worker["url"] for worker in response["workers"]]

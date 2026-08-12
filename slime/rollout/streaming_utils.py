@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from slime.utils.misc import decode_int32_meta_array
 
@@ -34,6 +34,7 @@ class SGLangStreamUpdate:
     """A normalized update ready to apply to the current HTTP call state."""
 
     replace_call_state: bool
+    output_mode: Literal["incremental", "cumulative"] | None
     tokens: list[int]
     log_probs: list[float]
     text: str
@@ -53,6 +54,7 @@ class SGLangStreamAccumulator:
     tokens: list[int] = field(default_factory=list)
     log_probs: list[float] = field(default_factory=list)
     text: str = ""
+    output_mode: Literal["incremental", "cumulative"] | None = None
 
     def add(self, chunk: dict[str, Any], *, decode: Callable[[list[int]], str]) -> SGLangStreamUpdate:
         meta_info = chunk.get("meta_info") or {}
@@ -64,15 +66,28 @@ class SGLangStreamAccumulator:
         chunk_log_probs = [item[0] for item in pairs]
         reported_length = int(meta_info["output_token_logprobs_length"])
 
-        if len(chunk_tokens) == reported_length:
-            cumulative = True
-        elif self.output_length + len(chunk_tokens) == reported_length:
-            cumulative = False
+        is_cumulative = len(chunk_tokens) == reported_length
+        is_incremental = self.output_length + len(chunk_tokens) == reported_length
+        if is_cumulative and is_incremental:
+            detected_mode = None
+        elif is_cumulative:
+            detected_mode = "cumulative"
+        elif is_incremental:
+            detected_mode = "incremental"
         else:
             raise ValueError(
                 "Inconsistent streaming output_token_logprobs_length: "
                 f"received={len(chunk_tokens)}, previous={self.output_length}, reported={reported_length}."
             )
+        if detected_mode is not None:
+            if self.output_mode is not None and self.output_mode != detected_mode:
+                raise ValueError(
+                    "SGLang changed streaming output mode within one request "
+                    f"(already using {self.output_mode}, received {detected_mode})."
+                )
+            self.output_mode = detected_mode
+
+        cumulative = self.output_mode != "incremental"
 
         full_top_p_metadata = not cumulative and _has_full_incremental_top_p_metadata(
             meta_info,
@@ -103,6 +118,7 @@ class SGLangStreamAccumulator:
         self.output_length = reported_length
         return SGLangStreamUpdate(
             replace_call_state=replace_call_state,
+            output_mode=self.output_mode,
             tokens=list(self.tokens) if replace_call_state else chunk_tokens,
             log_probs=list(self.log_probs) if replace_call_state else chunk_log_probs,
             text=self.text if replace_call_state else update_text,

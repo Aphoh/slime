@@ -103,21 +103,35 @@ def _generation_state():
         ),
         processor=None,
         aborted=False,
-        generation_mode=None,
-        streaming_tasks=set(),
+        abort_mode=None,
+        stream_output_mode=None,
+        cancellable_tasks=set(),
     )
-    state.register_generation_mode = lambda mode: sglang_rollout.GenerateState.register_generation_mode(state, mode)
+    state.register_abort_mode = lambda mode: sglang_rollout.GenerateState.register_abort_mode(state, mode)
+    state.register_stream_output_mode = lambda mode: sglang_rollout.GenerateState.register_stream_output_mode(
+        state, mode
+    )
     return state
 
 
-def test_generation_mode_must_be_homogeneous():
-    state = SimpleNamespace(generation_mode=None)
+def test_abort_mode_must_be_homogeneous():
+    state = SimpleNamespace(abort_mode=None)
 
-    sglang_rollout.GenerateState.register_generation_mode(state, "streaming")
-    sglang_rollout.GenerateState.register_generation_mode(state, "streaming")
+    sglang_rollout.GenerateState.register_abort_mode(state, "request")
+    sglang_rollout.GenerateState.register_abort_mode(state, "request")
 
-    with pytest.raises(RuntimeError, match="cannot mix streaming and non-streaming"):
-        sglang_rollout.GenerateState.register_generation_mode(state, "non_streaming")
+    with pytest.raises(RuntimeError, match="cannot mix request-cancelled and server-aborted"):
+        sglang_rollout.GenerateState.register_abort_mode(state, "server")
+
+
+def test_stream_output_mode_must_be_homogeneous():
+    state = SimpleNamespace(stream_output_mode=None)
+
+    sglang_rollout.GenerateState.register_stream_output_mode(state, "incremental")
+    sglang_rollout.GenerateState.register_stream_output_mode(state, "incremental")
+
+    with pytest.raises(RuntimeError, match="cannot mix incremental and cumulative"):
+        sglang_rollout.GenerateState.register_stream_output_mode(state, "cumulative")
 
 
 def test_stream_accumulator_requires_reported_length():
@@ -128,13 +142,31 @@ def test_stream_accumulator_requires_reported_length():
         )
 
 
+def test_stream_accumulator_rejects_mode_change():
+    accumulator = SGLangStreamAccumulator()
+    accumulator.add(_chunk("a", [[-0.1, 11, None]], 1), decode=lambda _tokens: "")
+    accumulator.add(_chunk("b", [[-0.2, 12, None]], 2), decode=lambda _tokens: "")
+
+    with pytest.raises(ValueError, match="changed streaming output mode"):
+        accumulator.add(
+            _chunk(
+                "abc",
+                [[-0.1, 11, None], [-0.2, 12, None], [-0.3, 13, None]],
+                3,
+            ),
+            decode=lambda _tokens: "",
+        )
+
+
 @pytest.mark.parametrize("stream_interval", [1, 20, 64])
 @pytest.mark.parametrize("incremental", [True, False], ids=["incremental", "cumulative"])
 @pytest.mark.parametrize("top_p_layout", ["final_full", "per_chunk"])
 def test_generate_streaming_preserves_metadata_across_stream_intervals(
     monkeypatch, stream_interval, incremental, top_p_layout
 ):
-    response_tokens = list(range(11, 56))
+    # Keep the response longer than the largest interval so the second chunk
+    # makes cumulative versus incremental output observable on the wire.
+    response_tokens = list(range(11, 76))
     chunks = []
     previous = 0
     for end in range(stream_interval, len(response_tokens) + stream_interval, stream_interval):
@@ -208,7 +240,8 @@ def test_generate_streaming_preserves_metadata_across_stream_intervals(
     assert result.rollout_log_probs == [-float(token_id) for token_id in response_tokens]
     assert result.rollout_top_p_token_ids.tolist() == [token_id + 1000 for token_id in response_tokens]
     assert result.rollout_top_p_token_offsets.tolist() == list(range(len(response_tokens) + 1))
-    assert state.generation_mode == "streaming"
+    assert state.abort_mode == "request"
+    assert state.stream_output_mode == ("incremental" if incremental else "cumulative")
 
 
 def test_stream_cancellation_closes_request_and_keeps_prefix(monkeypatch):
@@ -268,8 +301,8 @@ def test_stream_cancellation_closes_request_and_keeps_prefix(monkeypatch):
     assert result.status == Sample.Status.ABORTED
     assert (result.tokens, result.rollout_log_probs, result.response) == ([1, 2, 11], [-0.1], "<11>")
     assert request_closed is True
-    assert state.generation_mode == "streaming"
-    assert not state.streaming_tasks
+    assert state.abort_mode == "request"
+    assert not state.cancellable_tasks
 
 
 def test_unrelated_stream_cancellation_propagates(monkeypatch):
@@ -317,7 +350,7 @@ def test_unrelated_stream_cancellation_propagates(monkeypatch):
             await task
 
     asyncio.run(exercise())
-    assert not state.streaming_tasks
+    assert not state.cancellable_tasks
 
 
 def test_partial_abort_buffers_mixed_group_with_nonempty_aborted_sample(monkeypatch):
@@ -329,8 +362,8 @@ def test_partial_abort_buffers_mixed_group_with_nonempty_aborted_sample(monkeypa
     async def exercise():
         state = SimpleNamespace(
             aborted=False,
-            generation_mode="streaming",
-            streaming_tasks=set(),
+            abort_mode="request",
+            cancellable_tasks=set(),
             pendings={
                 asyncio.create_task(asyncio.sleep(0, result=group)) for group in (mixed_group, [terminal], [empty])
             },
