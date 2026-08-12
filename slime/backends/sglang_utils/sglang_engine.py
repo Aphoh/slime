@@ -10,7 +10,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
-from slime.backends.sglang_utils.external import engine_control_url, get_server_info
+from slime.backends.sglang_utils.external import get_server_info
 from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
 
@@ -233,17 +233,13 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
 
-        url = self._engine_control_url(endpoint)
-        response = requests.post(url, json=payload or {})
+        response = requests.post(f"{self.control_url}/{endpoint}", json=payload or {})
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
             e.add_note(f"{response.text=}")
             raise
         return response.json()
-
-    def _engine_control_url(self, method: str) -> str:
-        return engine_control_url(self.control_url, method)
 
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.
@@ -261,7 +257,7 @@ class SGLangEngine(RayActor):
             return True
 
         response = requests.get(
-            self._engine_control_url("health_generate"),
+            f"{self.control_url}/health_generate",
             timeout=timeout,
         )
         response.raise_for_status()
@@ -299,7 +295,7 @@ class SGLangEngine(RayActor):
         # flush cache will not return status_code 200 when there are pending requests
         for _ in range(60):
             try:
-                response = requests.get(self._engine_control_url("flush_cache"))
+                response = requests.get(f"{self.control_url}/flush_cache")
                 if response.status_code == 200:
                     break
                 logger.info(f"Error flushing cache: HTTP {response.status_code} {response.text!r}")
@@ -448,14 +444,14 @@ class SGLangEngine(RayActor):
     def pause_generation(self):
         if self.node_rank != 0:
             return
-        response = requests.post(self._engine_control_url("pause_generation"), json={})
+        response = requests.post(f"{self.control_url}/pause_generation", json={})
         response.raise_for_status()
         return response
 
     def continue_generation(self):
         if self.node_rank != 0:
             return
-        response = requests.post(self._engine_control_url("continue_generation"), json={})
+        response = requests.post(f"{self.control_url}/continue_generation", json={})
         response.raise_for_status()
         return response
 

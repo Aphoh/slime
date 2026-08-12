@@ -14,7 +14,6 @@ from slime.backends.sglang_utils.external import (
     ExternalEngineInfo,
     apply_external_engine_info_to_args,
     discover_external_engines,
-    engine_control_url,
     external_engine_init_kwargs,
     start_external_rollout_servers,
 )
@@ -121,7 +120,6 @@ def test_discover_external_engines_uses_control_base_url(monkeypatch):
 
     assert info.url == "http://worker:9090/engine"
     assert external_engine_init_kwargs(info)["control_url"] == "http://worker:9090/engine"
-    assert engine_control_url(info.url, "flush_cache") == "http://worker:9090/engine/flush_cache"
 
 
 def test_apply_external_engine_info_uses_dynamic_discovery_control_base_urls(monkeypatch):

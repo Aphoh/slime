@@ -61,11 +61,6 @@ def normalize_external_engine_addr(addr: str) -> str:
     return addr
 
 
-def engine_control_url(url: str, method: str) -> str:
-    """Build a per-worker SGLang control URL."""
-    return f"{url.rstrip('/')}/{method}"
-
-
 def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
     init_kwargs = {
         "dist_init_addr": f"{info.host}:{info.port}",
@@ -81,14 +76,13 @@ def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
 
 def get_server_info(url: str, timeout: float = 30.0) -> dict:
     errors = []
-    for method in ("server_info", "get_server_info"):
-        endpoint = engine_control_url(url, method)
+    for endpoint in ("/server_info", "/get_server_info"):
         try:
-            response = requests.get(endpoint, timeout=timeout)
+            response = requests.get(f"{url}{endpoint}", timeout=timeout)
             response.raise_for_status()
             return response.json()
         except Exception as exc:
-            errors.append(f"{endpoint}: {exc}")
+            errors.append(f"{url}{endpoint}: {exc}")
     raise RuntimeError(f"Failed to fetch SGLang server info from {url}: {'; '.join(errors)}")
 
 
