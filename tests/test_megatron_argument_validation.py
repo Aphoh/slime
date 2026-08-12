@@ -176,6 +176,15 @@ def test_update_weight_disk_dir_required_for_disk_transport(monkeypatch):
         module.slime_validate_args(args)
 
 
+@pytest.mark.unit
+def test_request_abort_requires_streaming_generate_function(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(rollout_abort_mode="request")
+
+    with pytest.raises(ValueError, match="rollout-abort-mode=request"):
+        module.slime_validate_args(args)
+
+
 def make_slime_validate_args(**overrides):
     values = dict(
         eval_config=None,
@@ -255,6 +264,8 @@ def make_slime_validate_args(**overrides):
         update_weight_disk_dir=None,
         update_weight_local_checkpoint_dir=None,
         update_weight_mode="full",
+        rollout_abort_mode="server",
+        custom_generate_function_path=None,
     )
     values.update(overrides)
     return types.SimpleNamespace(**values)

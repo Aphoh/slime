@@ -465,6 +465,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-abort-mode",
+                choices=("server", "request"),
+                default="server",
+                help=(
+                    "How to stop in-flight rollout generation. 'server' uses the SGLang abort API and waits for "
+                    "the engines to become idle. 'request' cancels active HTTP requests and requires "
+                    "slime.rollout.sglang_streaming_rollout.generate_streaming."
+                ),
+            )
+            parser.add_argument(
                 "--mask-offpolicy-in-partial-rollout",
                 action="store_true",
                 default=False,
@@ -1765,6 +1775,15 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    if (
+        args.rollout_abort_mode == "request"
+        and args.custom_generate_function_path != "slime.rollout.sglang_streaming_rollout.generate_streaming"
+    ):
+        raise ValueError(
+            "--rollout-abort-mode=request requires "
+            "--custom-generate-function-path=slime.rollout.sglang_streaming_rollout.generate_streaming."
+        )
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):

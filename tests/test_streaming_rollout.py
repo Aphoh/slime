@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import json
+import struct
 import sys
 from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
@@ -45,51 +47,62 @@ def _chunk(text, pairs, output_length, **meta_info):
     }
 
 
+def _b64_int32(values):
+    return base64.b64encode(struct.pack(f"<{len(values)}i", *values)).decode("ascii")
+
+
 @pytest.mark.parametrize(
-    ("initial", "chunks", "expected"),
+    ("output_mode", "chunks", "expected_updates", "expected"),
     [
         (
-            ("cumulative", [], [], ""),
+            "cumulative",
             [
                 _chunk("a", [[-0.1, 11, None]], 1),
                 _chunk("ab", [[-0.1, 11, None], [-0.2, 12, None]], 2),
             ],
+            [[11], [12]],
             ([11, 12], [-0.1, -0.2], "ab"),
         ),
         (
-            ("incremental", [], [], ""),
+            "incremental",
             [
                 _chunk("a", [[-0.1, 11, None]], 1),
                 _chunk("b", [[-0.2, 12, None]], 2),
                 _chunk("", [], 2),
             ],
+            [[11], [12], []],
             ([11, 12], [-0.1, -0.2], "ab"),
         ),
         (
-            ("cumulative", [11], [-0.1], "a"),
-            [_chunk(None, [[-0.1, 11, None]], 1)],
-            ([11], [-0.1], "a"),
+            "incremental",
+            [
+                _chunk(None, [[-0.1, 11, None]], 1),
+                _chunk(None, [[-0.2, 12, None]], 2),
+            ],
+            [[11], [12]],
+            ([11, 12], [-0.1, -0.2], "<11><12>"),
         ),
     ],
-    ids=["cumulative", "disjoint", "null-text"],
+    ids=["cumulative", "incremental", "null-text"],
 )
-def test_merge_stream_chunks(initial, chunks, expected):
-    output_mode, tokens, log_probs, text = initial
-    accumulator = SGLangStreamAccumulator(
-        output_mode=output_mode,
-        output_length=len(tokens),
-        tokens=list(tokens),
-        text=text,
-    )
+def test_merge_stream_chunks(output_mode, chunks, expected_updates, expected):
+    accumulator = SGLangStreamAccumulator(output_mode=output_mode)
+    updates = []
     for chunk in chunks:
-        update = accumulator.add(
-            chunk=chunk,
-            decode=lambda _tokens, current_text=text: current_text,
-        )
-        tokens, text = accumulator.tokens, accumulator.text
-        log_probs = update.log_probs if update.replace_call_state else log_probs + update.log_probs
+        updates.append(accumulator.add(chunk).tokens)
 
-    assert (tokens, log_probs, text) == expected
+    decode_calls = 0
+
+    def decode(token_ids):
+        nonlocal decode_calls
+        decode_calls += 1
+        return "".join(f"<{token_id}>" for token_id in token_ids)
+
+    result = (accumulator.tokens, accumulator.log_probs, accumulator.response_text(decode))
+
+    assert updates == expected_updates
+    assert result == expected
+    assert decode_calls == int(chunks[-1]["text"] is None)
 
 
 def test_merge_stream_rejects_inconsistent_length():
@@ -97,16 +110,12 @@ def test_merge_stream_rejects_inconsistent_length():
         output_mode="incremental",
         output_length=1,
         tokens=[11],
-        text="a",
     )
     with pytest.raises(ValueError, match="output_token_logprobs_length"):
-        accumulator.add(
-            chunk=_chunk("bc", [[-0.2, 12, None], [-0.3, 13, None]], 4),
-            decode=lambda _tokens: "",
-        )
+        accumulator.add(_chunk("bc", [[-0.2, 12, None], [-0.3, 13, None]], 4))
 
 
-def _generation_state(*, abort_mode="request", stream_output_mode="incremental"):
+def _generation_state(*, abort_mode="server", stream_output_mode="incremental"):
     return SimpleNamespace(
         tokenizer=SimpleNamespace(
             decode=lambda token_ids, skip_special_tokens=False: "".join(f"<{token_id}>" for token_id in token_ids)
@@ -116,6 +125,8 @@ def _generation_state(*, abort_mode="request", stream_output_mode="incremental")
         abort_mode=abort_mode,
         stream_output_mode=stream_output_mode,
         cancellable_tasks=set(),
+        request_abort_tasks=set(),
+        pendings=set(),
     )
 
 
@@ -127,11 +138,14 @@ def _streaming_args():
         use_rollout_routing_replay=False,
         router_policy=None,
         sglang_speculative_algorithm=False,
+        num_layers=1,
+        moe_router_topk=1,
     )
 
 
 def _patch_streaming(monkeypatch, state, stream):
     monkeypatch.setattr(streaming, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
     monkeypatch.setattr(streaming, "_prepare_prompt_ids", lambda *_args: [1, 2])
     monkeypatch.setattr(streaming.http_utils, "_http_client", SimpleNamespace(stream=stream))
     monkeypatch.setattr(
@@ -141,24 +155,16 @@ def _patch_streaming(monkeypatch, state, stream):
     )
 
 
-def test_streaming_generator_rejects_server_abort_mode(monkeypatch):
-    args = SimpleNamespace(ci_test=False)
-    monkeypatch.setattr(streaming, "GenerateState", lambda _args: _generation_state(abort_mode="server"))
-    with pytest.raises(RuntimeError, match="must be the globally configured"):
-        asyncio.run(streaming.generate_streaming(args, Sample(prompt="hello"), {"max_new_tokens": 1}))
-
-
 def test_stream_accumulator_requires_reported_length():
     with pytest.raises(ValueError, match="must include output_token_logprobs_length"):
         SGLangStreamAccumulator(output_mode="incremental").add(
             {"text": "x", "meta_info": {"output_token_logprobs": [[-0.1, 11, None]]}},
-            decode=lambda _tokens: "",
         )
 
 
 def test_stream_accumulator_rejects_output_incompatible_with_configured_mode():
     accumulator = SGLangStreamAccumulator(output_mode="incremental")
-    accumulator.add(_chunk("a", [[-0.1, 11, None]], 1), decode=lambda _tokens: "")
+    accumulator.add(_chunk("a", [[-0.1, 11, None]], 1))
 
     with pytest.raises(ValueError, match="incremental streaming output has inconsistent"):
         accumulator.add(
@@ -167,7 +173,6 @@ def test_stream_accumulator_rejects_output_incompatible_with_configured_mode():
                 [[-0.1, 11, None], [-0.2, 12, None]],
                 2,
             ),
-            decode=lambda _tokens: "",
         )
 
 
@@ -240,10 +245,110 @@ def test_generate_streaming_preserves_metadata_across_stream_intervals(
     assert result.rollout_top_p_token_offsets.tolist() == list(range(len(response_tokens) + 1))
 
 
+@pytest.mark.parametrize("incremental", [True, False], ids=["incremental", "cumulative"])
+def test_generate_streaming_handles_encoded_terminal_metadata(monkeypatch, incremental):
+    first = _chunk("λ", [[-0.1, 11, None]], 1)
+    second = _chunk(
+        "<|eot_id|>" if incremental else "λ<|eot_id|>",
+        [[-0.2, 12, None]] if incremental else [[-0.1, 11, None], [-0.2, 12, None]],
+        2,
+    )
+    terminal = _chunk(
+        "" if incremental else "λ<|eot_id|>",
+        [] if incremental else [[-0.1, 11, None], [-0.2, 12, None]],
+        2,
+        finish_reason={"type": "length"},
+        top_p_token_ids=_b64_int32([1011, 1012]),
+        top_p_token_offsets=_b64_int32([0, 1, 2]),
+        routed_experts=_b64_int32([101, 102, 103]),
+    )
+
+    async def lines():
+        for chunk in (first, second, terminal):
+            yield "data: " + json.dumps(chunk)
+
+    response = SimpleNamespace(raise_for_status=lambda: None, aiter_lines=lines)
+
+    @asynccontextmanager
+    async def stream(method, url, json, headers):
+        assert json["return_routed_experts"] is True
+        yield response
+
+    state = _generation_state(stream_output_mode="incremental" if incremental else "cumulative")
+    _patch_streaming(monkeypatch, state, stream)
+    args = _streaming_args()
+    args.use_rollout_routing_replay = True
+
+    result = asyncio.run(
+        streaming.generate_streaming(
+            args,
+            Sample(prompt="hello"),
+            {"max_new_tokens": 2, "skip_special_tokens": False},
+        )
+    )
+
+    assert result.status == Sample.Status.TRUNCATED
+    assert result.response == "λ<|eot_id|>"
+    assert result.tokens == [1, 2, 11, 12]
+    assert result.rollout_top_p_token_ids.tolist() == [1011, 1012]
+    assert result.rollout_top_p_token_offsets.tolist() == [0, 1, 2]
+    assert result.rollout_routed_experts.tolist() == [[[101]], [[102]], [[103]]]
+
+
+def test_streaming_generator_fails_closed_on_unexpected_eof(monkeypatch):
+    async def lines():
+        yield "data: " + json.dumps(_chunk("a", [[-0.1, 11, None]], 1))
+
+    response = SimpleNamespace(raise_for_status=lambda: None, aiter_lines=lines)
+
+    @asynccontextmanager
+    async def stream(method, url, json, headers):
+        yield response
+
+    _patch_streaming(monkeypatch, _generation_state(), stream)
+
+    with pytest.raises(RuntimeError, match="without a terminal finish_reason"):
+        asyncio.run(
+            streaming.generate_streaming(
+                _streaming_args(),
+                Sample(prompt="hello"),
+                {"max_new_tokens": 2},
+            )
+        )
+
+
+def test_server_abort_keeps_last_observed_prefix(monkeypatch):
+    state = _generation_state(abort_mode="server")
+
+    async def lines():
+        state.aborted = True
+        yield "data: " + json.dumps(_chunk("a", [[-0.1, 11, None]], 1))
+        raise AssertionError("server-aborted stream should stop after the next observed chunk")
+
+    response = SimpleNamespace(raise_for_status=lambda: None, aiter_lines=lines)
+
+    @asynccontextmanager
+    async def stream(method, url, json, headers):
+        yield response
+
+    _patch_streaming(monkeypatch, state, stream)
+    result = asyncio.run(
+        streaming.generate_streaming(
+            _streaming_args(),
+            Sample(prompt="hello"),
+            {"max_new_tokens": 2},
+        )
+    )
+
+    assert result.status == Sample.Status.ABORTED
+    assert (result.tokens, result.rollout_log_probs, result.response) == ([1, 2, 11], [-0.1], "a")
+    assert not state.cancellable_tasks
+
+
 def test_stream_cancellation_closes_request_and_keeps_prefix(monkeypatch):
     first_chunk_seen = asyncio.Event()
     request_closed = False
-    state = _generation_state()
+    state = _generation_state(abort_mode="request")
 
     async def lines():
         yield "data: " + json.dumps(
@@ -275,9 +380,8 @@ def test_stream_cancellation_closes_request_and_keeps_prefix(monkeypatch):
     async def exercise():
         task = asyncio.create_task(streaming.generate_streaming(args, Sample(prompt="hello"), {"max_new_tokens": 8}))
         await first_chunk_seen.wait()
-        state.aborted = True
-        task.cancel()
-        return await task
+        await sglang_rollout.abort(SimpleNamespace(partial_rollout=False), rollout_id=0)
+        return task.result()
 
     result = asyncio.run(exercise())
 
@@ -287,9 +391,31 @@ def test_stream_cancellation_closes_request_and_keeps_prefix(monkeypatch):
     assert not state.cancellable_tasks
 
 
+def test_request_abort_before_stream_registration_skips_request(monkeypatch):
+    state = _generation_state(abort_mode="request")
+    state.aborted = True
+
+    @asynccontextmanager
+    async def stream(method, url, json, headers):
+        raise AssertionError("an already-aborted rollout must not open a request")
+        yield
+
+    _patch_streaming(monkeypatch, state, stream)
+    result = asyncio.run(
+        streaming.generate_streaming(
+            _streaming_args(),
+            Sample(prompt="hello"),
+            {"max_new_tokens": 8},
+        )
+    )
+
+    assert result.status == Sample.Status.ABORTED
+    assert not state.cancellable_tasks
+
+
 def test_unrelated_stream_cancellation_propagates(monkeypatch):
     request_started = asyncio.Event()
-    state = _generation_state()
+    state = _generation_state(abort_mode="request")
 
     async def lines():
         request_started.set()
@@ -314,6 +440,7 @@ def test_unrelated_stream_cancellation_propagates(monkeypatch):
             )
         )
         await request_started.wait()
+        state.aborted = True
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -322,9 +449,24 @@ def test_unrelated_stream_cancellation_propagates(monkeypatch):
     assert not state.cancellable_tasks
 
 
-def test_partial_abort_buffers_mixed_group_with_nonempty_aborted_sample(monkeypatch):
-    partial = Sample(response="x", response_length=1, status=Sample.Status.ABORTED)
-    terminal = Sample(response="done", response_length=2, status=Sample.Status.TRUNCATED)
+def test_partial_abort_buffers_and_resumes_only_aborted_siblings(monkeypatch):
+    partial = Sample(
+        tokens=[1, 11],
+        response="x",
+        response_length=1,
+        rollout_log_probs=[-0.1],
+        loss_mask=[1],
+        status=Sample.Status.ABORTED,
+    )
+    terminal = Sample(
+        tokens=[1, 21, 22],
+        response="done",
+        response_length=2,
+        rollout_log_probs=[-0.3, -0.4],
+        loss_mask=[1, 1],
+        reward=1.0,
+        status=Sample.Status.COMPLETED,
+    )
     empty = Sample(response="", response_length=0, status=Sample.Status.ABORTED)
     mixed_group = [terminal, partial]
 
@@ -333,16 +475,65 @@ def test_partial_abort_buffers_mixed_group_with_nonempty_aborted_sample(monkeypa
             aborted=False,
             abort_mode="request",
             cancellable_tasks=set(),
+            request_abort_tasks=set(),
             pendings={
                 asyncio.create_task(asyncio.sleep(0, result=group)) for group in (mixed_group, [terminal], [empty])
             },
         )
         monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
-        return await sglang_rollout.abort(SimpleNamespace(partial_rollout=True), rollout_id=7)
+        args = SimpleNamespace(
+            partial_rollout=True,
+            mask_offpolicy_in_partial_rollout=True,
+            group_rm=False,
+            custom_generate_function_path="test.resume_generate",
+            rollout_sample_hook_path=None,
+            sglang_enable_deterministic_inference=False,
+            sglang_speculative_algorithm=False,
+        )
 
-    assert asyncio.run(exercise()) == [mixed_group]
+        buffered_groups = await sglang_rollout.abort(args, rollout_id=7)
+        assert buffered_groups == [mixed_group]
+
+        async def resume_generate(args, sample, sampling_params):
+            assert sample is partial
+            sample.append_response_tokens(
+                args,
+                tokens=[12],
+                log_probs=[-0.2],
+                meta_info={"finish_reason": {"type": "stop"}},
+                text="y",
+            )
+            return sample
+
+        async def reward(_args, sample):
+            assert sample is partial
+            return 2.0
+
+        monkeypatch.setattr(sglang_rollout, "load_function", lambda _path: resume_generate)
+        monkeypatch.setattr(sglang_rollout, "async_rm", reward)
+        state.aborted = False
+        state.abort_mode = "server"
+        state.semaphore = asyncio.Semaphore(2)
+        state.dp_rank_context = lambda: nullcontext(None)
+
+        resumed_group = await sglang_rollout.generate_and_rm_group(args, mixed_group, {"max_new_tokens": 1})
+        return buffered_groups, resumed_group
+
+    buffered_groups, resumed_group = asyncio.run(exercise())
+
+    assert buffered_groups == [mixed_group]
+    assert resumed_group == [terminal, partial]
     assert partial.metadata["start_rollout_id"] == 7
     assert terminal.metadata["start_rollout_id"] == 7
+    assert terminal.status == Sample.Status.COMPLETED
+    assert terminal.reward == 1.0
+    assert partial.status == Sample.Status.COMPLETED
+    assert partial.tokens == [1, 11, 12]
+    assert partial.response == "xy"
+    assert partial.response_length == 2
+    assert partial.rollout_log_probs == [-0.1, -0.2]
+    assert partial.loss_mask == [0, 1]
+    assert partial.reward == 2.0
 
 
 if __name__ == "__main__":

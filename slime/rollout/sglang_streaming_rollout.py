@@ -13,11 +13,18 @@ Wire it in as the per-sample generate function::
     --rollout-function-path slime.rollout.sglang_rollout.generate_rollout \\
     --custom-generate-function-path slime.rollout.sglang_streaming_rollout.generate_streaming
 
+Server-wide abort remains the default. Add ``--rollout-abort-mode request`` to
+cancel each active streaming HTTP request instead.
+
+Request cancellation only preserves metadata received before disconnect.
+SGLang emits top-p and routed-expert replay data on its terminal chunk, so use
+server abort when those features must survive a partial rollout.
+
 The outer rollout loop (semaphore, dp_rank balancing, abort orchestration,
 partial-rollout buffer hand-off) is still owned by ``sglang_rollout``; this
 file only replaces the inner HTTP call.
 
-Both cumulative and disjoint SGLang streams are accepted. The latter is used
+Both cumulative and incremental SGLang streams are accepted. The latter is used
 when the server enables incremental streaming output.
 """
 
@@ -42,15 +49,13 @@ logger = logging.getLogger(__name__)
 async def generate_streaming(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
     """Streaming counterpart to :func:`slime.rollout.sglang_rollout.generate`.
 
-    Writes the cumulative state from each SSE chunk onto ``sample`` so an
-    abort that cuts the stream still leaves a coherent partial sample behind.
+    Applies each SSE chunk onto ``sample`` so an abort that cuts the stream
+    still leaves a coherent partial sample behind.
     """
     if args.ci_test:
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    if state.abort_mode != "request":
-        raise RuntimeError("generate_streaming must be the globally configured --custom-generate-function-path.")
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert sample.status in (
@@ -89,9 +94,9 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     if sample.session_id and getattr(args, "router_policy", None) == "consistent_hashing":
         headers = {"X-SMG-Routing-Key": sample.session_id}
 
-    # A cumulative chunk replaces the state produced by this HTTP call, while
-    # an incremental chunk appends to it. Preserve the pre-call state so both
-    # formats also work when resuming a partial rollout.
+    # Preserve the pre-call state so both stream formats also work when
+    # resuming a partial rollout. A terminal full top-p snapshot may replay
+    # the current call from this base to keep metadata aligned.
     base_tokens = list(sample.tokens)
     base_response = sample.response or ""
     base_response_length = sample.response_length
@@ -107,9 +112,14 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     client = http_utils._http_client
     assert client is not None, "http client not initialized; call init_http_client first"
 
-    current_task = asyncio.current_task()
-    assert current_task is not None
-    state.cancellable_tasks.add(current_task)
+    current_task = asyncio.current_task() if state.abort_mode == "request" else None
+    if current_task is not None:
+        state.cancellable_tasks.add(current_task)
+        if state.aborted:
+            state.cancellable_tasks.discard(current_task)
+            sample.status = Sample.Status.ABORTED
+            return sample
+    cancelled_by_abort = False
     try:
         with trace_span(
             sample, "sglang_generate_stream", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}
@@ -128,13 +138,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
                         logger.warning("sglang_streaming: skipping non-JSON chunk: %r", data_str[:120])
                         continue
 
-                    update = stream.add(
-                        chunk,
-                        decode=lambda token_ids: state.tokenizer.decode(
-                            token_ids,
-                            skip_special_tokens=sampling_params.get("skip_special_tokens", True),
-                        ),
-                    )
+                    update = stream.add(chunk)
                     last_meta_info = update.meta_info
 
                     if update.replace_call_state:
@@ -153,22 +157,35 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
                         log_probs=update.log_probs,
                         trainable=True,
                         meta_info=last_meta_info,
-                        text=update.text,
+                        text=None,
                         update_terminal_info=bool(last_meta_info.get("finish_reason")),
                     )
+
+                    # Preserve the existing server-abort behavior: stop after
+                    # the first chunk observed once the global abort begins.
+                    if state.aborted and state.abort_mode == "server":
+                        break
 
             if last_meta_info.get("finish_reason"):
                 span.update(build_sglang_meta_trace_attrs(last_meta_info))
     except asyncio.CancelledError:
-        if not state.aborted:
+        if current_task not in state.request_abort_tasks:
             raise
-        if not last_meta_info.get("finish_reason"):
-            sample.status = Sample.Status.ABORTED
-        return sample
+        cancelled_by_abort = True
     finally:
-        state.cancellable_tasks.discard(current_task)
+        if current_task is not None:
+            state.cancellable_tasks.discard(current_task)
+            state.request_abort_tasks.discard(current_task)
+        sample.response = base_response + stream.response_text(
+            lambda token_ids: state.tokenizer.decode(
+                token_ids,
+                skip_special_tokens=sampling_params.get("skip_special_tokens", True),
+            )
+        )
 
-    if state.aborted and not last_meta_info.get("finish_reason"):
+    if cancelled_by_abort or (state.aborted and not last_meta_info.get("finish_reason")):
         sample.status = Sample.Status.ABORTED
+    elif not last_meta_info.get("finish_reason"):
+        raise RuntimeError("SGLang streaming response ended without a terminal finish_reason.")
 
     return sample
