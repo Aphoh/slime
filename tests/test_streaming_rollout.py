@@ -49,7 +49,7 @@ def _chunk(text, pairs, output_length, **meta_info):
     ("initial", "chunks", "expected"),
     [
         (
-            ([], [], ""),
+            ("cumulative", [], [], ""),
             [
                 _chunk("a", [[-0.1, 11, None]], 1),
                 _chunk("ab", [[-0.1, 11, None], [-0.2, 12, None]], 2),
@@ -57,7 +57,7 @@ def _chunk(text, pairs, output_length, **meta_info):
             ([11, 12], [-0.1, -0.2], "ab"),
         ),
         (
-            ([], [], ""),
+            ("incremental", [], [], ""),
             [
                 _chunk("a", [[-0.1, 11, None]], 1),
                 _chunk("b", [[-0.2, 12, None]], 2),
@@ -66,7 +66,7 @@ def _chunk(text, pairs, output_length, **meta_info):
             ([11, 12], [-0.1, -0.2], "ab"),
         ),
         (
-            ([11], [-0.1], "a"),
+            ("cumulative", [11], [-0.1], "a"),
             [_chunk(None, [[-0.1, 11, None]], 1)],
             ([11], [-0.1], "a"),
         ),
@@ -74,8 +74,13 @@ def _chunk(text, pairs, output_length, **meta_info):
     ids=["cumulative", "disjoint", "null-text"],
 )
 def test_merge_stream_chunks(initial, chunks, expected):
-    tokens, log_probs, text = initial
-    accumulator = SGLangStreamAccumulator(output_length=len(tokens), tokens=list(tokens), text=text)
+    output_mode, tokens, log_probs, text = initial
+    accumulator = SGLangStreamAccumulator(
+        output_mode=output_mode,
+        output_length=len(tokens),
+        tokens=list(tokens),
+        text=text,
+    )
     for chunk in chunks:
         update = accumulator.add(
             chunk=chunk,
@@ -88,7 +93,12 @@ def test_merge_stream_chunks(initial, chunks, expected):
 
 
 def test_merge_stream_rejects_inconsistent_length():
-    accumulator = SGLangStreamAccumulator(output_length=1, tokens=[11], text="a")
+    accumulator = SGLangStreamAccumulator(
+        output_mode="incremental",
+        output_length=1,
+        tokens=[11],
+        text="a",
+    )
     with pytest.raises(ValueError, match="output_token_logprobs_length"):
         accumulator.add(
             chunk=_chunk("bc", [[-0.2, 12, None], [-0.3, 13, None]], 4),
@@ -96,63 +106,49 @@ def test_merge_stream_rejects_inconsistent_length():
         )
 
 
-def _generation_state():
+def _generation_state(*, abort_mode="request", stream_output_mode="incremental"):
     state = SimpleNamespace(
         tokenizer=SimpleNamespace(
             decode=lambda token_ids, skip_special_tokens=False: "".join(f"<{token_id}>" for token_id in token_ids)
         ),
         processor=None,
         aborted=False,
-        abort_mode=None,
-        stream_output_mode=None,
+        abort_mode=abort_mode,
+        stream_output_mode=stream_output_mode,
         cancellable_tasks=set(),
-    )
-    state.register_abort_mode = lambda mode: sglang_rollout.GenerateState.register_abort_mode(state, mode)
-    state.register_stream_output_mode = lambda mode: sglang_rollout.GenerateState.register_stream_output_mode(
-        state, mode
     )
     return state
 
 
-def test_abort_mode_must_be_homogeneous():
-    state = SimpleNamespace(abort_mode=None)
+def test_generators_reject_wrong_abort_mode(monkeypatch):
+    args = SimpleNamespace(ci_test=False)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: _generation_state(abort_mode="request"))
+    with pytest.raises(RuntimeError, match="Non-streaming generation requires"):
+        asyncio.run(sglang_rollout.generate(args, Sample(prompt="hello"), {"max_new_tokens": 1}))
 
-    sglang_rollout.GenerateState.register_abort_mode(state, "request")
-    sglang_rollout.GenerateState.register_abort_mode(state, "request")
-
-    with pytest.raises(RuntimeError, match="cannot mix request-cancelled and server-aborted"):
-        sglang_rollout.GenerateState.register_abort_mode(state, "server")
-
-
-def test_stream_output_mode_must_be_homogeneous():
-    state = SimpleNamespace(stream_output_mode=None)
-
-    sglang_rollout.GenerateState.register_stream_output_mode(state, "incremental")
-    sglang_rollout.GenerateState.register_stream_output_mode(state, "incremental")
-
-    with pytest.raises(RuntimeError, match="cannot mix incremental and cumulative"):
-        sglang_rollout.GenerateState.register_stream_output_mode(state, "cumulative")
+    monkeypatch.setattr(streaming, "GenerateState", lambda _args: _generation_state(abort_mode="server"))
+    with pytest.raises(RuntimeError, match="Streaming generation requires"):
+        asyncio.run(streaming.generate_streaming(args, Sample(prompt="hello"), {"max_new_tokens": 1}))
 
 
 def test_stream_accumulator_requires_reported_length():
     with pytest.raises(ValueError, match="must include output_token_logprobs_length"):
-        SGLangStreamAccumulator().add(
+        SGLangStreamAccumulator(output_mode="incremental").add(
             {"text": "x", "meta_info": {"output_token_logprobs": [[-0.1, 11, None]]}},
             decode=lambda _tokens: "",
         )
 
 
-def test_stream_accumulator_rejects_mode_change():
-    accumulator = SGLangStreamAccumulator()
+def test_stream_accumulator_rejects_output_incompatible_with_configured_mode():
+    accumulator = SGLangStreamAccumulator(output_mode="incremental")
     accumulator.add(_chunk("a", [[-0.1, 11, None]], 1), decode=lambda _tokens: "")
-    accumulator.add(_chunk("b", [[-0.2, 12, None]], 2), decode=lambda _tokens: "")
 
-    with pytest.raises(ValueError, match="changed streaming output mode"):
+    with pytest.raises(ValueError, match="incremental streaming output has inconsistent"):
         accumulator.add(
             _chunk(
-                "abc",
-                [[-0.1, 11, None], [-0.2, 12, None], [-0.3, 13, None]],
-                3,
+                "ab",
+                [[-0.1, 11, None], [-0.2, 12, None]],
+                2,
             ),
             decode=lambda _tokens: "",
         )
@@ -207,7 +203,7 @@ def test_generate_streaming_preserves_metadata_across_stream_intervals(
         assert (method, url, json["stream"]) == ("POST", "http://frontend:8000/generate", True)
         yield response
 
-    state = _generation_state()
+    state = _generation_state(stream_output_mode="incremental" if incremental else "cumulative")
     monkeypatch.setattr(streaming, "GenerateState", lambda _args: state)
     monkeypatch.setattr(streaming, "_prepare_prompt_ids", lambda *_args: [1, 2])
     monkeypatch.setattr(streaming.http_utils, "_http_client", SimpleNamespace(stream=stream))
@@ -224,6 +220,7 @@ def test_generate_streaming_preserves_metadata_across_stream_intervals(
         use_rollout_routing_replay=False,
         router_policy=None,
         sglang_speculative_algorithm=False,
+        sglang_incremental_streaming_output=incremental,
     )
 
     result = asyncio.run(

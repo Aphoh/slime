@@ -88,6 +88,10 @@ class GenerateState(metaclass=SingletonMeta):
     def __init__(self, args: Namespace) -> None:
         # persistent state for the generation process
         self.args = args
+        self.abort_mode: Literal["request", "server"] = args.rollout_abort_mode
+        self.stream_output_mode: Literal["incremental", "cumulative"] = (
+            "incremental" if args.sglang_incremental_streaming_output else "cumulative"
+        )
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
@@ -132,25 +136,7 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size = 0
         self.pendings = set()
         self.aborted = False
-        self.abort_mode: Literal["request", "server"] | None = None
-        self.stream_output_mode: Literal["incremental", "cumulative"] | None = None
         self.cancellable_tasks = set()
-
-    def register_abort_mode(self, mode: Literal["request", "server"]) -> None:
-        if self.abort_mode is not None and self.abort_mode != mode:
-            raise RuntimeError(
-                "A rollout batch cannot mix request-cancelled and server-aborted generation "
-                f"(already using {self.abort_mode}, received {mode})."
-            )
-        self.abort_mode = mode
-
-    def register_stream_output_mode(self, mode: Literal["incremental", "cumulative"]) -> None:
-        if self.stream_output_mode is not None and self.stream_output_mode != mode:
-            raise RuntimeError(
-                "A rollout batch cannot mix incremental and cumulative streaming output "
-                f"(already using {self.stream_output_mode}, received {mode})."
-            )
-        self.stream_output_mode = mode
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
@@ -174,7 +160,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    state.register_abort_mode("server")
+    if state.abort_mode != "server":
+        raise RuntimeError("Non-streaming generation requires --rollout-abort-mode server.")
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert (

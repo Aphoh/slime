@@ -50,7 +50,8 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    state.register_abort_mode("request")
+    if state.abort_mode != "request":
+        raise RuntimeError("Streaming generation requires --rollout-abort-mode request.")
     url = get_model_url(args, "default")
 
     assert sample.status in (
@@ -102,7 +103,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     base_loss_mask = list(sample.loss_mask) if sample.loss_mask is not None else None
 
     last_meta_info: dict[str, Any] = {}
-    stream = SGLangStreamAccumulator()
+    stream = SGLangStreamAccumulator(output_mode=state.stream_output_mode)
 
     client = http_utils._http_client
     assert client is not None, "http client not initialized; call init_http_client first"
@@ -135,8 +136,6 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
                             skip_special_tokens=sampling_params.get("skip_special_tokens", True),
                         ),
                     )
-                    if update.output_mode is not None:
-                        state.register_stream_output_mode(update.output_mode)
                     last_meta_info = update.meta_info
 
                     if update.replace_call_state:
