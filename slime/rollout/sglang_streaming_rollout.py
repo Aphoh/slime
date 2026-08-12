@@ -22,13 +22,12 @@ when the server enables incremental streaming output.
 """
 
 import asyncio
-import copy
 import json
 import logging
 from argparse import Namespace
 from typing import Any
 
-from slime.rollout.sglang_rollout import GenerateState, _prepare_prompt_ids, get_model_url
+from slime.rollout.sglang_rollout import GenerateState, _prepare_prompt_ids
 from slime.rollout.streaming_utils import SGLangStreamAccumulator
 from slime.utils import http_utils
 from slime.utils.processing_utils import encode_image_for_rollout_engine
@@ -52,7 +51,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     state = GenerateState(args)
     if state.abort_mode != "request":
         raise RuntimeError("generate_streaming must be the globally configured --custom-generate-function-path.")
-    url = get_model_url(args, "default")
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert sample.status in (
         Sample.Status.PENDING,
@@ -97,9 +96,9 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     base_response = sample.response or ""
     base_response_length = sample.response_length
     base_log_probs = None if sample.rollout_log_probs is None else list(sample.rollout_log_probs)
-    base_top_p_token_ids = copy.deepcopy(sample.rollout_top_p_token_ids)
-    base_top_p_token_offsets = copy.deepcopy(sample.rollout_top_p_token_offsets)
-    base_routed_experts = copy.deepcopy(sample.rollout_routed_experts)
+    base_top_p_token_ids = sample.rollout_top_p_token_ids
+    base_top_p_token_offsets = sample.rollout_top_p_token_offsets
+    base_routed_experts = sample.rollout_routed_experts
     base_loss_mask = list(sample.loss_mask) if sample.loss_mask is not None else None
 
     last_meta_info: dict[str, Any] = {}
@@ -143,9 +142,9 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
                         sample.response = base_response
                         sample.response_length = base_response_length
                         sample.rollout_log_probs = None if base_log_probs is None else list(base_log_probs)
-                        sample.rollout_top_p_token_ids = copy.deepcopy(base_top_p_token_ids)
-                        sample.rollout_top_p_token_offsets = copy.deepcopy(base_top_p_token_offsets)
-                        sample.rollout_routed_experts = copy.deepcopy(base_routed_experts)
+                        sample.rollout_top_p_token_ids = base_top_p_token_ids
+                        sample.rollout_top_p_token_offsets = base_top_p_token_offsets
+                        sample.rollout_routed_experts = base_routed_experts
                         sample.loss_mask = None if base_loss_mask is None else list(base_loss_mask)
 
                     sample.append_response_tokens(

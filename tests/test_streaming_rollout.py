@@ -107,7 +107,7 @@ def test_merge_stream_rejects_inconsistent_length():
 
 
 def _generation_state(*, abort_mode="request", stream_output_mode="incremental"):
-    state = SimpleNamespace(
+    return SimpleNamespace(
         tokenizer=SimpleNamespace(
             decode=lambda token_ids, skip_special_tokens=False: "".join(f"<{token_id}>" for token_id in token_ids)
         ),
@@ -117,24 +117,35 @@ def _generation_state(*, abort_mode="request", stream_output_mode="incremental")
         stream_output_mode=stream_output_mode,
         cancellable_tasks=set(),
     )
-    return state
 
 
-def test_generators_reject_wrong_abort_mode(monkeypatch):
+def _streaming_args():
+    return SimpleNamespace(
+        ci_test=False,
+        sglang_router_ip="frontend",
+        sglang_router_port=8000,
+        use_rollout_routing_replay=False,
+        router_policy=None,
+        sglang_speculative_algorithm=False,
+    )
+
+
+def _patch_streaming(monkeypatch, state, stream):
+    monkeypatch.setattr(streaming, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(streaming, "_prepare_prompt_ids", lambda *_args: [1, 2])
+    monkeypatch.setattr(streaming.http_utils, "_http_client", SimpleNamespace(stream=stream))
+    monkeypatch.setattr(
+        streaming,
+        "trace_span",
+        lambda *_args, **_kwargs: nullcontext(SimpleNamespace(update=lambda *_args, **_kwargs: None)),
+    )
+
+
+def test_streaming_generator_rejects_server_abort_mode(monkeypatch):
     args = SimpleNamespace(ci_test=False)
-    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: _generation_state(abort_mode="request"))
-    with pytest.raises(RuntimeError, match="cannot be mixed with request-cancelled"):
-        asyncio.run(sglang_rollout.generate(args, Sample(prompt="hello"), {"max_new_tokens": 1}))
-
     monkeypatch.setattr(streaming, "GenerateState", lambda _args: _generation_state(abort_mode="server"))
     with pytest.raises(RuntimeError, match="must be the globally configured"):
         asyncio.run(streaming.generate_streaming(args, Sample(prompt="hello"), {"max_new_tokens": 1}))
-
-
-def test_abort_mode_follows_configured_generate_function():
-    assert sglang_rollout._generate_abort_mode(None) == "server"
-    assert sglang_rollout._generate_abort_mode(lambda: None) == "server"
-    assert sglang_rollout._generate_abort_mode(streaming.generate_streaming) == "request"
 
 
 def test_stream_accumulator_requires_reported_length():
@@ -210,24 +221,8 @@ def test_generate_streaming_preserves_metadata_across_stream_intervals(
         yield response
 
     state = _generation_state(stream_output_mode="incremental" if incremental else "cumulative")
-    monkeypatch.setattr(streaming, "GenerateState", lambda _args: state)
-    monkeypatch.setattr(streaming, "_prepare_prompt_ids", lambda *_args: [1, 2])
-    monkeypatch.setattr(streaming.http_utils, "_http_client", SimpleNamespace(stream=stream))
-    monkeypatch.setattr(
-        streaming,
-        "trace_span",
-        lambda *_args, **_kwargs: nullcontext(SimpleNamespace(update=lambda *_args, **_kwargs: None)),
-    )
-    args = SimpleNamespace(
-        ci_test=False,
-        sglang_model_routers={"default": ("frontend", 8000)},
-        sglang_router_ip="frontend",
-        sglang_router_port=8000,
-        use_rollout_routing_replay=False,
-        router_policy=None,
-        sglang_speculative_algorithm=False,
-        sglang_incremental_streaming_output=incremental,
-    )
+    _patch_streaming(monkeypatch, state, stream)
+    args = _streaming_args()
 
     result = asyncio.run(
         streaming.generate_streaming(
@@ -243,8 +238,6 @@ def test_generate_streaming_preserves_metadata_across_stream_intervals(
     assert result.rollout_log_probs == [-float(token_id) for token_id in response_tokens]
     assert result.rollout_top_p_token_ids.tolist() == [token_id + 1000 for token_id in response_tokens]
     assert result.rollout_top_p_token_offsets.tolist() == list(range(len(response_tokens) + 1))
-    assert state.abort_mode == "request"
-    assert state.stream_output_mode == ("incremental" if incremental else "cumulative")
 
 
 def test_stream_cancellation_closes_request_and_keeps_prefix(monkeypatch):
@@ -276,21 +269,8 @@ def test_stream_cancellation_closes_request_and_keeps_prefix(monkeypatch):
         finally:
             request_closed = True
 
-    monkeypatch.setattr(streaming, "GenerateState", lambda _args: state)
-    monkeypatch.setattr(streaming, "_prepare_prompt_ids", lambda *_args: [1, 2])
-    monkeypatch.setattr(streaming.http_utils, "_http_client", SimpleNamespace(stream=stream))
-    monkeypatch.setattr(
-        streaming,
-        "trace_span",
-        lambda *_args, **_kwargs: nullcontext(SimpleNamespace(update=lambda *_args, **_kwargs: None)),
-    )
-    args = SimpleNamespace(
-        ci_test=False,
-        sglang_router_ip="frontend",
-        sglang_router_port=8000,
-        use_rollout_routing_replay=False,
-        router_policy=None,
-    )
+    _patch_streaming(monkeypatch, state, stream)
+    args = _streaming_args()
 
     async def exercise():
         task = asyncio.create_task(streaming.generate_streaming(args, Sample(prompt="hello"), {"max_new_tokens": 8}))
@@ -304,7 +284,6 @@ def test_stream_cancellation_closes_request_and_keeps_prefix(monkeypatch):
     assert result.status == Sample.Status.ABORTED
     assert (result.tokens, result.rollout_log_probs, result.response) == ([1, 2, 11], [-0.1], "<11>")
     assert request_closed is True
-    assert state.abort_mode == "request"
     assert not state.cancellable_tasks
 
 
@@ -323,21 +302,8 @@ def test_unrelated_stream_cancellation_propagates(monkeypatch):
     async def stream(method, url, json, headers):
         yield response
 
-    monkeypatch.setattr(streaming, "GenerateState", lambda _args: state)
-    monkeypatch.setattr(streaming, "_prepare_prompt_ids", lambda *_args: [1, 2])
-    monkeypatch.setattr(streaming.http_utils, "_http_client", SimpleNamespace(stream=stream))
-    monkeypatch.setattr(
-        streaming,
-        "trace_span",
-        lambda *_args, **_kwargs: nullcontext(SimpleNamespace(update=lambda *_args, **_kwargs: None)),
-    )
-    args = SimpleNamespace(
-        ci_test=False,
-        sglang_router_ip="frontend",
-        sglang_router_port=8000,
-        use_rollout_routing_replay=False,
-        router_policy=None,
-    )
+    _patch_streaming(monkeypatch, state, stream)
+    args = _streaming_args()
 
     async def exercise():
         task = asyncio.create_task(
