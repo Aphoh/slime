@@ -133,7 +133,7 @@ class SGLangEngine(RayActor):
     ):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
-        self.register_to_router = register_to_router
+        self.should_register_to_router = register_to_router
 
         host = host or get_host_info()[1]
 
@@ -188,7 +188,7 @@ class SGLangEngine(RayActor):
 
         actual_server_args = get_server_info(self.control_url)
         _sanity_check_server_args(actual_server_args, expect_server_args)
-        if self.register_to_router:
+        if self.should_register_to_router:
             self._register_to_router(expect_server_args)
 
     def _init_normal(self, server_args_dict):

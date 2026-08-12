@@ -191,10 +191,6 @@ class RayTrainGroup:
         if rollout_manager is not None:
             self._rollout_manager = rollout_manager
         self.args.update_weight_start_version = self._disk_weight_version
-        if self._num_nodes * self._num_gpus_per_node == 0:
-            assert self.args.debug_rollout_only, "zero-sized train groups are only valid in rollout-only debug mode"
-            start_rollout_id = self.args.start_rollout_id
-            return [0 if start_rollout_id is None else start_rollout_id]
         self._allocate_gpus_for_actor(self._pg, self._num_gpus_per_actor)
         start_rollout_ids = ray.get(
             [

@@ -149,9 +149,6 @@ def apply_external_engine_info_to_args(args, logger=None) -> None:
     """Detect external engines and store the derived topology on ``args``."""
     infos = discover_external_engine_infos(args)
 
-    if not infos:
-        raise ValueError("External rollout engine discovery returned no engines.")
-
     args.rollout_external_engine_infos = [info.to_dict() for info in infos]
     args.rollout_num_engines = len(infos)
     args.rollout_num_gpus = sum(info.num_gpus for info in infos)

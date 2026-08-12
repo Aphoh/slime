@@ -1914,6 +1914,9 @@ def slime_validate_args(args):
         apply_external_engine_info_to_args(args, logger=logger)
 
     args.use_critic = args.advantage_estimator == "ppo"
+    # Critic always uses the same GPU count as actor.
+    args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
+    args.critic_num_nodes = args.actor_num_nodes
 
     if args.offload:
         args.offload_train = True
@@ -1921,10 +1924,7 @@ def slime_validate_args(args):
     del args.offload
 
     if args.debug_rollout_only:
-        if args.rollout_external:
-            args.actor_num_gpus_per_node = 0
-            args.actor_num_nodes = 0
-        elif args.colocate and args.rollout_num_gpus is None:
+        if args.colocate and args.rollout_num_gpus is None:
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
         elif args.rollout_num_gpus == 0:
             args.actor_num_gpus_per_node = 0
