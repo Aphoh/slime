@@ -128,9 +128,12 @@ class SGLangEngine(RayActor):
         disaggregation_bootstrap_port=None,
         router_ip=None,
         router_port=None,
+        control_url=None,
+        register_to_router=True,
     ):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
+        self.should_register_to_router = register_to_router
 
         host = host or get_host_info()[1]
 
@@ -165,6 +168,7 @@ class SGLangEngine(RayActor):
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        self.control_url = control_url.rstrip("/") if control_url else f"http://{self.server_host}:{self.server_port}"
 
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
@@ -182,9 +186,10 @@ class SGLangEngine(RayActor):
                     actual_value == expect_value
                 ), f"{name=} {expect_value=} {actual_value=} {expect_server_args=} {actual_server_args=}"
 
-        actual_server_args = get_server_info(f"http://{self.server_host}:{self.server_port}")
+        actual_server_args = get_server_info(self.control_url)
         _sanity_check_server_args(actual_server_args, expect_server_args)
-        self._register_to_router(expect_server_args)
+        if self.should_register_to_router:
+            self._register_to_router(expect_server_args)
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
@@ -228,8 +233,7 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
 
-        url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        response = requests.post(f"{self.control_url}/{endpoint}", json=payload or {})
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -253,7 +257,7 @@ class SGLangEngine(RayActor):
             return True
 
         response = requests.get(
-            f"http://{self.server_host}:{self.server_port}/health_generate",
+            f"{self.control_url}/health_generate",
             timeout=timeout,
         )
         response.raise_for_status()
@@ -291,7 +295,7 @@ class SGLangEngine(RayActor):
         # flush cache will not return status_code 200 when there are pending requests
         for _ in range(60):
             try:
-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                response = requests.get(f"{self.control_url}/flush_cache")
                 if response.status_code == 200:
                     break
                 logger.info(f"Error flushing cache: HTTP {response.status_code} {response.text!r}")
@@ -440,14 +444,14 @@ class SGLangEngine(RayActor):
     def pause_generation(self):
         if self.node_rank != 0:
             return
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})
+        response = requests.post(f"{self.control_url}/pause_generation", json={})
         response.raise_for_status()
         return response
 
     def continue_generation(self):
         if self.node_rank != 0:
             return
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
+        response = requests.post(f"{self.control_url}/continue_generation", json={})
         response.raise_for_status()
         return response
 
