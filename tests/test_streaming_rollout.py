@@ -172,7 +172,7 @@ def test_generate_streaming_preserves_metadata_across_stream_intervals(
 
     @asynccontextmanager
     async def stream(method, url, json, headers):
-        assert (method, url, json["stream"]) == ("POST", "http://frontend:8000/api/generate", True)
+        assert (method, url, json["stream"]) == ("POST", "http://frontend:8000/generate", True)
         yield response
 
     state = _generation_state()
@@ -186,9 +186,9 @@ def test_generate_streaming_preserves_metadata_across_stream_intervals(
     )
     args = SimpleNamespace(
         ci_test=False,
-        sglang_rollout_url="http://frontend:8000/api",
-        sglang_router_ip="unused",
-        sglang_router_port=1,
+        sglang_model_routers={"default": ("frontend", 8000)},
+        sglang_router_ip="frontend",
+        sglang_router_port=8000,
         use_rollout_routing_replay=False,
         router_policy=None,
         sglang_speculative_algorithm=False,

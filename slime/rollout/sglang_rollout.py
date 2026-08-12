@@ -73,9 +73,6 @@ def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate")
     Falls back to the default router if *model_name* is not found or
     ``sglang_model_routers`` is not set.
     """
-    if model_name == "default" and (base_url := getattr(args, "sglang_rollout_url", None)):
-        return f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
-
     routers = getattr(args, "sglang_model_routers", None)
     if routers and model_name in routers:
         ip, port = routers[model_name]
@@ -169,7 +166,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     state = GenerateState(args)
     state.register_generation_mode("non_streaming")
-    url = get_model_url(args, "default")
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED

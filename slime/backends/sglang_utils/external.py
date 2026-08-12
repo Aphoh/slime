@@ -8,7 +8,6 @@ from urllib.parse import urlparse
 
 import requests
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +53,8 @@ def normalize_external_engine_addr(addr: str) -> str:
     parsed = urlparse(addr)
     if parsed.scheme != "http" or parsed.hostname is None or parsed.port is None:
         raise ValueError(
-            f"Invalid external SGLang engine address {addr!r}. Use host:port or http://host:port (IPv6 must be bracketed)."
+            f"Invalid external SGLang engine address {addr!r}. "
+            "Use host:port or http://host:port (IPv6 must be bracketed)."
         )
     return addr
 
@@ -65,7 +65,6 @@ def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
         "nccl_port": None,
         "host": info.host,
         "port": info.port,
-        "control_url": info.url,
     }
     if info.worker_type == "prefill":
         init_kwargs["disaggregation_bootstrap_port"] = info.disaggregation_bootstrap_port
@@ -80,7 +79,7 @@ def get_server_info(url: str, timeout: float = 30.0) -> dict:
             response.raise_for_status()
             return response.json()
         except Exception as exc:
-            errors.append(f"{url}{endpoint}: {exc}")
+            errors.append(f"{endpoint}: {exc}")
     raise RuntimeError(f"Failed to fetch SGLang server info from {url}: {'; '.join(errors)}")
 
 
@@ -128,6 +127,8 @@ def apply_external_engine_info_to_args(args, logger=None) -> None:
         raise ValueError("apply_external_engine_info_to_args requires --rollout-external-engine-addrs.")
 
     infos = discover_external_engines(addrs)
+    if not infos:
+        raise ValueError("--rollout-external-engine-addrs did not contain any engines.")
 
     args.rollout_external_engine_infos = [info.to_dict() for info in infos]
     args.rollout_num_engines = len(infos)
@@ -185,7 +186,8 @@ def external_engine_infos_from_args(args) -> list[ExternalEngineInfo]:
     raw_infos = getattr(args, "rollout_external_engine_infos", None)
     if raw_infos is None:
         raise RuntimeError(
-            "External rollout engine info is missing. apply_external_engine_info_to_args must run before starting external rollout servers."
+            "External rollout engine info is missing. "
+            "apply_external_engine_info_to_args must run before starting external rollout servers."
         )
     return [ExternalEngineInfo(**info) if isinstance(info, dict) else info for info in raw_infos]
 
@@ -197,20 +199,7 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
     from slime.ray.utils import add_default_ray_env_vars
 
     infos = external_engine_infos_from_args(args)
-    rollout_url = (
-        normalize_external_engine_addr(args.rollout_external_rollout_url)
-        if args.rollout_external_rollout_url
-        else None
-    )
-    if rollout_url is None:
-        router_ip, router_port = start_router(args, has_pd_disaggregation=any(info.is_pd_worker for info in infos))
-    else:
-        parsed = urlparse(rollout_url)
-        assert parsed.hostname is not None and parsed.port is not None
-        router_ip, router_port = parsed.hostname, parsed.port
-    args.sglang_rollout_url = rollout_url
-    # TODO: Remove these compatibility fields after all rollout consumers use
-    # the canonical base URL. They cannot represent path-prefixed frontends.
+    router_ip, router_port = start_router(args, has_pd_disaggregation=any(info.is_pd_worker for info in infos))
     args.sglang_router_ip = router_ip
     args.sglang_router_port = router_port
 
@@ -236,10 +225,13 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
         engine_gpu_counts.append(info.num_gpus)
         engine_gpu_offsets.append(gpu_offset)
         gpu_offset += info.num_gpus
-        init_kwargs = external_engine_init_kwargs(info)
-        if rollout_url is not None:
-            init_kwargs["register_to_router"] = False
-        init_handles.append(rollout_engine.init.remote(**init_kwargs, router_ip=router_ip, router_port=router_port))
+        init_handles.append(
+            rollout_engine.init.remote(
+                **external_engine_init_kwargs(info),
+                router_ip=router_ip,
+                router_port=router_port,
+            )
+        )
 
     args.sglang_model_routers = {"default": (router_ip, router_port)}
     servers = {
