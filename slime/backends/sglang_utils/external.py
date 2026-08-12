@@ -208,6 +208,9 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
         parsed = urlparse(rollout_url)
         assert parsed.hostname is not None and parsed.port is not None
         router_ip, router_port = parsed.hostname, parsed.port
+    args.sglang_rollout_url = rollout_url
+    # TODO: Remove these compatibility fields after all rollout consumers use
+    # the canonical base URL. They cannot represent path-prefixed frontends.
     args.sglang_router_ip = router_ip
     args.sglang_router_port = router_port
 

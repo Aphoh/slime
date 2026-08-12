@@ -66,7 +66,7 @@ def test_discover_external_engines_reads_server_info(monkeypatch):
     assert info.parallel_config == {"tp_size": 4, "pp_size": 2, "ep_size": 4, "moe_dp_size": 1}
 
 
-@pytest.mark.parametrize("rollout_url", [None, "http://frontend:8000"])
+@pytest.mark.parametrize("rollout_url", [None, "http://frontend:8000", "http://frontend:8000/api"])
 def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch, rollout_url):
     class FakeActor:
         init = Namespace(remote=lambda **kwargs: kwargs)
@@ -105,6 +105,7 @@ def test_start_external_rollout_servers_exposes_parallel_configs(monkeypatch, ro
 
     assert servers["default"].engine_parallel_configs == [{"tp_size": 4, "pp_size": 2, "ep_size": 4, "moe_dp_size": 2}]
     assert len(init_handles) == 1
+    assert args.sglang_rollout_url == rollout_url
     expected_router = ("host1", 30000) if rollout_url is None else ("frontend", 8000)
     assert (args.sglang_router_ip, args.sglang_router_port) == expected_router
     assert init_handles[0].get("register_to_router", True) is (rollout_url is None)

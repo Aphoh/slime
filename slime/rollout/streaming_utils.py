@@ -1,37 +1,110 @@
-"""Backend-neutral helpers for token/logprob streaming responses."""
+"""Helpers for consuming SGLang streaming responses."""
 
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
+from slime.utils.misc import decode_int32_meta_array
 
-def merge_stream_chunk(
+_TOP_P_TOKEN_ID_META_KEYS = ("top_p_token_ids", "top_p_kept_token_ids")
+_TOP_P_TOKEN_OFFSET_META_KEYS = ("top_p_token_offsets", "top_p_kept_token_offsets")
+
+
+def _has_full_incremental_top_p_metadata(
+    meta_info: dict[str, Any],
     *,
-    tokens: list[int],
-    log_probs: list[float],
-    text: str,
-    chunk: dict[str, Any],
-) -> tuple[list[int], list[float], str]:
-    """Merge one cumulative or disjoint SGLang-compatible stream chunk."""
-    meta = chunk.get("meta_info") or {}
-    pairs = meta.get("output_token_logprobs") or []
-    chunk_tokens = [item[1] for item in pairs]
-    chunk_log_probs = [item[0] for item in pairs]
-    output_length = meta.get("output_token_logprobs_length")
+    new_token_count: int,
+    reported_length: int,
+) -> bool:
+    token_ids = decode_int32_meta_array(meta_info, _TOP_P_TOKEN_ID_META_KEYS)
+    offsets = decode_int32_meta_array(meta_info, _TOP_P_TOKEN_OFFSET_META_KEYS)
+    if token_ids is None or offsets is None or offsets.numel() == new_token_count + 1:
+        return False
+    if offsets.numel() != reported_length + 1:
+        raise ValueError(
+            "Incremental SGLang top-p metadata must describe either the current chunk or the full response: "
+            f"offsets={offsets.numel()}, chunk_tokens={new_token_count}, reported_tokens={reported_length}."
+        )
 
-    if output_length is not None:
-        output_length = int(output_length)
-        if len(chunk_tokens) == output_length:
+    return True
+
+
+@dataclass(frozen=True)
+class SGLangStreamUpdate:
+    """A normalized update ready to apply to the current HTTP call state."""
+
+    replace_call_state: bool
+    tokens: list[int]
+    log_probs: list[float]
+    text: str
+    meta_info: dict[str, Any]
+
+
+@dataclass
+class SGLangStreamAccumulator:
+    """Classify cumulative versus incremental SGLang stream chunks.
+
+    SGLang's ``output_token_logprobs_length`` is cumulative in both modes.
+    The number of logprob pairs in the chunk therefore tells us whether its
+    token-aligned payload is a complete snapshot or only the latest delta.
+    """
+
+    output_length: int = 0
+    tokens: list[int] = field(default_factory=list)
+    log_probs: list[float] = field(default_factory=list)
+    text: str = ""
+
+    def add(self, chunk: dict[str, Any], *, decode: Callable[[list[int]], str]) -> SGLangStreamUpdate:
+        meta_info = chunk.get("meta_info") or {}
+        if "output_token_logprobs_length" not in meta_info:
+            raise ValueError("SGLang streaming responses must include output_token_logprobs_length.")
+
+        pairs = meta_info.get("output_token_logprobs") or []
+        chunk_tokens = [item[1] for item in pairs]
+        chunk_log_probs = [item[0] for item in pairs]
+        reported_length = int(meta_info["output_token_logprobs_length"])
+
+        if len(chunk_tokens) == reported_length:
             cumulative = True
-        elif len(tokens) + len(chunk_tokens) == output_length:
+        elif self.output_length + len(chunk_tokens) == reported_length:
             cumulative = False
         else:
             raise ValueError(
                 "Inconsistent streaming output_token_logprobs_length: "
-                f"received={len(chunk_tokens)}, accumulated={len(tokens)}, reported={output_length}."
+                f"received={len(chunk_tokens)}, previous={self.output_length}, reported={reported_length}."
             )
-    else:
-        cumulative = len(chunk_tokens) >= len(tokens) and chunk_tokens[: len(tokens)] == tokens
 
-    chunk_text = chunk.get("text")
-    if cumulative:
-        return chunk_tokens, chunk_log_probs, text if chunk_text is None else chunk_text
-    return tokens + chunk_tokens, log_probs + chunk_log_probs, text + (chunk_text or "")
+        full_top_p_metadata = not cumulative and _has_full_incremental_top_p_metadata(
+            meta_info,
+            new_token_count=len(chunk_tokens),
+            reported_length=reported_length,
+        )
+
+        chunk_text = chunk.get("text")
+        if cumulative:
+            self.tokens = list(chunk_tokens)
+            self.log_probs = list(chunk_log_probs)
+            self.text = decode(self.tokens) if chunk_text is None else chunk_text
+            update_text = self.text
+        else:
+            self.tokens.extend(chunk_tokens)
+            self.log_probs.extend(chunk_log_probs)
+            if chunk_text is not None:
+                update_text = chunk_text
+                self.text += chunk_text
+            else:
+                decoded_text = decode(self.tokens)
+                if not decoded_text.startswith(self.text):
+                    raise ValueError("Decoded incremental stream text does not extend the previously received text.")
+                update_text = decoded_text[len(self.text) :]
+                self.text = decoded_text
+
+        replace_call_state = cumulative or full_top_p_metadata
+        self.output_length = reported_length
+        return SGLangStreamUpdate(
+            replace_call_state=replace_call_state,
+            tokens=list(self.tokens) if replace_call_state else chunk_tokens,
+            log_probs=list(self.log_probs) if replace_call_state else chunk_log_probs,
+            text=self.text if replace_call_state else update_text,
+            meta_info=meta_info,
+        )

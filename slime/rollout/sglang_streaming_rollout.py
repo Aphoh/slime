@@ -22,13 +22,14 @@ when the server enables incremental streaming output.
 """
 
 import asyncio
+import copy
 import json
 import logging
 from argparse import Namespace
 from typing import Any
 
-from slime.rollout.sglang_rollout import GenerateState, _prepare_prompt_ids
-from slime.rollout.streaming_utils import merge_stream_chunk
+from slime.rollout.sglang_rollout import GenerateState, _prepare_prompt_ids, get_model_url
+from slime.rollout.streaming_utils import SGLangStreamAccumulator
 from slime.utils import http_utils
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.trace_utils import build_sglang_meta_trace_attrs, trace_span
@@ -49,8 +50,8 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    state.streaming_generation = True
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    state.register_generation_mode("streaming")
+    url = get_model_url(args, "default")
 
     assert sample.status in (
         Sample.Status.PENDING,
@@ -88,22 +89,20 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     if sample.session_id and getattr(args, "router_policy", None) == "consistent_hashing":
         headers = {"X-SMG-Routing-Key": sample.session_id}
 
-    # Snapshot pre-call sample state. sglang's SSE chunks are cumulative
-    # *within this call*; on each chunk we rebuild the post-call view of the
-    # sample = prior state + chunk delta. That way a mid-stream break leaves
-    # the sample exactly at the boundary of the last chunk we observed.
+    # A cumulative chunk replaces the state produced by this HTTP call, while
+    # an incremental chunk appends to it. Preserve the pre-call state so both
+    # formats also work when resuming a partial rollout.
     base_tokens = list(sample.tokens)
     base_response = sample.response or ""
     base_response_length = sample.response_length
     base_log_probs = None if sample.rollout_log_probs is None else list(sample.rollout_log_probs)
-    base_top_p_token_ids = sample.rollout_top_p_token_ids
-    base_top_p_token_offsets = sample.rollout_top_p_token_offsets
+    base_top_p_token_ids = copy.deepcopy(sample.rollout_top_p_token_ids)
+    base_top_p_token_offsets = copy.deepcopy(sample.rollout_top_p_token_offsets)
+    base_routed_experts = copy.deepcopy(sample.rollout_routed_experts)
     base_loss_mask = list(sample.loss_mask) if sample.loss_mask is not None else None
 
     last_meta_info: dict[str, Any] = {}
-    call_tokens: list[int] = []
-    call_log_probs: list[float] = []
-    call_text: str = ""
+    stream = SGLangStreamAccumulator()
 
     client = http_utils._http_client
     assert client is not None, "http client not initialized; call init_http_client first"
@@ -129,38 +128,40 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
                         logger.warning("sglang_streaming: skipping non-JSON chunk: %r", data_str[:120])
                         continue
 
-                    last_meta_info = chunk.get("meta_info") or {}
-                    call_tokens, call_log_probs, call_text = merge_stream_chunk(
-                        tokens=call_tokens,
-                        log_probs=call_log_probs,
-                        text=call_text,
-                        chunk=chunk,
+                    update = stream.add(
+                        chunk,
+                        decode=lambda token_ids: state.tokenizer.decode(
+                            token_ids,
+                            skip_special_tokens=sampling_params.get("skip_special_tokens", True),
+                        ),
                     )
-                    if chunk.get("text") is None:
-                        call_text = state.tokenizer.decode(call_tokens, skip_special_tokens=False)
+                    last_meta_info = update.meta_info
 
-                    # Rebuild from the pre-call snapshot so the sample always
-                    # exposes the coherent prefix represented by this chunk.
-                    sample.tokens = list(base_tokens)
-                    sample.response = base_response
-                    sample.response_length = base_response_length
-                    sample.rollout_log_probs = None if base_log_probs is None else list(base_log_probs)
-                    sample.rollout_top_p_token_ids = base_top_p_token_ids
-                    sample.rollout_top_p_token_offsets = base_top_p_token_offsets
-                    sample.loss_mask = None if base_loss_mask is None else list(base_loss_mask)
+                    if update.replace_call_state:
+                        sample.tokens = list(base_tokens)
+                        sample.response = base_response
+                        sample.response_length = base_response_length
+                        sample.rollout_log_probs = None if base_log_probs is None else list(base_log_probs)
+                        sample.rollout_top_p_token_ids = copy.deepcopy(base_top_p_token_ids)
+                        sample.rollout_top_p_token_offsets = copy.deepcopy(base_top_p_token_offsets)
+                        sample.rollout_routed_experts = copy.deepcopy(base_routed_experts)
+                        sample.loss_mask = None if base_loss_mask is None else list(base_loss_mask)
+
                     sample.append_response_tokens(
                         args,
-                        tokens=call_tokens,
-                        log_probs=call_log_probs,
+                        tokens=update.tokens,
+                        log_probs=update.log_probs,
                         trainable=True,
                         meta_info=last_meta_info,
-                        text=call_text,
+                        text=update.text,
                         update_terminal_info=bool(last_meta_info.get("finish_reason")),
                     )
 
             if last_meta_info.get("finish_reason"):
                 span.update(build_sglang_meta_trace_attrs(last_meta_info))
     except asyncio.CancelledError:
+        if not state.aborted:
+            raise
         if not last_meta_info.get("finish_reason"):
             sample.status = Sample.Status.ABORTED
         return sample

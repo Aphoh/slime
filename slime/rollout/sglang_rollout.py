@@ -7,7 +7,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from tqdm import tqdm
@@ -73,6 +73,9 @@ def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate")
     Falls back to the default router if *model_name* is not found or
     ``sglang_model_routers`` is not set.
     """
+    if model_name == "default" and (base_url := getattr(args, "sglang_rollout_url", None)):
+        return f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+
     routers = getattr(args, "sglang_model_routers", None)
     if routers and model_name in routers:
         ip, port = routers[model_name]
@@ -132,8 +135,16 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size = 0
         self.pendings = set()
         self.aborted = False
-        self.streaming_generation = False
+        self.generation_mode: Literal["streaming", "non_streaming"] | None = None
         self.streaming_tasks = set()
+
+    def register_generation_mode(self, mode: Literal["streaming", "non_streaming"]) -> None:
+        if self.generation_mode is not None and self.generation_mode != mode:
+            raise RuntimeError(
+                "A rollout batch cannot mix streaming and non-streaming generation "
+                f"(already using {self.generation_mode}, received {mode})."
+            )
+        self.generation_mode = mode
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
@@ -157,7 +168,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    state.register_generation_mode("non_streaming")
+    url = get_model_url(args, "default")
 
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
@@ -343,7 +355,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    if state.streaming_generation:
+    if state.generation_mode == "streaming":
         streaming_tasks = list(state.streaming_tasks)
         for task in streaming_tasks:
             task.cancel()
@@ -364,9 +376,7 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
             group = task.result()
-            if not all(sample.status == Sample.Status.ABORTED for sample in group):
-                continue
-            if not any(sample.response_length > 0 for sample in group):
+            if not any(sample.status == Sample.Status.ABORTED and sample.response_length > 0 for sample in group):
                 continue
             for sample in group:
                 if sample.response and "start_rollout_id" not in sample.metadata:
